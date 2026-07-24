@@ -1,4 +1,4 @@
-/* ===== 账户管理（ChatGPT + Codex 生产） ===== */
+/* ===== 账户管理（ChatGPT 账号生产） ===== */
 const ACC_STATUS = {
   pending: '待生产',
   registering: '注册中',
@@ -190,7 +190,7 @@ function syncBatchBar() {
   all.checked = ids.length > 0 && ids.every(id => accSelected.has(id));
 }
 
-/* ===== 下载（agent_identity JSON，单个→对象，多个→数组；下载即出库） ===== */
+/* ===== 下载（账号凭据 JSON，单个→对象，多个→数组；下载即出库） ===== */
 async function downloadAcc(id) {
   await downloadByIds([id], 'auth_' + id + '.json');
 }
@@ -237,6 +237,19 @@ async function del(id) {
   accSelected.delete(id);
   toast('已删除');
   load();
+}
+
+async function deleteAllAccounts() {
+  if (!confirm('确定删除全部账户？此操作不可恢复。')) return;
+  if (!confirm('再次确认：将永久删除账户管理中的全部记录。')) return;
+  const r = await api('/api/registrations', { method: 'DELETE' });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) return toast('全部删除失败: ' + (d.error || r.status), true);
+  accSelected.clear();
+  page = 1;
+  toast('已删除 ' + (d.deleted || 0) + ' 个账户');
+  load();
+  loadProduce();
 }
 
 document.getElementById('search').addEventListener('keydown', e => {

@@ -1,41 +1,31 @@
-// Package mailfetch 通过 Microsoft Graph API 拉取 Outlook 邮箱的收件箱邮件，
-// 用 refresh_token 换 access_token（scope=.default，按刷新令牌已授权的权限换取），供网页“取件”弹窗展示。
+// Package mailfetch reads Outlook mailboxes through Microsoft Graph or IMAP
+// according to the permissions carried by each refresh token.
 package mailfetch
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
-	"net/url"
-	"regexp"
-	"strings"
+	"sort"
 	"sync"
 	"time"
 )
 
-const (
-	tokenURL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
-	// 使用 .default：按 refresh_token 原本已授权的权限换取，避免请求未授权 scope 触发 AADSTS70000。
-	graphScope = "https://graph.microsoft.com/.default"
-	graphBase  = "https://graph.microsoft.com/v1.0"
-)
-
 var (
-	ErrMissingCreds = errors.New("client_id / refresh_token 必填")
-	ErrAuthFailed   = errors.New("邮箱鉴权失败")
-	searchFolders   = []string{"Inbox", "JunkEmail"}
+	ErrMissingCreds  = errors.New("client_id / refresh_token 必填")
+	ErrAuthFailed    = errors.New("邮箱鉴权失败")
+	ErrAuthTemporary = errors.New("邮箱鉴权服务暂时不可用")
 )
 
-// Account 一条邮箱凭据。
+// Account contains the OAuth credentials for one mailbox.
 type Account struct {
 	Email        string
 	ClientID     string
 	RefreshToken string
 }
 
-// Message 一封邮件。列表接口只返回头部（ID/发件人/主题/时间），正文按需单独拉取。
+// Message is a mailbox message. ListMessages only fills the headers; the body
+// is fetched on demand by GetMessage.
 type Message struct {
 	ID         string    `json:"id"`
 	From       string    `json:"from"`
@@ -46,30 +36,31 @@ type Message struct {
 	Text       string    `json:"text,omitempty"`
 }
 
-type cachedToken struct {
-	access    string
-	expiresAt time.Time
-}
-
-// Client 无状态可全局复用，内部按 refresh_token 缓存 access_token。
+// Client is safe for concurrent use. Access tokens are cached by refresh
+// token together with the protocol implied by the granted OAuth scopes.
 type Client struct {
-	http   *http.Client
-	tokMu  sync.Mutex
-	tokens map[string]cachedToken
+	http     *http.Client
+	tokMu    sync.Mutex
+	tokens   map[string]cachedToken
+	workMu   sync.Mutex
+	inflight map[string]*tokenCall
+	imapDial imapDialFunc
 }
 
 func New() *Client {
 	return &Client{
-		http:   &http.Client{Timeout: 15 * time.Second},
-		tokens: map[string]cachedToken{},
+		http:     &http.Client{Timeout: 15 * time.Second},
+		tokens:   map[string]cachedToken{},
+		inflight: map[string]*tokenCall{},
+		imapDial: dialOutlookIMAP,
 	}
 }
 
-// Verify 校验一条邮箱凭据是否可用：尝试用 refresh_token 换取 access_token。
-// 批量并发验证时微软 token 端点会偶发限流/瞬时错误，这里带指数退避重试，避免误判为失败。
+// Verify checks the actual mail protocol, not just whether the OAuth token
+// endpoint accepts the refresh token.
 func (c *Client) Verify(ctx context.Context, acc Account) error {
-	if acc.ClientID == "" || acc.RefreshToken == "" {
-		return ErrMissingCreds
+	if err := validateAccount(acc); err != nil {
+		return err
 	}
 	c.invalidate(acc.RefreshToken)
 	var err error
@@ -81,250 +72,95 @@ func (c *Client) Verify(ctx context.Context, acc Account) error {
 			case <-time.After(time.Duration(attempt) * 800 * time.Millisecond):
 			}
 		}
-		if _, err = c.accessToken(ctx, acc); err == nil {
+		tok, tokenErr := c.accessToken(ctx, acc)
+		if tokenErr != nil {
+			err = tokenErr
+		} else if tok.protocol == protocolIMAP {
+			err = c.verifyIMAP(ctx, acc, tok.access)
+		} else {
+			err = c.verifyGraph(ctx, tok.access)
+		}
+		if err == nil {
 			return nil
 		}
+		if errors.Is(err, errIMAPAuthRejected) {
+			c.invalidate(acc.RefreshToken)
+			continue
+		}
+		if !errors.Is(err, ErrAuthTemporary) {
+			return err
+		}
+		c.invalidate(acc.RefreshToken)
 	}
 	return err
 }
 
-// ListMessages 拉 Inbox + JunkEmail 最新邮件的头部（不含正文），两个文件夹并发拉取，按时间倒序合并返回。
-// 正文由 GetMessage 按需单独拉取，避免每次列表都传输大量 HTML 拖慢速度。
+// ListMessages returns the newest headers from Inbox and Junk, sorted newest
+// first. Graph and IMAP IDs remain opaque to callers.
 func (c *Client) ListMessages(ctx context.Context, acc Account, limit int) ([]Message, error) {
+	if err := validateAccount(acc); err != nil {
+		return nil, err
+	}
 	if limit < 1 {
 		limit = 20
 	}
-	tok, err := c.accessToken(ctx, acc)
-	if err != nil {
-		return nil, err
-	}
-
-	type folderResult struct {
-		msgs []graphMessage
-	}
-	results := make([]folderResult, len(searchFolders))
-	var wg sync.WaitGroup
-	for i, folder := range searchFolders {
-		wg.Add(1)
-		go func(i int, folder string) {
-			defer wg.Done()
-			if msgs, ferr := c.listFolder(ctx, tok, acc, folder, limit); ferr == nil {
-				results[i].msgs = msgs
-			}
-		}(i, folder)
-	}
-	wg.Wait()
-
-	var all []graphMessage
-	for _, r := range results {
-		all = append(all, r.msgs...)
-	}
-	out := make([]Message, 0, len(all))
-	for _, m := range all {
-		t, _ := time.Parse(time.RFC3339, m.ReceivedDateTime)
-		out = append(out, Message{
-			ID:         m.ID,
-			From:       m.From.EmailAddress.Address,
-			FromName:   m.From.EmailAddress.Name,
-			Subject:    m.Subject,
-			ReceivedAt: t,
-		})
-	}
-	// 合并后按时间倒序
-	for i := 0; i < len(out); i++ {
-		for j := i + 1; j < len(out); j++ {
-			if out[j].ReceivedAt.After(out[i].ReceivedAt) {
-				out[i], out[j] = out[j], out[i]
-			}
-		}
-	}
-	if len(out) > limit {
-		out = out[:limit]
-	}
-	return out, nil
-}
-
-// GetMessage 按消息 ID 拉取单封邮件的完整正文（HTML + 纯文本）。
-func (c *Client) GetMessage(ctx context.Context, acc Account, msgID string) (Message, error) {
-	tok, err := c.accessToken(ctx, acc)
-	if err != nil {
-		return Message{}, err
-	}
-	q := url.Values{}
-	q.Set("$select", "id,subject,body,receivedDateTime,from")
-	u := fmt.Sprintf("%s/me/messages/%s?%s", graphBase, url.PathEscape(msgID), q.Encode())
-
-	resp, err := c.graphGet(ctx, tok, u)
-	if err != nil {
-		return Message{}, err
-	}
-	if resp.StatusCode == http.StatusUnauthorized {
-		resp.Body.Close()
-		c.invalidate(acc.RefreshToken)
-		newTok, terr := c.accessToken(ctx, acc)
-		if terr != nil {
-			return Message{}, terr
-		}
-		if resp, err = c.graphGet(ctx, newTok, u); err != nil {
-			return Message{}, err
-		}
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		return Message{}, fmt.Errorf("graph status=%d", resp.StatusCode)
-	}
-	var m graphMessage
-	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
-		return Message{}, err
-	}
-	html, text := "", ""
-	if strings.EqualFold(m.Body.ContentType, "html") {
-		html = m.Body.Content
-		text = stripHTML(m.Body.Content)
-	} else {
-		text = m.Body.Content
-	}
-	t, _ := time.Parse(time.RFC3339, m.ReceivedDateTime)
-	return Message{
-		ID:         m.ID,
-		From:       m.From.EmailAddress.Address,
-		FromName:   m.From.EmailAddress.Name,
-		Subject:    m.Subject,
-		ReceivedAt: t,
-		HTML:       html,
-		Text:       text,
-	}, nil
-}
-
-type graphMessage struct {
-	ID               string `json:"id"`
-	Subject          string `json:"subject"`
-	ReceivedDateTime string `json:"receivedDateTime"`
-	Body             struct {
-		ContentType string `json:"contentType"`
-		Content     string `json:"content"`
-	} `json:"body"`
-	From struct {
-		EmailAddress struct {
-			Address string `json:"address"`
-			Name    string `json:"name"`
-		} `json:"emailAddress"`
-	} `json:"from"`
-}
-
-func (c *Client) listFolder(ctx context.Context, tok string, acc Account, folder string, top int) ([]graphMessage, error) {
-	q := url.Values{}
-	q.Set("$top", fmt.Sprintf("%d", top))
-	q.Set("$orderby", "receivedDateTime desc")
-	q.Set("$select", "id,subject,receivedDateTime,from")
-	u := fmt.Sprintf("%s/me/mailFolders/%s/messages?%s", graphBase, folder, q.Encode())
-
-	resp, err := c.graphGet(ctx, tok, u)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode == http.StatusUnauthorized {
-		resp.Body.Close()
-		c.invalidate(acc.RefreshToken)
-		newTok, terr := c.accessToken(ctx, acc)
-		if terr != nil {
-			return nil, terr
-		}
-		resp, err = c.graphGet(ctx, newTok, u)
+	for attempt := 0; attempt < 2; attempt++ {
+		tok, err := c.accessToken(ctx, acc)
 		if err != nil {
 			return nil, err
 		}
+		var messages []Message
+		if tok.protocol == protocolIMAP {
+			messages, err = c.listIMAPMessages(ctx, acc, tok.access, limit)
+		} else {
+			messages, err = c.listGraphMessages(ctx, tok.access, limit)
+		}
+		if !errors.Is(err, errTokenUnauthorized) && !errors.Is(err, errIMAPAuthRejected) {
+			return messages, err
+		}
+		c.invalidate(acc.RefreshToken)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("graph status=%d", resp.StatusCode)
-	}
-	var data struct {
-		Value []graphMessage `json:"value"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		return nil, err
-	}
-	return data.Value, nil
+	return nil, ErrAuthFailed
 }
 
-func (c *Client) graphGet(ctx context.Context, tok, u string) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		return nil, err
+// GetMessage fetches one complete message. IMAP IDs encode the mailbox and
+// immutable UID; Graph IDs are passed through unchanged.
+func (c *Client) GetMessage(ctx context.Context, acc Account, msgID string) (Message, error) {
+	if err := validateAccount(acc); err != nil {
+		return Message{}, err
 	}
-	req.Header.Set("Authorization", "Bearer "+tok)
-	req.Header.Set("Accept", "application/json")
-	return c.http.Do(req)
+	for attempt := 0; attempt < 2; attempt++ {
+		tok, err := c.accessToken(ctx, acc)
+		if err != nil {
+			return Message{}, err
+		}
+		var message Message
+		if tok.protocol == protocolIMAP {
+			message, err = c.getIMAPMessage(ctx, acc, tok.access, msgID)
+		} else {
+			message, err = c.getGraphMessage(ctx, tok.access, msgID)
+		}
+		if !errors.Is(err, errTokenUnauthorized) && !errors.Is(err, errIMAPAuthRejected) {
+			return message, err
+		}
+		c.invalidate(acc.RefreshToken)
+	}
+	return Message{}, ErrAuthFailed
 }
 
-func (c *Client) accessToken(ctx context.Context, acc Account) (string, error) {
+func validateAccount(acc Account) error {
 	if acc.ClientID == "" || acc.RefreshToken == "" {
-		return "", ErrMissingCreds
+		return ErrMissingCreds
 	}
-	c.tokMu.Lock()
-	if t, ok := c.tokens[acc.RefreshToken]; ok && time.Until(t.expiresAt) > 60*time.Second {
-		c.tokMu.Unlock()
-		return t.access, nil
-	}
-	c.tokMu.Unlock()
-
-	form := url.Values{}
-	form.Set("client_id", acc.ClientID)
-	form.Set("refresh_token", acc.RefreshToken)
-	form.Set("grant_type", "refresh_token")
-	form.Set("scope", graphScope)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, strings.NewReader(form.Encode()))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("%w: %v", ErrAuthFailed, err)
-	}
-	defer resp.Body.Close()
-
-	var tr struct {
-		AccessToken string `json:"access_token"`
-		ExpiresIn   int    `json:"expires_in"`
-		Error       string `json:"error"`
-		ErrorDesc   string `json:"error_description"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&tr); err != nil {
-		return "", err
-	}
-	if tr.Error != "" {
-		return "", fmt.Errorf("%w: %s: %s", ErrAuthFailed, tr.Error, tr.ErrorDesc)
-	}
-	if tr.AccessToken == "" {
-		return "", fmt.Errorf("%w: empty access_token", ErrAuthFailed)
-	}
-	ttl := time.Duration(tr.ExpiresIn) * time.Second
-	if ttl <= 0 {
-		ttl = 60 * time.Minute
-	}
-	c.tokMu.Lock()
-	c.tokens[acc.RefreshToken] = cachedToken{access: tr.AccessToken, expiresAt: time.Now().Add(ttl)}
-	c.tokMu.Unlock()
-	return tr.AccessToken, nil
+	return nil
 }
 
-func (c *Client) invalidate(refreshTok string) {
-	c.tokMu.Lock()
-	delete(c.tokens, refreshTok)
-	c.tokMu.Unlock()
-}
-
-var (
-	htmlTagRe  = regexp.MustCompile(`<[^>]*>`)
-	htmlEntity = regexp.MustCompile(`&[a-zA-Z0-9#]+;`)
-	wsRe       = regexp.MustCompile(`\s+`)
-)
-
-func stripHTML(s string) string {
-	s = htmlTagRe.ReplaceAllString(s, " ")
-	s = htmlEntity.ReplaceAllString(s, " ")
-	return strings.TrimSpace(wsRe.ReplaceAllString(s, " "))
+func sortAndLimit(messages []Message, limit int) []Message {
+	sort.Slice(messages, func(i, j int) bool {
+		return messages[i].ReceivedAt.After(messages[j].ReceivedAt)
+	})
+	if len(messages) > limit {
+		return messages[:limit]
+	}
+	return messages
 }

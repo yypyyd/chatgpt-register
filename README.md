@@ -41,9 +41,9 @@
     ↓
 完成注册 → 获取 accessToken
     ↓
-生成 Ed25519 密钥对，调用 auth.openai.com 注册 Codex Agent Identity
+保存 ChatGPT accessToken 和账号元数据（不注册 Agent Identity）
     ↓
-导出完整 auth.json（含 agent_runtime_id / private_key / account_id 等）
+导出 ChatGPT 账号凭据 JSON
     ↓
 写入数据库，账号状态更新为「已注册」
 ```
@@ -188,8 +188,11 @@ ADDR=8080 ./chatgpt-register.exe
 ### 邮箱管理
 
 - 状态四态：`待验证 / 验证中 / 验证失败 / 已验证`
+- 导入后由服务端 10 并发后台认证；关闭页面或重启服务后会自动继续
+- 支持重新认证所选邮箱、仅认证失败邮箱或全部邮箱，无效凭据立即失败，临时网络错误自动重试
+- 邮箱管理、账户管理和仪表盘列表均提供带二次确认的“全部删除”操作
 - 「取件」弹窗：3 秒轮询实时收件，sandbox iframe 隔离展示邮件内容
-- 支持 Outlook（需填 `client_id` + `refresh_token`，Microsoft Graph API）
+- 支持 Outlook（需填 `client_id` + `refresh_token`）：自动识别 OAuth 权限并选择 Microsoft Graph 或 Outlook IMAP XOAUTH2，兼容两类刷新令牌
 
 ---
 
@@ -206,7 +209,7 @@ ADDR=8080 ./chatgpt-register.exe
   ```
   `provider` 支持 `outlook` / `hotmail` / `gmail` 等
 
-> Outlook 邮箱需额外填写 `client_id` 和 `refresh_token`（用于 Microsoft Graph API 自动收件）
+> Outlook 邮箱需额外填写 `client_id` 和 `refresh_token`。系统优先按 Microsoft Graph `.default` 刷新令牌；旧式令牌不接受该 scope（`AADSTS90023`）时自动按原授权刷新，并通过 Outlook IMAP XOAUTH2 收件，无需手动选择协议。
 
 ---
 

@@ -7,6 +7,7 @@ import (
 	"chatgpt-register/internal/auth"
 	"chatgpt-register/internal/browserboot"
 	"chatgpt-register/internal/mailfetch"
+	"chatgpt-register/internal/mailverify"
 	"chatgpt-register/internal/models"
 	"chatgpt-register/internal/producer"
 
@@ -15,16 +16,21 @@ import (
 )
 
 type Handler struct {
-	DB       *gorm.DB
-	Mail     *mailfetch.Client
-	Auth     *auth.Service
-	Producer *producer.Producer
-	Browser  *browserboot.Manager
+	DB              *gorm.DB
+	Mail            *mailfetch.Client
+	Auth            *auth.Service
+	Producer        *producer.Producer
+	Browser         *browserboot.Manager
+	MailboxVerifier *mailverify.Service
 }
 
-func New(db *gorm.DB, authSvc *auth.Service, browser *browserboot.Manager) *Handler {
+func New(db *gorm.DB, authSvc *auth.Service, browser *browserboot.Manager) (*Handler, error) {
 	mail := mailfetch.New()
-	return &Handler{DB: db, Mail: mail, Auth: authSvc, Producer: producer.New(db, mail), Browser: browser}
+	verifier := mailverify.New(db, mail, mailverify.DefaultConcurrency)
+	if err := verifier.Start(); err != nil {
+		return nil, err
+	}
+	return &Handler{DB: db, Mail: mail, Auth: authSvc, Producer: producer.New(db, mail), Browser: browser, MailboxVerifier: verifier}, nil
 }
 
 type registrationInput struct {
@@ -148,6 +154,19 @@ func (h *Handler) Delete(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+func (h *Handler) DeleteAll(c *gin.Context) {
+	if h.Producer.Snapshot().Running {
+		c.JSON(http.StatusConflict, gin.H{"error": "生产任务运行中，不能删除全部账户"})
+		return
+	}
+	r := h.DB.Where("1 = 1").Delete(&models.Registration{})
+	if r.Error != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": r.Error.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"deleted": r.RowsAffected})
 }
 
 func (h *Handler) Stats(c *gin.Context) {

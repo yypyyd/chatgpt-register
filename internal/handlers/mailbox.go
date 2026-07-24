@@ -126,6 +126,7 @@ func (h *Handler) MailboxImport(c *gin.Context) {
 		return
 	}
 	added, skipped := 0, 0
+	ids := make([]uint, 0, len(in.Items))
 	seen := map[string]bool{}
 	for _, it := range in.Items {
 		email := strings.TrimSpace(it.Email)
@@ -145,36 +146,79 @@ func (h *Handler) MailboxImport(c *gin.Context) {
 			Password:     strings.TrimSpace(it.Password),
 			ClientID:     strings.TrimSpace(it.ClientID),
 			RefreshToken: strings.TrimSpace(it.RefreshToken),
-			Status:       "verifying",
+			Status:       "unverified",
 		}
 		if err := h.DB.Create(&m).Error; err != nil {
 			skipped++
 			continue
 		}
 		added++
+		ids = append(ids, m.ID)
 	}
-	c.JSON(http.StatusOK, gin.H{"added": added, "skipped": skipped})
+	if len(ids) > 0 {
+		h.MailboxVerifier.Wake()
+	}
+	c.JSON(http.StatusOK, gin.H{"added": added, "skipped": skipped, "queued": len(ids)})
 }
 
-// MailboxVerify 校验单个邮箱凭据是否可用，更新状态为 verified / verify_failed。
+// MailboxVerify 把单个邮箱提交给持久化认证队列。
 func (h *Handler) MailboxVerify(c *gin.Context) {
-	var m models.Mailbox
-	if err := h.DB.First(&m, c.Param("id")).Error; err != nil {
+	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无效邮箱 ID"})
+		return
+	}
+	queued, err := h.MailboxVerifier.Reauthenticate([]uint{uint(id)})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if queued == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "邮箱不存在"})
 		return
 	}
-	err := h.Mail.Verify(c.Request.Context(), mailfetch.Account{
-		Email:        m.Email,
-		ClientID:     m.ClientID,
-		RefreshToken: m.RefreshToken,
-	})
-	if err != nil {
-		m.Status = "verify_failed"
-	} else {
-		m.Status = "verified"
+	c.JSON(http.StatusAccepted, gin.H{"id": uint(id), "status": "queued"})
+}
+
+// MailboxReauthenticate queues selected, failed, or every mailbox for fresh authentication.
+func (h *Handler) MailboxReauthenticate(c *gin.Context) {
+	var in struct {
+		IDs    []uint `json:"ids"`
+		Failed bool   `json:"failed"`
+		All    bool   `json:"all"`
 	}
-	h.DB.Model(&m).Update("status", m.Status)
-	c.JSON(http.StatusOK, gin.H{"id": m.ID, "status": m.Status})
+	if err := c.ShouldBindJSON(&in); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	modes := 0
+	if len(in.IDs) > 0 {
+		modes++
+	}
+	if in.Failed {
+		modes++
+	}
+	if in.All {
+		modes++
+	}
+	if modes != 1 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请选择一种重新认证范围"})
+		return
+	}
+	var queued int64
+	var err error
+	if in.Failed {
+		queued, err = h.MailboxVerifier.ReauthenticateFailed()
+	} else if in.All {
+		queued, err = h.MailboxVerifier.ReauthenticateAll()
+	} else {
+		queued, err = h.MailboxVerifier.Reauthenticate(in.IDs)
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusAccepted, gin.H{"queued": queued})
 }
 
 func (h *Handler) MailboxUpdate(c *gin.Context) {
@@ -214,6 +258,15 @@ func (h *Handler) MailboxDelete(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+func (h *Handler) MailboxDeleteAll(c *gin.Context) {
+	r := h.DB.Where("1 = 1").Delete(&models.Mailbox{})
+	if r.Error != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": r.Error.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"deleted": r.RowsAffected})
 }
 
 // MailboxMessages 取件：拉某个邮箱收件箱最新邮件，含完整 HTML 正文，供网页弹窗轮询展示。

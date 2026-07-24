@@ -1,4 +1,4 @@
-// Package producer 编排 ChatGPT + Codex 账号的批量"生产"。
+// Package producer 编排 ChatGPT 账号的批量"生产"。
 //
 // 规则：维持"母号 + 指定数量的裂变"——每个邮箱先注册主号(母号，用邮箱本身地址)，
 // 母号成功后才用别名(email-001@…)注册裂变子号，每个邮箱最多 1 + FissionCount 个账号。
@@ -257,7 +257,7 @@ func (p *Producer) nextJob(cfg Config) (models.Mailbox, string, bool, bool) {
 	return models.Mailbox{}, "", false, false
 }
 
-// produceOne 完整生产一个账号：注册 ChatGPT → 生成 Codex agent identity → 入库。
+// produceOne 完整生产一个账号：注册 ChatGPT → 保存账号凭据 → 入库。
 func (p *Producer) produceOne(ctx context.Context, cfg Config, mb models.Mailbox, email string, isMother bool) error {
 	password := codexreg.GenPassword(16)
 	note := ""
@@ -318,7 +318,7 @@ func (p *Producer) produceOne(ctx context.Context, cfg Config, mb models.Mailbox
 		return err
 	}
 
-	appendLog("✓ 注册成功")
+	appendLog("✓ ChatGPT 注册成功（未执行 Agent Identity）")
 	authBytes, _ := json.MarshalIndent(res.AuthJSON, "", "  ")
 	p.upsert(models.Registration{
 		Email: email, MailboxID: mb.ID, Password: password,

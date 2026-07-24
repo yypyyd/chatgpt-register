@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>邮箱管理 · ChatGPT 注册管理</title>
-<link rel="stylesheet" href="/static/style.css?v=8">
+<link rel="stylesheet" href="/static/style.css?v=15">
 </head>
 <body data-page="mailboxes">
 <div class="layout">
@@ -20,9 +20,22 @@
         <option value="verified">已验证</option>
       </select>
       <button class="px-btn primary" onclick="openImportModal()">批量导入邮箱</button>
+      <div class="px-select reauth-actions" id="reauth-actions">
+        <button type="button" class="px-select-btn" onclick="toggleReauthActions(event)">
+          <span class="px-select-label">重新认证</span>
+          <svg class="px-select-arrow" viewBox="0 0 24 24"><path d="M7.41 8.59 12 13.17l4.59-4.58L18 10l-6 6-6-6z"/></svg>
+        </button>
+        <div class="px-select-menu">
+          <button type="button" class="px-select-opt" id="reauth-selected-action" onclick="reauthenticateSelected()" style="display:none">认证所选邮箱</button>
+          <button type="button" class="px-select-opt reauth-scope-action" onclick="reauthenticateFailed()">仅认证失败邮箱</button>
+          <button type="button" class="px-select-opt reauth-scope-action" onclick="reauthenticateAll()">认证全部邮箱</button>
+        </div>
+      </div>
+      <button class="px-btn danger" onclick="deleteAllMailboxes()">全部删除</button>
     </div>
     <div class="batch-bar" id="mb-batch" style="display:none">
       <span id="mb-batch-count">已选 0 项</span>
+      <button class="px-btn" onclick="reauthenticateSelected()">重新认证所选</button>
       <button class="px-btn danger" onclick="delSelected()">删除所选</button>
       <button class="px-btn ghost" onclick="clearSelection()">取消</button>
     </div>
@@ -100,6 +113,6 @@
 
 <div id="toast" class="toast" style="display:none"></div>
 <script src="/static/layout.js"></script>
-<script src="/static/mailboxes.js?v=7"></script>
+<script src="/static/mailboxes.js?v=9"></script>
 </body>
 </html>

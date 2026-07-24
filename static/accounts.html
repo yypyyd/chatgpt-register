@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>账户管理 · ChatGPT 注册管理</title>
-<link rel="stylesheet" href="/static/style.css?v=13">
+<link rel="stylesheet" href="/static/style.css?v=14">
 </head>
 <body data-page="accounts">
 <div class="layout">
@@ -35,6 +35,7 @@
         <option value="already_registered">停用</option>
       </select>
       <button class="px-btn primary" id="produce-btn" onclick="openProduceModal()">生产</button>
+      <button class="px-btn danger" onclick="deleteAllAccounts()">全部删除</button>
     </div>
 
     <div class="batch-bar" id="acc-batch" style="display:none">
@@ -61,7 +62,7 @@
 <div class="modal-mask" id="produce-modal" style="display:none">
   <div class="modal px-panel" style="width:420px">
     <h2>生产账号</h2>
-    <div class="import-sub">填写要生产的账号数量，后台会用「母号 + 裂变」自动注册 ChatGPT + Codex 账号。</div>
+    <div class="import-sub">填写要生产的账号数量，后台会用「母号 + 裂变」自动注册 ChatGPT 账号，不执行 Agent Identity。</div>
     <label class="produce-field">
       <span>生产数量</span>
       <input id="produce-count" class="px-input" type="number" min="1" value="10">
@@ -100,6 +101,6 @@
 
 <div id="toast" class="toast" style="display:none"></div>
 <script src="/static/layout.js?v=2"></script>
-<script src="/static/accounts.js?v=11"></script>
+<script src="/static/accounts.js?v=12"></script>
 </body>
 </html>

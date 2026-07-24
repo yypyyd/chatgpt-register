@@ -160,6 +160,8 @@ body {
 
 .dash-recent { padding: 20px 22px; margin-top: 10px; }
 .dash-recent h2 { margin: 0 0 14px; font-size: 15px; font-weight: 600; }
+.panel-title-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+.dash-recent .panel-title-row h2 { margin: 0; }
 
 /* 旧的 settings-panel 已由 settings-card 取代 */
 
@@ -239,6 +241,11 @@ select.px-input option { background: #fff; }
 }
 .px-select-opt:hover { background: #f2f5fa; color: var(--primary); }
 .px-select-opt.active { background: var(--primary-soft); color: var(--primary); font-weight: 600; }
+.reauth-actions { min-width: 152px; }
+.reauth-actions .px-select-opt {
+  display: block; width: 100%; border: 0; text-align: left;
+  background: transparent; font-family: inherit;
+}
 
 .px-btn {
   height: 36px; padding: 0 15px; cursor: pointer; color: var(--text-2);

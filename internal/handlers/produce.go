@@ -29,10 +29,30 @@ func buildCredentials(authData, email string) map[string]any {
 	var parsed map[string]any
 	_ = json.Unmarshal([]byte(authData), &parsed)
 	ai, _ := parsed["agent_identity"].(map[string]any)
-	if ai == nil {
-		ai = map[string]any{}
+	if ai != nil {
+		str := func(k string) string { s, _ := ai[k].(string); return s }
+		planType := str("plan_type")
+		if planType == "" {
+			planType = "free"
+		}
+		em := str("email")
+		if em == "" {
+			em = email
+		}
+		fedramp, _ := ai["chatgpt_account_is_fedramp"].(bool)
+		return map[string]any{
+			"agent_private_key":          str("agent_private_key"),
+			"agent_runtime_id":           str("agent_runtime_id"),
+			"auth_mode":                  "agentIdentity",
+			"chatgpt_account_id":         str("account_id"),
+			"chatgpt_account_is_fedramp": fedramp,
+			"chatgpt_user_id":            str("chatgpt_user_id"),
+			"email":                      em,
+			"plan_type":                  planType,
+		}
 	}
-	str := func(k string) string { s, _ := ai[k].(string); return s }
+
+	str := func(k string) string { s, _ := parsed[k].(string); return s }
 	planType := str("plan_type")
 	if planType == "" {
 		planType = "free"
@@ -41,16 +61,13 @@ func buildCredentials(authData, email string) map[string]any {
 	if em == "" {
 		em = email
 	}
-	fedramp, _ := ai["chatgpt_account_is_fedramp"].(bool)
 	return map[string]any{
-		"agent_private_key":          str("agent_private_key"),
-		"agent_runtime_id":           str("agent_runtime_id"),
-		"auth_mode":                  "agentIdentity",
-		"chatgpt_account_id":         str("account_id"),
-		"chatgpt_account_is_fedramp": fedramp,
-		"chatgpt_user_id":            str("chatgpt_user_id"),
-		"email":                      em,
-		"plan_type":                  planType,
+		"access_token":       str("access_token"),
+		"auth_mode":          "chatgpt",
+		"chatgpt_account_id": str("account_id"),
+		"chatgpt_user_id":    str("chatgpt_user_id"),
+		"email":              em,
+		"plan_type":          planType,
 	}
 }
 

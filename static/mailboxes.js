@@ -72,14 +72,56 @@ function syncBatchBar() {
   const bar = document.getElementById('mb-batch');
   bar.style.display = mbSelected.size ? 'flex' : 'none';
   document.getElementById('mb-batch-count').textContent = '已选 ' + mbSelected.size + ' 项';
+  const selectedAction = document.getElementById('reauth-selected-action');
+  selectedAction.textContent = '认证所选 ' + mbSelected.size + ' 个邮箱';
+  selectedAction.style.display = mbSelected.size ? 'block' : 'none';
+  document.querySelectorAll('.reauth-scope-action').forEach(action => {
+    action.style.display = mbSelected.size ? 'none' : 'block';
+  });
   const all = document.getElementById('mb-check-all');
   const ids = Object.keys(mbCache).map(Number);
   all.checked = ids.length > 0 && ids.every(id => mbSelected.has(id));
 }
 
-async function verifySelected() {
-  if (!mbSelected.size) return;
-  await runVerify([...mbSelected]);
+async function reauthenticateSelected() {
+  const ids = [...mbSelected];
+  if (!ids.length) return;
+  if (!confirm('确定重新认证所选 ' + ids.length + ' 个邮箱？')) return;
+  await queueReauthentication({ ids });
+}
+
+function toggleReauthActions(event) {
+  event.stopPropagation();
+  const actions = document.getElementById('reauth-actions');
+  document.querySelectorAll('.px-select.open').forEach(x => {
+    if (x !== actions) x.classList.remove('open');
+  });
+  actions.classList.toggle('open');
+}
+
+async function reauthenticateFailed() {
+  if (!confirm('确定重新认证全部认证失败的邮箱？认证将在后台继续运行。')) return;
+  await queueReauthentication({ failed: true }, '没有认证失败的邮箱');
+}
+
+async function reauthenticateAll() {
+  if (!confirm('确定重新认证全部邮箱？认证将在后台继续运行。')) return;
+  await queueReauthentication({ all: true });
+}
+
+async function queueReauthentication(body, emptyMessage) {
+  const r = await api('/api/mailboxes/reauthenticate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) return toast('提交失败: ' + (d.error || r.status), true);
+  const queued = Number(d.queued || 0);
+  if (!queued && emptyMessage) toast(emptyMessage);
+  else toast('已提交 ' + queued + ' 个邮箱，后台认证中');
+  mbSelected.clear();
+  loadMailboxes();
 }
 
 async function delSelected() {
@@ -91,6 +133,18 @@ async function delSelected() {
     mbSelected.delete(id);
   }
   toast('已删除 ' + ids.length + ' 个');
+  loadMailboxes();
+}
+
+async function deleteAllMailboxes() {
+  if (!confirm('确定删除全部邮箱？此操作不可恢复。')) return;
+  if (!confirm('再次确认：将永久删除邮箱管理中的全部记录。')) return;
+  const r = await api('/api/mailboxes', { method: 'DELETE' });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) return toast('全部删除失败: ' + (d.error || r.status), true);
+  mbSelected.clear();
+  mbPage = 1;
+  toast('已删除 ' + (d.deleted || 0) + ' 个邮箱');
   loadMailboxes();
 }
 
@@ -155,60 +209,7 @@ async function doImport() {
   toast(`识别 ${items.length} 个：新增 ${d.added}，跳过 ${d.skipped}`);
   mbPage = 1;
   loadMailboxes();
-  if (d.added > 0) verifyAll(); // 导入后自动验证
-}
-
-/* ===== 批量验证：10 并发，10 个一批 ===== */
-let verifying = false;
-
-async function verifyAll() {
-  if (verifying) return;
-  // 拉取所有待验证 / 验证失败的邮箱 id
-  const ids = [];
-  let page = 1;
-  for (;;) {
-    const r = await api('/api/mailboxes?' + new URLSearchParams({ page, size: 100 }));
-    const d = await r.json().catch(() => ({}));
-    const list = d.data || [];
-    list.forEach(x => {
-      if (x.status === 'unverified' || x.status === 'verify_failed' || x.status === 'verifying') ids.push(x.id);
-    });
-    if (page * 100 >= (d.total || 0) || !list.length) break;
-    page++;
-  }
-  if (!ids.length) return toast('没有需要验证的邮箱');
-  await runVerify(ids);
-}
-
-// 10 并发验证给定的邮箱 id 列表
-async function runVerify(ids) {
-  if (verifying || !ids.length) return;
-  verifying = true;
-  let ok = 0, fail = 0;
-  const CONCURRENCY = 10;
-  let idx = 0;
-
-  async function worker() {
-    while (idx < ids.length) {
-      const id = ids[idx++];
-      try {
-        const r = await api('/api/mailboxes/' + id + '/verify', { method: 'POST' });
-        const d = await r.json().catch(() => ({}));
-        if (d.status === 'verified') ok++; else fail++;
-      } catch (e) {
-        fail++;
-      }
-      loadMailboxes();
-    }
-  }
-
-  const workers = [];
-  for (let i = 0; i < CONCURRENCY; i++) workers.push(worker());
-  await Promise.all(workers);
-
-  verifying = false;
-  toast(`验证完成：成功 ${ok}，失败 ${fail}`);
-  loadMailboxes();
+  if (d.added > 0) toast(`已加入后台认证队列：${d.queued || d.added} 个`);
 }
 
 function openMailboxModal(data) {

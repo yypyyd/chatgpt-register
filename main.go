@@ -46,7 +46,11 @@ func main() {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.Default()
 
-	h := handlers.New(database, authSvc, browser)
+	h, err := handlers.New(database, authSvc, browser)
+	if err != nil {
+		log.Fatalf("init mailbox verifier: %v", err)
+	}
+	defer h.MailboxVerifier.Stop()
 
 	r.POST("/api/login", h.Login)
 
@@ -56,6 +60,7 @@ func main() {
 
 		api.GET("/stats", h.Stats)
 		api.GET("/registrations", h.List)
+		api.DELETE("/registrations", h.DeleteAll)
 		api.GET("/registrations/:id", h.Get)
 		api.POST("/registrations", h.Create)
 		api.PUT("/registrations/:id", h.Update)
@@ -71,8 +76,10 @@ func main() {
 		api.GET("/browser/status", h.BrowserStatus)
 
 		api.GET("/mailboxes", h.MailboxList)
+		api.DELETE("/mailboxes", h.MailboxDeleteAll)
 		api.POST("/mailboxes", h.MailboxCreate)
 		api.POST("/mailboxes/import", h.MailboxImport)
+		api.POST("/mailboxes/reauthenticate", h.MailboxReauthenticate)
 		api.POST("/mailboxes/:id/verify", h.MailboxVerify)
 		api.PUT("/mailboxes/:id", h.MailboxUpdate)
 		api.DELETE("/mailboxes/:id", h.MailboxDelete)

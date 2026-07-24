@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>仪表盘 · ChatGPT 注册管理</title>
-<link rel="stylesheet" href="/static/style.css?v=13">
+<link rel="stylesheet" href="/static/style.css?v=14">
 </head>
 <body data-page="dashboard">
 <div class="layout">
@@ -86,7 +86,10 @@
 
     <!-- 最近账户 -->
     <div class="px-panel dash-recent">
-      <h2>最近账户</h2>
+      <div class="panel-title-row">
+        <h2>最近账户</h2>
+        <button class="px-btn danger" onclick="deleteAllAccounts()">全部删除</button>
+      </div>
       <table class="px-table">
         <thead><tr><th>ID</th><th>Email</th><th>母号</th><th>状态</th><th>出库</th><th>创建时间</th></tr></thead>
         <tbody id="dash-rows"></tbody>
@@ -200,6 +203,16 @@ async function loadBrowser() {
   const pct = s.percent || 0;
   document.getElementById('bb-pct').textContent = (s.phase === 'downloading' || s.phase === 'unzip') ? pct + '%' : '';
   document.getElementById('bb-bar').style.width = (s.phase === 'error' ? 100 : pct) + '%';
+}
+
+async function deleteAllAccounts() {
+  if (!confirm('确定删除全部账户？此操作不可恢复。')) return;
+  if (!confirm('再次确认：将永久删除所有账户记录。')) return;
+  const r = await api('/api/registrations', { method: 'DELETE' });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) return toast('全部删除失败: ' + (d.error || r.status), true);
+  toast('已删除 ' + (d.deleted || 0) + ' 个账户');
+  loadDashboard();
 }
 
 loadDashboard();
