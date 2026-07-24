@@ -45,9 +45,10 @@ function rowHtml(x) {
         <button class="icon-btn" title="日志" onclick="showLog(${x.id})">
           <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M8 13h8M8 17h5"/></svg>
         </button>
-        <button class="icon-btn" title="下载" ${canDownload ? '' : 'disabled'} onclick="downloadAcc(${x.id})">
+        <button class="icon-btn" title="下载 Sub2API" ${canDownload ? '' : 'disabled'} onclick="downloadAcc(${x.id}, 'sub2api')">
           <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/></svg>
         </button>
+        <button class="icon-btn" title="下载 CPA" ${canDownload ? '' : 'disabled'} onclick="downloadAcc(${x.id}, 'cpa')" style="font-size:10px;font-weight:700">CPA</button>
         <button class="icon-btn danger" title="删除" onclick="del(${x.id})">
           <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2m2 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M10 11v6M14 11v6"/></svg>
         </button>
@@ -190,26 +191,29 @@ function syncBatchBar() {
   all.checked = ids.length > 0 && ids.every(id => accSelected.has(id));
 }
 
-/* ===== 下载（账号凭据 JSON，单个→对象，多个→数组；下载即出库） ===== */
-async function downloadAcc(id) {
-  await downloadByIds([id], 'auth_' + id + '.json');
+/* ===== 下载（Sub2API 聚合 JSON / CPA 单账号 JSON 或多账号 ZIP；下载即出库） ===== */
+async function downloadAcc(id, format) {
+  await downloadByIds([id], format, format === 'cpa' ? 'codex-auth.json' : 'auth_' + id + '.json');
 }
-async function downloadSelected() {
+async function downloadSelected(format) {
   const ids = [...accSelected];
   if (!ids.length) return;
-  await downloadByIds(ids, 'auth_' + ids.length + '.json');
+  await downloadByIds(ids, format, format === 'cpa' ? 'cpa_auth_' + ids.length + '.zip' : 'auth_' + ids.length + '.json');
 }
-async function downloadByIds(ids, filename) {
+async function downloadByIds(ids, format, fallbackFilename) {
   const r = await api('/api/download', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ids }),
+    body: JSON.stringify({ ids, format }),
   });
   if (!r.ok) {
     const d = await r.json().catch(() => ({}));
     return toast(d.error || '下载失败', true);
   }
   const blob = await r.blob();
+  const disposition = r.headers.get('Content-Disposition') || '';
+  const match = disposition.match(/filename="?([^";]+)"?/i);
+  const filename = match ? match[1] : fallbackFilename;
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
   a.download = filename;

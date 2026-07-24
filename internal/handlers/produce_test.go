@@ -1,8 +1,11 @@
 package handlers
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestBuildCredentialsForChatGPTOnly(t *testing.T) {
@@ -23,6 +26,44 @@ func TestBuildCredentialsForChatGPTOnly(t *testing.T) {
 	}
 	if _, exists := got["agent_runtime_id"]; exists {
 		t.Fatal("new ChatGPT credentials must not contain agent fields")
+	}
+}
+
+func TestBuildCPACredentials(t *testing.T) {
+	exp := time.Date(2026, 8, 1, 2, 3, 4, 0, time.UTC)
+	payload, err := json.Marshal(map[string]any{"exp": exp.Unix()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := "header." + base64.RawURLEncoding.EncodeToString(payload) + ".signature"
+	raw, err := json.Marshal(map[string]any{
+		"access_token": token,
+		"account_id":   "account-1",
+		"email":        "person@example.com",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 7, 25, 1, 2, 3, 0, time.UTC)
+	got := buildCPACredentials(string(raw), "fallback@example.com", now)
+	if got["type"] != "codex" || got["access_token"] != token || got["account_id"] != "account-1" {
+		t.Fatalf("unexpected CPA credentials: %#v", got)
+	}
+	if got["expired"] != exp.Format(time.RFC3339) {
+		t.Fatalf("expired = %q, want %q", got["expired"], exp.Format(time.RFC3339))
+	}
+	if got["refresh_token"] != "" {
+		t.Fatalf("refresh_token = %q, want empty", got["refresh_token"])
+	}
+	if got["id_token"] != "" {
+		t.Fatalf("id_token = %q, want empty", got["id_token"])
+	}
+}
+
+func TestCPAFileNamePreventsPathTraversal(t *testing.T) {
+	if got := cpaFileName("../bad\\name@example.com\r\nInjected: yes"); strings.ContainsAny(got, "/\\\r\n: ") {
+		t.Fatalf("unsafe filename: %q", got)
 	}
 }
 

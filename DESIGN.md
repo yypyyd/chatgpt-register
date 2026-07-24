@@ -24,6 +24,12 @@
 
 IMAP 读取固定使用 TLS 993 和最低 TLS 1.2，读取 `INBOX`，并通过 `LIST` 的 `\Junk` 属性发现垃圾邮件目录（兼容 `Junk` / `Junk Email`）。列表只取信封头，正文按需通过 UID FETCH 获取；对外 ID 使用 `imap:<base64-folder>:<uid>` 的不透明格式，MIME 正文限制为单个文本部分最多 8 MiB。访问令牌连同协议类型缓存在内存中，不写入数据库或日志。
 
+### 双格式凭据导出
+
+下载接口通过显式 `format` 参数区分 Sub2API 与 CLIProxyAPI（CPA），缺省保持原有 Sub2API 格式以兼容旧客户端。CPA 使用其 auth-dir 所需的扁平 `type=codex` JSON，并从 access token 的 JWT `exp` 生成 RFC3339 `expired`；单账号直接返回 JSON，多账号返回 ZIP 且每个账号独立成文件。文件名会过滤路径分隔符，避免压缩包路径穿越。
+
+注册流程只获得 ChatGPT 网页会话 access token，因此 CPA 导出的 `refresh_token` 和 `id_token` 为空。导出格式转换不改变上游授权范围，也不能解决账号本身对 Codex Responses 的 401；凭据过期后不能由 CPA 自动刷新。
+
 ## 已知限制
 
 - 面向单实例 SQLite 部署，不提供分布式任务锁。
@@ -41,6 +47,16 @@ IMAP 读取固定使用 TLS 993 和最低 TLS 1.2，读取 `INBOX`，并通过 `
 - **已知风险**：管理员凭据被盗后仍可执行不可恢复的全部删除；应依赖强管理员密码、HTTPS 与数据库备份降低风险。
 
 ## 变更历史
+
+### 2026-07-25 - 增加 CPA 凭据导出
+
+**变更内容**：账户管理增加 Sub2API 与 CPA 两个直接导出选项；后端生成 CPA 扁平认证 JSON，批量时按账号打包 ZIP，并从 JWT 提取准确过期时间。
+
+**变更理由**：让已注册账号无需手工转换即可放入 CLIProxyAPI 的 `auth-dir`，同时保持原有 Sub2API 导出接口兼容。
+
+**影响范围**：账户下载接口、CPA 文件打包与命名、账户管理交互、单元测试及使用文档。
+
+**决策依据**：对照 CLIProxyAPI 当前 `CodexTokenStorage` 与文件加载器字段定义；空缺的 OAuth refresh/id token 保持为空，不伪造不可用凭据。
 
 ### 2026-07-25 - 重新认证范围选择
 

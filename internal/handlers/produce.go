@@ -1,9 +1,14 @@
 package handlers
 
 import (
+	"archive/zip"
+	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"time"
+	"unicode"
 
 	"chatgpt-register/internal/models"
 
@@ -22,6 +27,73 @@ type exportAccount struct {
 	Platform    string         `json:"platform"`
 	Type        string         `json:"type"`
 	Credentials map[string]any `json:"credentials"`
+}
+
+// buildCPACredentials maps a stored ChatGPT session to CLIProxyAPI's flat
+// Codex auth-file format. A session-only registration has no refresh token,
+// so the field is kept empty instead of inventing a non-functional value.
+func buildCPACredentials(authData, email string, now time.Time) map[string]any {
+	var parsed map[string]any
+	_ = json.Unmarshal([]byte(authData), &parsed)
+	str := func(k string) string { s, _ := parsed[k].(string); return s }
+
+	accessToken := str("access_token")
+	em := str("email")
+	if em == "" {
+		em = email
+	}
+	expired := tokenExpiryRFC3339(accessToken)
+
+	return map[string]any{
+		"type":          "codex",
+		"id_token":      str("id_token"),
+		"access_token":  accessToken,
+		"refresh_token": str("refresh_token"),
+		"account_id":    str("account_id"),
+		"last_refresh":  now.UTC().Format(time.RFC3339),
+		"email":         em,
+		"expired":       expired,
+	}
+}
+
+func tokenExpiryRFC3339(token string) string {
+	parts := strings.Split(token, ".")
+	if len(parts) < 2 {
+		return ""
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return ""
+	}
+	var claims struct {
+		Exp json.Number `json:"exp"`
+	}
+	if err = json.Unmarshal(payload, &claims); err != nil {
+		return ""
+	}
+	exp, err := claims.Exp.Int64()
+	if err != nil || exp <= 0 {
+		return ""
+	}
+	return time.Unix(exp, 0).UTC().Format(time.RFC3339)
+}
+
+func cpaFileName(email string) string {
+	safe := strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || unicode.IsSpace(r) {
+			return '_'
+		}
+		switch r {
+		case '/', '\\', ':', '*', '?', '"', '<', '>', '|':
+			return '_'
+		default:
+			return r
+		}
+	}, strings.TrimSpace(email))
+	if safe == "" {
+		safe = "account"
+	}
+	return "codex-" + safe + ".json"
 }
 
 // buildCredentials 把库里存的 auth.json（agent_identity 结构）映射成导出用的 credentials。
@@ -145,11 +217,13 @@ func (h *Handler) SetShipped(c *gin.Context) {
 	c.JSON(http.StatusForbidden, gin.H{"error": "出库状态已锁定，只能由下载操作自动更新"})
 }
 
-// Download 下载选中账号的 auth.json：单个→对象，多个→数组；下载即标记出库。
-// 请求体：{ "ids": [1,2,3] }。
+// Download 下载选中账号。默认导出 Sub2API 聚合 JSON；format=cpa 时
+// 按 CLIProxyAPI auth-dir 格式导出，单账号为 JSON，多账号为 ZIP。
+// 请求体：{ "ids": [1,2,3], "format": "sub2api|cpa" }。
 func (h *Handler) Download(c *gin.Context) {
 	var in struct {
-		IDs []uint `json:"ids"`
+		IDs    []uint `json:"ids"`
+		Format string `json:"format"`
 	}
 	if err := c.ShouldBindJSON(&in); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -157,6 +231,13 @@ func (h *Handler) Download(c *gin.Context) {
 	}
 	if len(in.IDs) == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "未选择账号"})
+		return
+	}
+	if in.Format == "" {
+		in.Format = "sub2api"
+	}
+	if in.Format != "sub2api" && in.Format != "cpa" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "不支持的导出格式"})
 		return
 	}
 
@@ -170,9 +251,29 @@ func (h *Handler) Download(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "所选账号没有可下载的已注册数据"})
 		return
 	}
+	if in.Format == "cpa" {
+		for _, r := range regs {
+			if buildCPACredentials(r.AuthData, r.Email, time.Now())["access_token"] == "" {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "账号 " + r.Email + " 缺少 CPA 所需的 access_token"})
+				return
+			}
+		}
+	}
+
+	ids := make([]uint, 0, len(regs))
+	for _, r := range regs {
+		ids = append(ids, r.ID)
+	}
+
+	// 下载即出库
+	h.DB.Model(&models.Registration{}).Where("id IN ?", ids).Update("shipped", true)
+
+	if in.Format == "cpa" {
+		h.downloadCPA(c, regs)
+		return
+	}
 
 	accounts := make([]exportAccount, 0, len(regs))
-	ids := make([]uint, 0, len(regs))
 	for _, r := range regs {
 		accounts = append(accounts, exportAccount{
 			Name:        r.Email,
@@ -180,11 +281,7 @@ func (h *Handler) Download(c *gin.Context) {
 			Type:        "oauth",
 			Credentials: buildCredentials(r.AuthData, r.Email),
 		})
-		ids = append(ids, r.ID)
 	}
-
-	// 下载即出库
-	h.DB.Model(&models.Registration{}).Where("id IN ?", ids).Update("shipped", true)
 
 	bundle := exportBundle{
 		ExportedAt: time.Now().UTC().Format(time.RFC3339),
@@ -194,4 +291,35 @@ func (h *Handler) Download(c *gin.Context) {
 	out, _ := json.MarshalIndent(bundle, "", "  ")
 	c.Header("Content-Disposition", "attachment; filename=auth.json")
 	c.Data(http.StatusOK, "application/json; charset=utf-8", out)
+}
+
+func (h *Handler) downloadCPA(c *gin.Context, regs []models.Registration) {
+	now := time.Now().UTC()
+	if len(regs) == 1 {
+		out, _ := json.MarshalIndent(buildCPACredentials(regs[0].AuthData, regs[0].Email, now), "", "  ")
+		c.Header("Content-Disposition", `attachment; filename="`+cpaFileName(regs[0].Email)+`"`)
+		c.Data(http.StatusOK, "application/json; charset=utf-8", out)
+		return
+	}
+
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for _, r := range regs {
+		entry, err := zw.Create(cpaFileName(r.Email))
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "创建 CPA 压缩包失败"})
+			return
+		}
+		out, _ := json.MarshalIndent(buildCPACredentials(r.AuthData, r.Email, now), "", "  ")
+		if _, err = entry.Write(out); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "写入 CPA 压缩包失败"})
+			return
+		}
+	}
+	if err := zw.Close(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "完成 CPA 压缩包失败"})
+		return
+	}
+	c.Header("Content-Disposition", `attachment; filename="cpa_auth_`+time.Now().UTC().Format("20060102_150405")+`.zip"`)
+	c.Data(http.StatusOK, "application/zip", buf.Bytes())
 }
