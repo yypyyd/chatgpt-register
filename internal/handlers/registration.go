@@ -6,6 +6,7 @@ import (
 
 	"chatgpt-register/internal/auth"
 	"chatgpt-register/internal/browserboot"
+	"chatgpt-register/internal/grokproducer"
 	"chatgpt-register/internal/mailfetch"
 	"chatgpt-register/internal/mailverify"
 	"chatgpt-register/internal/models"
@@ -20,6 +21,7 @@ type Handler struct {
 	Mail            *mailfetch.Client
 	Auth            *auth.Service
 	Producer        *producer.Producer
+	GrokProducer    *grokproducer.Producer
 	Browser         *browserboot.Manager
 	MailboxVerifier *mailverify.Service
 }
@@ -30,7 +32,7 @@ func New(db *gorm.DB, authSvc *auth.Service, browser *browserboot.Manager) (*Han
 	if err := verifier.Start(); err != nil {
 		return nil, err
 	}
-	return &Handler{DB: db, Mail: mail, Auth: authSvc, Producer: producer.New(db, mail), Browser: browser, MailboxVerifier: verifier}, nil
+	return &Handler{DB: db, Mail: mail, Auth: authSvc, Producer: producer.New(db, mail), GrokProducer: grokproducer.New(db, mail), Browser: browser, MailboxVerifier: verifier}, nil
 }
 
 type registrationInput struct {

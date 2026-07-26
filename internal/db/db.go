@@ -13,11 +13,12 @@ func Init(path string) (*gorm.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := db.AutoMigrate(&models.Registration{}, &models.Mailbox{}, &models.Setting{}, &models.Admin{}); err != nil {
+	if err := db.AutoMigrate(&models.Registration{}, &models.GrokRegistration{}, &models.Mailbox{}, &models.Setting{}, &models.Admin{}); err != nil {
 		return nil, err
 	}
 	normalizeLegacyStatuses(db)
 	reclaimOrphanRegistering(db)
+	reclaimOrphanGrokRegistering(db)
 	backfillRegistrationMailboxIDs(db)
 	return db, nil
 }
@@ -28,6 +29,11 @@ func Init(path string) (*gorm.DB, error) {
 func reclaimOrphanRegistering(db *gorm.DB) {
 	db.Model(&models.Registration{}).Where("status = ?", "registering").
 		Updates(map[string]any{"status": "register_failed", "note": "程序重启中断，可重新生产"})
+}
+
+func reclaimOrphanGrokRegistering(db *gorm.DB) {
+	db.Model(&models.GrokRegistration{}).Where("status IN ?", []string{"registering", "waiting_code"}).
+		Updates(map[string]any{"status": "register_failed", "note": "程序重启中断，可重新注册"})
 }
 
 // normalizeLegacyStatuses 把旧的 AdSkull 验证态注册记录迁移到新的生产态。

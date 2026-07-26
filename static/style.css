@@ -86,6 +86,7 @@ body {
 #menu .menu-item:nth-of-type(3) svg { fill: #7c3aed; background: #ede9fe; }
 #menu .menu-item:nth-of-type(4) svg { fill: #d97706; background: #fef3c7; }
 #menu .menu-item:nth-of-type(5) svg { fill: #16a34a; background: #dcfce7; }
+#menu .menu-item:nth-of-type(6) svg { fill: #0f766e; background: #ccfbf1; }
 .menu-item:hover:not(.active) {
   background: rgba(255, 255, 255, .85);
   color: var(--primary);
@@ -456,6 +457,7 @@ select.px-input option { background: #fff; }
 /* ===== 账户生产态徽章 ===== */
 .badge.pending         { color: var(--amber);  background: rgba(217, 119, 6, .13); }
 .badge.registering     { color: var(--cyan);   background: rgba(8, 145, 178, .13); }
+.badge.waiting_code    { color: var(--violet); background: rgba(124, 58, 237, .12); }
 .badge.registered      { color: var(--green);  background: rgba(22, 163, 74, .13); }
 .badge.register_failed { color: var(--red);    background: rgba(225, 29, 72, .12); }
 .badge.already_registered { color: var(--amber); background: rgba(217, 119, 6, .13); }

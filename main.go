@@ -33,6 +33,12 @@ func main() {
 	).Error; err != nil {
 		log.Printf("reset registering on boot: %v", err)
 	}
+	if err := database.Exec(
+		"UPDATE grok_registrations SET status = 'register_failed', log = log || ? WHERE status IN ('registering', 'waiting_code')",
+		"\n"+time.Now().Format("2006-01-02 15:04:05")+" ✗ 程序重启，Grok 任务中断，判定为失败",
+	).Error; err != nil {
+		log.Printf("reset grok registering on boot: %v", err)
+	}
 
 	authSvc, err := auth.New(database)
 	if err != nil {
@@ -90,6 +96,17 @@ func main() {
 		api.PUT("/settings", h.SettingsSave)
 
 		api.POST("/proxy/test", h.ProxyTest)
+
+		api.GET("/grok/registrations", h.GrokList)
+		api.DELETE("/grok/registrations", h.GrokDeleteAll)
+		api.POST("/grok/registrations", h.GrokStart)
+		api.POST("/grok/produce", h.GrokProduce)
+		api.POST("/grok/registrations/:id/code", h.GrokSubmitCode)
+		api.POST("/grok/registrations/:id/stop", h.GrokStop)
+		api.DELETE("/grok/registrations/:id", h.GrokDelete)
+		api.GET("/grok/registrations/:id/logs", h.GrokLog)
+		api.GET("/grok/registrations/:id/shot", h.GrokShot)
+		api.POST("/grok/download", h.GrokDownload)
 	}
 
 	sub, err := fs.Sub(staticFS, "static")
@@ -98,7 +115,7 @@ func main() {
 	}
 	httpFS := http.FS(sub)
 	r.StaticFS("/static", httpFS)
-	for _, p := range []string{"login", "dashboard", "mailboxes", "accounts", "settings"} {
+	for _, p := range []string{"login", "dashboard", "mailboxes", "accounts", "grok", "settings"} {
 		p := p
 		r.GET("/"+p, func(c *gin.Context) { c.FileFromFS(p+".html", httpFS) })
 	}
