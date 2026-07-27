@@ -101,6 +101,8 @@ func main() {
 		api.DELETE("/grok/registrations", h.GrokDeleteAll)
 		api.POST("/grok/registrations", h.GrokStart)
 		api.POST("/grok/produce", h.GrokProduce)
+		api.GET("/grok/produce/status", h.GrokProduceStatus)
+		api.POST("/grok/produce/stop", h.GrokProduceStop)
 		api.POST("/grok/registrations/:id/code", h.GrokSubmitCode)
 		api.POST("/grok/registrations/:id/stop", h.GrokStop)
 		api.DELETE("/grok/registrations/:id", h.GrokDelete)

@@ -96,9 +96,7 @@ func (p *Producer) StartFromAccounts(count int) ([]models.GrokRegistration, erro
 	if err := p.db.
 		Where("status = ? AND mailbox_id <> 0", "registered").
 		Where("email NOT IN (?)",
-			p.db.Model(&models.GrokRegistration{}).
-				Select("email").
-				Where("status IN ?", []string{"registered", "registering", "waiting_code"})).
+			p.db.Model(&models.GrokRegistration{}).Select("email")).
 		Order("id asc").
 		Limit(count).
 		Find(&accounts).Error; err != nil {
@@ -141,9 +139,7 @@ func (p *Producer) StartFromAccounts(count int) ([]models.GrokRegistration, erro
 	if err := p.db.
 		Where("status = ?", "verified").
 		Where("email NOT IN (?)",
-			p.db.Model(&models.GrokRegistration{}).
-				Select("email").
-				Where("status IN ?", []string{"registered", "registering", "waiting_code"})).
+			p.db.Model(&models.GrokRegistration{}).Select("email")).
 		Order("id asc").
 		Limit(count - len(started)).
 		Find(&mailboxes).Error; err != nil {
@@ -211,6 +207,48 @@ func (p *Producer) Stop(id uint) {
 	}
 }
 
+// StopAll 请求停止所有在跑的 Grok 注册任务。
+func (p *Producer) StopAll() {
+	p.mu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(p.cancel))
+	for _, cancel := range p.cancel {
+		cancels = append(cancels, cancel)
+	}
+	p.mu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+}
+
+// Progress 生产进度快照，供 /api/grok/produce/status 展示。
+type Progress struct {
+	Running    bool `json:"running"`
+	Pending    int  `json:"pending"`     // 待生产
+	RunningNum int  `json:"running_num"` // 在跑
+	Registered int  `json:"registered"`  // 已注册
+	Failed     int  `json:"failed"`      // 注册失败
+}
+
+// Snapshot 返回 Grok 生产进度：在跑数取自当前运行的任务，其余按库中状态统计。
+func (p *Producer) Snapshot() Progress {
+	p.mu.Lock()
+	runningNum := len(p.cancel)
+	p.mu.Unlock()
+
+	count := func(statuses ...string) int {
+		var n int64
+		p.db.Model(&models.GrokRegistration{}).Where("status IN ?", statuses).Count(&n)
+		return int(n)
+	}
+	return Progress{
+		Running:    runningNum > 0,
+		Pending:    count("pending"),
+		RunningNum: runningNum,
+		Registered: count("registered"),
+		Failed:     count("register_failed"),
+	}
+}
+
 func (p *Producer) run(id uint) {
 	ctx, cancel := context.WithCancel(context.Background())
 	p.mu.Lock()
@@ -236,9 +274,7 @@ func (p *Producer) run(id uint) {
 		Proxy:    p.nextProxy(),
 		// Match the reference project: Grok registration is headed by default.
 		// A dedicated opt-in setting can still enable headless for diagnostics.
-		Headless:        p.getSetting("grok_headless") == "1",
-		CaptchaProvider: p.getSetting("captcha_provider"),
-		CaptchaAPIKey:   p.getSetting("captcha_api_key"),
+		Headless: p.getSetting("grok_headless") == "1",
 		Log: func(f string, a ...any) {
 			p.appendLog(id, fmt.Sprintf(f, a...))
 		},

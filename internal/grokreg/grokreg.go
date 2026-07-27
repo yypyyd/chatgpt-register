@@ -17,15 +17,22 @@ type Input struct {
 	Proxy     string
 	Headless  bool
 
-	// Optional third-party Turnstile solver (CapSolver / 2Captcha).
-	// Invisible managed Turnstile on x.ai often will not auto-issue tokens
-	// for automation — solver is the reliable path.
-	CaptchaProvider string // capsolver | 2captcha
-	CaptchaAPIKey   string
+	// TurnstilePython/TurnstileScript/TurnstileMode locate the CloakBrowser mint
+	// helper that signs a Cloudflare Turnstile token for x.ai. Empty values fall
+	// back to the GROK_TURNSTILE_* environment variables and finally to the
+	// server defaults in turnstile_mint.go.
+	TurnstilePython string
+	TurnstileScript string
+	TurnstileMode   string
 
 	WaitCode func(ctx context.Context) (string, error)
 	Log      func(format string, a ...any)
 	SaveShot func(png []byte)
+
+	// mintProxy is the loopback proxy Chromium uses for this registration. The
+	// mint runs through the same egress so the token's remote IP matches the
+	// submission. Set internally by registerBrowser.
+	mintProxy string
 }
 
 type Result struct {

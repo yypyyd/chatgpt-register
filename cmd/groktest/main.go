@@ -19,13 +19,11 @@ import (
 )
 
 type cfg struct {
-	Email           string `json:"email"`
-	ClientID        string `json:"client_id"`
-	RefreshToken    string `json:"refresh_token"`
-	Proxy           string `json:"proxy"`
-	Headless        bool   `json:"headless"`
-	CaptchaProvider string `json:"captcha_provider"`
-	CaptchaAPIKey   string `json:"captcha_api_key"`
+	Email        string `json:"email"`
+	ClientID     string `json:"client_id"`
+	RefreshToken string `json:"refresh_token"`
+	Proxy        string `json:"proxy"`
+	Headless     bool   `json:"headless"`
 }
 
 var (
@@ -66,31 +64,10 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Minute)
 	defer cancel()
 
-	if c.CaptchaAPIKey == "" {
-		c.CaptchaAPIKey = firstEnv("CAPSOLVER_API_KEY", "CAPTCHA_API_KEY", "TWOCAPTCHA_API_KEY")
-	}
-	if c.CaptchaProvider == "" {
-		if os.Getenv("TWOCAPTCHA_API_KEY") != "" && os.Getenv("CAPSOLVER_API_KEY") == "" {
-			c.CaptchaProvider = "2captcha"
-		} else {
-			c.CaptchaProvider = firstEnv("CAPTCHA_PROVIDER")
-			if c.CaptchaProvider == "" {
-				c.CaptchaProvider = "capsolver"
-			}
-		}
-	}
-	if c.CaptchaAPIKey != "" {
-		fmt.Println(time.Now().Format("15:04:05"), "已启用打码:", c.CaptchaProvider)
-	} else {
-		fmt.Println(time.Now().Format("15:04:05"), "未配置打码密钥（CAPSOLVER_API_KEY / captcha_api_key），将仅尝试本地过 CF")
-	}
-
 	in := grokreg.Input{
-		Email:           c.Email,
-		Proxy:           c.Proxy,
-		Headless:        c.Headless,
-		CaptchaProvider: c.CaptchaProvider,
-		CaptchaAPIKey:   c.CaptchaAPIKey,
+		Email:    c.Email,
+		Proxy:    c.Proxy,
+		Headless: c.Headless,
 		Log: func(f string, a ...any) {
 			fmt.Println(time.Now().Format("15:04:05"), fmt.Sprintf(f, a...))
 		},
@@ -145,15 +122,6 @@ func main() {
 	_ = os.WriteFile("groktest-auth.json", b, 0o644)
 	fmt.Println("RESULT: OK email=", c.Email)
 	fmt.Println("会话已写入 groktest-auth.json")
-}
-
-func firstEnv(keys ...string) string {
-	for _, k := range keys {
-		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
-			return v
-		}
-	}
-	return ""
 }
 
 func extractGrokCode(s string) string {

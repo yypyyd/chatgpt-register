@@ -7,7 +7,6 @@ import (
 	"net"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -77,9 +76,26 @@ func registerBrowser(ctx context.Context, in Input) (res *Result, err error) {
 	if !in.Headless {
 		in.logf("使用有头模式")
 	}
-	if chromePath := installedChromePath(); chromePath != "" {
+	if chromePath, cerr := grokChromiumBin(); cerr != nil {
+		in.logf("准备 Grok 专用 Chromium 失败，回退默认浏览器: %v", cerr)
+	} else {
 		l = l.Bin(chromePath)
-		in.logf("使用系统 Chrome，避免浏览器版本与指纹不一致")
+		in.logf("使用 Grok 专用 Chromium(%d)，与 GPT 浏览器隔离", launcher.RevisionDefault)
+	}
+
+	// Load the Turnstile-Patch extension like the reference project. It rewrites
+	// MouseEvent.screenX/screenY at document_start in every frame so x.ai's
+	// invisible managed Turnstile issues a token to a real checkbox click — no
+	// third-party solver required. Extensions are ignored in headless Chrome, so
+	// only load it in headed mode (Grok registration is headed by default).
+	if !in.Headless {
+		if patchDir, perr := extractTurnstilePatch(); perr != nil {
+			in.logf("释放 Turnstile 补丁扩展失败，回退到无扩展模式: %v", perr)
+		} else {
+			defer os.RemoveAll(patchDir)
+			l = l.Set("disable-extensions-except", patchDir).Set("load-extension", patchDir)
+			in.logf("已加载 Turnstile 补丁扩展")
+		}
 	}
 
 	var authBridge *localAuthProxyBridge
@@ -99,6 +115,9 @@ func registerBrowser(ctx context.Context, in Input) (res *Result, err error) {
 		}
 		l = l.Set("proxy-server", server)
 		in.logf("使用代理: %s", server)
+		// The Turnstile mint reuses this loopback endpoint so its token is signed
+		// from the same egress IP as the registration.
+		in.mintProxy = server
 	}
 
 	controlURL, err := l.Launch()
@@ -228,8 +247,33 @@ func registerBrowser(ctx context.Context, in Input) (res *Result, err error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// 附加后处理：注册成功后立刻铸造 CLIProxyAPI 使用的 xAI OAuth 凭证（CPA 导出用），
+	// 并提取 sso token（Sub2API/grok2api 导出用）。失败不影响已注册的账号。
+	if sso := ssoFromCookies(auth); sso != "" {
+		auth["sso"] = sso
+	}
+	if cpa, mintErr := mintXAIToken(ctx, page, in); mintErr != nil {
+		in.logf("CPA 凭证铸造失败（不影响注册结果）: %v", mintErr)
+	} else {
+		auth["cpa_xai"] = cpa
+	}
+
 	in.logf("Grok 注册完成")
 	return &Result{AuthJSON: auth}, nil
+}
+
+// ssoFromCookies 取出 Grok 的 sso cookie 值，供 Sub2API/grok2api 池使用。
+func ssoFromCookies(auth map[string]any) string {
+	list, _ := auth["cookies"].([]map[string]any)
+	for _, c := range list {
+		if name, _ := c["name"].(string); name == "sso" {
+			if v, _ := c["value"].(string); v != "" {
+				return v
+			}
+		}
+	}
+	return ""
 }
 
 func availableLoopbackPort() (int, error) {
@@ -648,9 +692,6 @@ func waitGrokReady(ctx context.Context, page *rod.Page, in Input) error {
 	lastSubmit := time.Time{}
 	cfWaitSince := time.Time{}
 	lastCFRetry := time.Time{}
-	solveAttempts := 0
-	lastSolve := time.Time{}
-	cfRetries := 0
 	for time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():
@@ -660,6 +701,12 @@ func waitGrokReady(ctx context.Context, page *rod.Page, in Input) error {
 		pg := page.Timeout(8 * time.Second)
 		info, _ := pg.Info()
 		if info != nil && strings.Contains(info.URL, "grok.com") {
+			return nil
+		}
+		// After Complete sign up, x.ai lands on the logged-in account page
+		// (accounts.x.ai/account); treat that as a completed registration too.
+		if info != nil && strings.Contains(info.URL, "accounts.x.ai/account") {
+			in.logf("已完成注册，进入 x.ai 账户页")
 			return nil
 		}
 		if has, _, _ := pg.Has("textarea"); has {
@@ -690,19 +737,25 @@ func waitGrokReady(ctx context.Context, page *rod.Page, in Input) error {
 					cfWaitSince = time.Now()
 					in.logf("资料已填写，等待页面安全校验 token")
 				}
-				// 主路径：像参考项目那样复用/点击 Turnstile 组件——x.ai 的托管组件
-				// 对真实复选框点击会直接签发 token，本就不需要第三方打码。
-				if time.Since(cfWaitSince) >= 12*time.Second && time.Since(lastCFRetry) >= 8*time.Second {
-					reuseTurnstile(pg, in)
+				// Sign the Turnstile token with the CloakBrowser mint pool and
+				// inject it into cf-turnstile-response so the form submits — no
+				// third-party solver required. The mint blocks for a while, so
+				// throttle retries.
+				if time.Since(lastCFRetry) >= 12*time.Second {
 					lastCFRetry = time.Now()
-					cfRetries++
-				}
-				// 安全网：仅当点击路径反复失败且配置了打码密钥时，才回退到打码服务。
-				if in.CaptchaAPIKey != "" && cfRetries >= 3 && solveAttempts < 3 && time.Since(lastSolve) >= 15*time.Second {
-					solveAttempts++
-					lastSolve = time.Now()
-					if solveTurnstileViaAPI(ctx, pg, in) {
-						lastSubmit = time.Time{}
+					sitekey := pageSitekey(pg)
+					pageURL := ""
+					if info != nil {
+						pageURL = info.URL
+					}
+					in.logf("调用 CloakBrowser 令牌池签发 Turnstile token")
+					// The mint blocks for tens of seconds, so pg's short deadline
+					// is stale afterwards; inject with a fresh page handle.
+					if token, merr := mintTurnstileToken(ctx, in, sitekey, pageURL); merr != nil {
+						in.logf("令牌池签发失败，稍后重试: %v", merr)
+					} else {
+						cbs, fieldSet := injectMintedToken(page.Timeout(10*time.Second), token)
+						in.logf("已注入令牌池 Turnstile token(len=%d 回调=%d 字段=%t)", len(token), cbs, fieldSet)
 					}
 				}
 				time.Sleep(800 * time.Millisecond)
@@ -824,27 +877,16 @@ func waitInvisibleTurnstile(ctx context.Context, page *rod.Page, in Input, timeo
 	}
 }
 
-func installedChromePath() string {
-	if path, err := exec.LookPath("chrome"); err == nil {
-		return path
-	}
-	candidates := []string{
-		filepath.Join(os.Getenv("ProgramFiles"), "Google", "Chrome", "Application", "chrome.exe"),
-		filepath.Join(os.Getenv("ProgramFiles(x86)"), "Google", "Chrome", "Application", "chrome.exe"),
-		filepath.Join(os.Getenv("LocalAppData"), "Google", "Chrome", "Application", "chrome.exe"),
-		"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-		"/usr/bin/google-chrome",
-		"/usr/bin/google-chrome-stable",
-	}
-	for _, path := range candidates {
-		if path == "" {
-			continue
-		}
-		if info, err := os.Stat(path); err == nil && !info.IsDir() {
-			return path
-		}
-	}
-	return ""
+// grokChromiumBin returns a Chromium binary managed in a Grok-dedicated rod
+// directory (browser-grok), kept separate from the GPT flow's default rod
+// browser so the two never share a binary or profile. rod's --load-extension
+// content-script injection works on this Chromium revision but is silently
+// ignored by current stable Chrome, so the Turnstile patch only takes effect
+// here.
+func grokChromiumBin() (string, error) {
+	b := launcher.NewBrowser()
+	b.RootDir = filepath.Join(filepath.Dir(launcher.DefaultBrowserDir), "browser-grok")
+	return b.Get()
 }
 
 func pendingCaptcha(page *rod.Page) bool {
@@ -1255,20 +1297,6 @@ func clickCompleteSignup(page *rod.Page) bool {
 		return false
 	}
 	return ok.Value.Bool()
-}
-
-func extractTurnstileSitekey(page *rod.Page) string {
-	v, err := page.Eval(`() => {
-		const el = document.querySelector('[data-sitekey]');
-		if (el) return el.getAttribute('data-sitekey') || '';
-		const html = document.documentElement.innerHTML || '';
-		const m = html.match(/0x4AAAAA[A-Za-z0-9_-]{10,}/) || html.match(/sitekey["'\s:=]+([0-9A-Za-z_-]{20,})/i);
-		return m ? (m[1] || m[0]) : '';
-	}`)
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(v.Value.Str())
 }
 
 func humanIdle(page *rod.Page, d time.Duration) {
