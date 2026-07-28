@@ -199,19 +199,8 @@ func registerBrowser(ctx context.Context, in Input) (res *Result, err error) {
 	}
 	in.logf("Grok 注册页已加载")
 
-	if page.Timeout(5*time.Second).MustHas("input[type='email']") == false {
-		if pendingCaptcha(page) {
-			if err = waitForCloudflare(ctx, page, in, 10*time.Minute); err != nil {
-				return nil, err
-			}
-		}
-		clickEmailSignup(page)
-	}
-	if err = typeHumanStable(page, "input[type='email']", in.Email, 60*time.Second); err != nil {
-		return nil, fmt.Errorf("输入邮箱失败: %w", err)
-	}
-	if err = clickSubmit(page, in); err != nil {
-		return nil, fmt.Errorf("点击邮箱提交按钮失败: %w", err)
+	if err = fillGrokEmail(ctx, page, in); err != nil {
+		return nil, err
 	}
 	in.logf("已提交邮箱，等待安全代码输入框")
 
@@ -1273,6 +1262,56 @@ func maxF(a, b float64) float64 {
 		return a
 	}
 	return b
+}
+
+// fillGrokEmail 确保邮箱输入框出现、填入邮箱并提交。整段最多重试 3 次：某次
+// 输入/提交卡住或超时，就重新加载注册页（含重新等待 Cloudflare）再来一遍，而不是
+// 直接判失败。保留「真实按键优先」（typeHumanStable 内部先逐字输入、写不进去才
+// 用原生 setter 兜底），以维持 Turnstile 评分。
+func fillGrokEmail(ctx context.Context, page *rod.Page, in Input) error {
+	const signupURL = "https://accounts.x.ai/sign-up?redirect=grok-com&return_to=%2F"
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if attempt > 0 {
+			in.logf("邮箱步重试第 %d 次：重新加载注册页", attempt)
+			if err := rod.Try(func() {
+				nav := page.Timeout(120 * time.Second)
+				nav.MustNavigate(signupURL)
+				nav.MustWaitLoad()
+			}); err != nil {
+				lastErr = fmt.Errorf("重新加载注册页失败: %w", err)
+				continue
+			}
+			if err := waitForCloudflare(ctx, page, in, 5*time.Minute); err != nil {
+				lastErr = err
+				continue
+			}
+		}
+		hasEmail := false
+		_ = rod.Try(func() { hasEmail = page.Timeout(5 * time.Second).MustHas("input[type='email']") })
+		if !hasEmail {
+			if pendingCaptcha(page) {
+				if err := waitForCloudflare(ctx, page, in, 10*time.Minute); err != nil {
+					lastErr = err
+					continue
+				}
+			}
+			clickEmailSignup(page)
+		}
+		if err := typeHumanStable(page, "input[type='email']", in.Email, 45*time.Second); err != nil {
+			lastErr = fmt.Errorf("输入邮箱失败: %w", err)
+			continue
+		}
+		if err := clickSubmit(page, in); err != nil {
+			lastErr = fmt.Errorf("点击邮箱提交按钮失败: %w", err)
+			continue
+		}
+		return nil
+	}
+	return lastErr
 }
 
 func fillProfileHuman(page *rod.Page, in Input) error {

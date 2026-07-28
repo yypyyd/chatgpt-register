@@ -235,24 +235,45 @@ func gotoCreateForm(ctx context.Context, page *rod.Page, in Input) error {
 	return fmt.Errorf("未能进入 Adobe 创建账号表单")
 }
 
+// fillStep1 填写邮箱+密码并提交第一步。整段最多重试 3 次：某次输入/提交
+// 卡住或超时，就重新加载注册页、重新进入创建表单后再来一遍，而不是直接判失败
+// （headed 模式下 React 表单偶发重渲染/节点失效，整体重试比单点重试更稳）。
 func fillStep1(ctx context.Context, page *rod.Page, in Input) error {
-	if err := fillInput(ctx, page, `input[name="username"]`, in.Email, 60*time.Second); err != nil {
-		return fmt.Errorf("输入邮箱失败: %w", err)
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if attempt > 0 {
+			in.logf("第一步重试第 %d 次：重新加载注册页", attempt)
+			_ = gotoStable(ctx, page, signInURL, in, 60*time.Second)
+			if err := gotoCreateForm(ctx, page, in); err != nil {
+				lastErr = err
+				continue
+			}
+		}
+		if err := fillInput(ctx, page, `input[name="username"]`, in.Email, 45*time.Second); err != nil {
+			lastErr = fmt.Errorf("输入邮箱失败: %w", err)
+			continue
+		}
+		if err := fillInput(ctx, page, `input[name="password"]`, in.Password, 30*time.Second); err != nil {
+			lastErr = fmt.Errorf("输入密码失败: %w", err)
+			continue
+		}
+		in.logf("已填写邮箱与密码，提交第一步")
+		// 提交后等待离开邮箱/密码步：出现姓名框、出现验证码框，或密码框消失。
+		leftStep1 := func() bool {
+			return hasSel(page, `input[name="firstname"]`) ||
+				onEmailVerify(page, pageURL(page)) ||
+				!hasSel(page, `input[name="password"]`)
+		}
+		if err := submitAndAdvance(ctx, page, in, leftStep1, 60*time.Second); err != nil {
+			lastErr = fmt.Errorf("提交第一步失败: %w", err)
+			continue
+		}
+		return nil
 	}
-	if err := fillInput(ctx, page, `input[name="password"]`, in.Password, 45*time.Second); err != nil {
-		return fmt.Errorf("输入密码失败: %w", err)
-	}
-	in.logf("已填写邮箱与密码，提交第一步")
-	// 提交后等待离开邮箱/密码步：出现姓名框、出现验证码框，或密码框消失。
-	leftStep1 := func() bool {
-		return hasSel(page, `input[name="firstname"]`) ||
-			onEmailVerify(page, pageURL(page)) ||
-			!hasSel(page, `input[name="password"]`)
-	}
-	if err := submitAndAdvance(ctx, page, in, leftStep1, 60*time.Second); err != nil {
-		return fmt.Errorf("提交第一步失败: %w", err)
-	}
-	return nil
+	return lastErr
 }
 
 // completeSignup 在第一步之后自适应处理后续步骤：邮箱验证与姓名/生日步
@@ -489,27 +510,34 @@ func hasSel(page *rod.Page, selector string) bool {
 	return has
 }
 
-// fillInput 往输入框写入文本：每次尝试都重新定位元素并使用独立的超时，避免
-// 元素继承等待阶段的绝对 deadline（此前邮箱框会因此报 context deadline
-// exceeded）；React 重渲染导致节点失效时重试，写入后校验实际值，连续失败
-// 后改用原生 setter + 事件派发兜底。
+// fillInput 往输入框写入文本：优先用原生 setter 直接赋值并校验（快且对 React
+// 受控组件稳定，避免逐字输入时节点被重渲染替换导致的 context deadline
+// exceeded），未生效再退回逐字输入。每步都有独立超时并在总预算内重试。
 func fillInput(ctx context.Context, page *rod.Page, selector, value string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	var lastErr error
-	for attempt := 0; time.Now().Before(deadline); attempt++ {
+	for time.Now().Before(deadline) {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		lastErr = func() error {
-			if attempt < 2 {
-				el, err := waitVisible(page, selector, 20*time.Second)
-				if err != nil {
-					return err
-				}
-				if err = typeHuman(el, value); err != nil {
-					return err
-				}
-			} else if err := setInputValue(page, selector, value); err != nil {
+			// 先确认输入框已出现（有独立超时，不会拖到几分钟）。
+			if _, err := waitVisible(page, selector, 12*time.Second); err != nil {
+				return err
+			}
+			// 优先用原生 setter 直接赋值（快且对 React 受控组件稳定），写完校验。
+			if err := setInputValue(page, selector, value); err != nil {
+				return err
+			}
+			if inputValue(page, selector) == value {
+				return nil
+			}
+			// setter 未生效（个别页面会重置），退回逐字输入，重新定位元素。
+			el, err := waitVisible(page, selector, 12*time.Second)
+			if err != nil {
+				return err
+			}
+			if err = typeHuman(el, value); err != nil {
 				return err
 			}
 			if got := inputValue(page, selector); got != value {
@@ -528,11 +556,13 @@ func fillInput(ctx context.Context, page *rod.Page, selector, value string, time
 	return lastErr
 }
 
-// setInputValue 用原生 setter 赋值并派发 input/change，兼容 React 受控组件。
+// setInputValue 聚焦输入框并用原生 setter 赋值、派发 input/change，兼容 React
+// 受控组件。带独立超时，避免 CDP 卡顿时单次 eval 阻塞过久。
 func setInputValue(page *rod.Page, selector, value string) error {
-	ok, err := page.Eval(`(selector, value) => {
+	ok, err := page.Timeout(10*time.Second).Eval(`(selector, value) => {
 		const el = document.querySelector(selector);
 		if (!el) return false;
+		el.focus();
 		const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
 		setter.call(el, value);
 		el.dispatchEvent(new Event('input', { bubbles: true }));
@@ -549,7 +579,7 @@ func setInputValue(page *rod.Page, selector, value string) error {
 }
 
 func inputValue(page *rod.Page, selector string) string {
-	got, err := page.Eval(`selector => {
+	got, err := page.Timeout(8*time.Second).Eval(`selector => {
 		const el = document.querySelector(selector);
 		return el ? el.value : '';
 	}`, selector)
