@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +22,11 @@ const (
 	codePollTimeout  = 4 * time.Minute
 	codePollInterval = 5 * time.Second
 	maxLogBytes      = 64 * 1024
+
+	// defaultMaxConcurrency 未配置任何并发键时的默认值：逐个开工。批量注册时多个
+	// 有头浏览器 + Turnstile 令牌池同时抢 CPU 会互相超时，串行最稳。可用设置页
+	// 「最大并发数」(max_concurrency) 或专用键 grok_max_concurrency 调大。
+	defaultMaxConcurrency = 1
 )
 
 var (
@@ -35,6 +41,7 @@ type Producer struct {
 	mu      sync.Mutex
 	waiters map[uint]chan string
 	cancel  map[uint]context.CancelFunc
+	active  int // 当前真正在跑（已获得并发槽位）的任务数
 	pxIdx   int
 }
 
@@ -265,7 +272,20 @@ func (p *Producer) run(id uint) {
 	if err := p.db.First(&reg, id).Error; err != nil {
 		return
 	}
+
+	// 并发闸门：并发已满时排队等待，避免多个有头浏览器同时抢 CPU 互相超时。
+	if !p.acquireSlot(ctx, id) {
+		p.appendLog(id, "已取消（排队等待空闲注册槽位时被停止）")
+		p.db.Model(&models.GrokRegistration{}).Where("id = ?", id).Updates(map[string]any{
+			"status": "register_failed",
+			"note":   "已取消",
+		})
+		return
+	}
+	defer p.releaseSlot()
+
 	p.appendLog(id, "开始 Grok 邮箱注册")
+	// since 在获得槽位后再取，避免排队期间旧验证码被误读。
 	since := time.Now().Add(-30 * time.Second)
 
 	in := grokreg.Input{
@@ -406,6 +426,62 @@ func (p *Producer) appendLog(id uint, line string) {
 		log = log[len(log)-maxLogBytes:]
 	}
 	p.db.Model(&models.GrokRegistration{}).Where("id = ?", id).Update("log", log)
+}
+
+// maxConcurrency 读取并发上限：优先用 Grok 专用键 grok_max_concurrency，
+// 未设置时继承设置页「最大并发数」(max_concurrency)，都没有则默认 1，最小为 1。
+func (p *Producer) maxConcurrency() int {
+	raw := strings.TrimSpace(p.getSetting("grok_max_concurrency"))
+	if raw == "" {
+		raw = strings.TrimSpace(p.getSetting("max_concurrency"))
+	}
+	n := defaultMaxConcurrency
+	if raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil {
+			n = parsed
+		}
+	}
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
+// acquireSlot 阻塞直到并发未满（获得槽位返回 true）或 ctx 取消（返回 false）。
+// 限额从设置动态读取，改大后新任务无需重启即可生效。
+func (p *Producer) acquireSlot(ctx context.Context, id uint) bool {
+	logged := false
+	for {
+		if ctx.Err() != nil {
+			return false
+		}
+		limit := p.maxConcurrency()
+		p.mu.Lock()
+		if p.active < limit {
+			p.active++
+			p.mu.Unlock()
+			return true
+		}
+		p.mu.Unlock()
+		if !logged {
+			p.appendLog(id, "并发已满，排队等待空闲注册槽位")
+			logged = true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(1 * time.Second):
+		}
+	}
+}
+
+// releaseSlot 释放一个并发槽位。
+func (p *Producer) releaseSlot() {
+	p.mu.Lock()
+	if p.active > 0 {
+		p.active--
+	}
+	p.mu.Unlock()
 }
 
 func (p *Producer) getSetting(key string) string {

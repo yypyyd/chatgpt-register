@@ -232,9 +232,8 @@ func registerBrowser(ctx context.Context, in Input) (res *Result, err error) {
 		return nil, fmt.Errorf("验证码为空")
 	}
 
-	page.MustElement("input[name='code']").MustSelectAllText().MustInput(code)
-	if err = clickSubmit(page, in); err != nil {
-		return nil, fmt.Errorf("点击安全代码提交按钮失败: %w", err)
+	if err = submitSecurityCode(page, in, code); err != nil {
+		return nil, err
 	}
 	in.logf("已提交安全代码，等待 Grok 会话")
 
@@ -674,6 +673,72 @@ func clickSubmit(page *rod.Page, in Input) error {
 	}
 	in.logf("已点击按钮: %s", selectedLabel)
 	return nil
+}
+
+// codeInputGone 判断安全代码输入框是否已消失（页面已前进到下一步）。
+func codeInputGone(page *rod.Page) bool {
+	has, _, err := page.Timeout(2 * time.Second).Has("input[name='code']")
+	if err != nil {
+		return false
+	}
+	return !has
+}
+
+// submitSecurityCode 输入并提交安全代码，容忍 x.ai 在验证码输满后自动前进的情况：
+// 若在点击提交前/后代码输入框已消失，视为已提交成功，避免误报“未找到可见的提交按钮”。
+func submitSecurityCode(page *rod.Page, in Input, code string) error {
+	input, err := page.Timeout(10 * time.Second).Element("input[name='code']")
+	if err != nil {
+		if codeInputGone(page) {
+			in.logf("安全代码输入框已消失，判定页面已自动前进")
+			return nil
+		}
+		return fmt.Errorf("查找安全代码输入框失败: %w", err)
+	}
+	input = input.CancelTimeout().Timeout(10 * time.Second)
+	if err = input.SelectAllText(); err != nil {
+		if codeInputGone(page) {
+			return nil
+		}
+		return fmt.Errorf("选中安全代码输入框失败: %w", err)
+	}
+	if err = input.Input(code); err != nil {
+		if codeInputGone(page) {
+			return nil
+		}
+		return fmt.Errorf("输入安全代码失败: %w", err)
+	}
+
+	// x.ai 有时在验证码输满后自动提交（页面自动前进），有时需要手动点提交按钮。
+	// 重试点击；每次点击前后都检查输入框是否已消失，消失即视为已提交。
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if codeInputGone(page) {
+			in.logf("安全代码已生效，页面已自动前进")
+			return nil
+		}
+		if err = clickSubmit(page, in); err != nil {
+			lastErr = err
+			if codeInputGone(page) {
+				in.logf("提交按钮已消失但页面已前进，判定安全代码已提交")
+				return nil
+			}
+			time.Sleep(1 * time.Second)
+			continue
+		}
+		// 点击成功，等待页面前进；未前进也交由后续 waitGrokReady 处理。
+		for i := 0; i < 6; i++ {
+			if codeInputGone(page) {
+				return nil
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+		return nil
+	}
+	if codeInputGone(page) {
+		return nil
+	}
+	return fmt.Errorf("点击安全代码提交按钮失败: %w", lastErr)
 }
 
 func clickEmailSignup(page *rod.Page) {
