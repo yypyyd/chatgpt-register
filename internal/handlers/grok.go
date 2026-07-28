@@ -186,17 +186,19 @@ func (h *Handler) GrokShot(c *gin.Context) {
 // format=sub2api：导出 grok2api/Sub2API 使用的 sso token 池 JSON。
 // format=cpa：导出 CLIProxyAPI 使用的 xAI OAuth 凭证（注册时用设备码流程铸造，
 // 每账号一个 xai-<邮箱>.json，单账号为 JSON，多账号为 ZIP）。
-// 请求体：{ "ids": [1,2,3], "format": "sub2api|cpa" }。
+// 请求体：{ "ids": [1,2,3], "format": "sub2api|cpa", "unshipped_only": false }。
+// unshipped_only=true 时忽略 ids，导出全部已注册且未出库的账号。
 func (h *Handler) GrokDownload(c *gin.Context) {
 	var in struct {
-		IDs    []uint `json:"ids"`
-		Format string `json:"format"`
+		IDs           []uint `json:"ids"`
+		Format        string `json:"format"`
+		UnshippedOnly bool   `json:"unshipped_only"`
 	}
 	if err := c.ShouldBindJSON(&in); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if len(in.IDs) == 0 {
+	if len(in.IDs) == 0 && !in.UnshippedOnly {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "未选择 Grok 账号"})
 		return
 	}
@@ -208,11 +210,21 @@ func (h *Handler) GrokDownload(c *gin.Context) {
 		return
 	}
 	var regs []models.GrokRegistration
-	if err := h.DB.Where("id IN ? AND status = ? AND auth_data <> ''", in.IDs, "registered").Find(&regs).Error; err != nil {
+	q := h.DB.Where("status = ? AND auth_data <> ''", "registered")
+	if in.UnshippedOnly {
+		q = q.Where("shipped = ?", false)
+	} else {
+		q = q.Where("id IN ?", in.IDs)
+	}
+	if err := q.Find(&regs).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	if len(regs) == 0 {
+		if in.UnshippedOnly {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "没有已注册未出库的 Grok 账号"})
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": "所选 Grok 账号没有可下载的会话数据"})
 		return
 	}

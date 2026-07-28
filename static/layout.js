@@ -105,6 +105,14 @@ function initSelects(root) {
 document.addEventListener('click', () => {
   document.querySelectorAll('.px-select.open').forEach(w => w.classList.remove('open'));
 });
+/* “导出未出库”下拉：点击按钮弹出格式选项，复用 px-select 的样式与外部点击关闭逻辑。 */
+function toggleExportUnshipped(event) {
+  event.stopPropagation();
+  const el = event.currentTarget.closest('.px-select');
+  document.querySelectorAll('.px-select.open').forEach(x => { if (x !== el) x.classList.remove('open'); });
+  el.classList.toggle('open');
+}
+
 /* 代码里改了 select.value 之后调用，刷新自定义下拉显示 */
 function syncSelect(id) {
   const sel = document.getElementById(id);
@@ -144,6 +152,7 @@ function renderPager(elId, page, maxPage, go) {
     ['mailboxes', '邮箱管理', 'M20 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 4l-8 5-8-5V6l8 5 8-5v2z'],
     ['accounts', '账户管理', 'M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z'],
     ['grok', 'Grok 注册', 'M12 2l2.7 6.8L22 9l-5.6 4.5 1.8 7L12 16.6 5.8 20.5l1.8-7L2 9l7.3-.2L12 2z'],
+    ['adobe', 'Adobe 注册', 'M13.5 2 L21 20 h-4.6 l-1.5-3.8 h-4 l2.5-6.2 3 7.4 M8.6 2 L2 20 h4.6 L8.6 2z'],
     ['settings', '系统设置', 'M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z'],
   ];
   const nav = items.map(([key, label, d]) => `

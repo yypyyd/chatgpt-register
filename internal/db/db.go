@@ -13,12 +13,13 @@ func Init(path string) (*gorm.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := db.AutoMigrate(&models.Registration{}, &models.GrokRegistration{}, &models.Mailbox{}, &models.Setting{}, &models.Admin{}); err != nil {
+	if err := db.AutoMigrate(&models.Registration{}, &models.GrokRegistration{}, &models.AdobeRegistration{}, &models.Mailbox{}, &models.Setting{}, &models.Admin{}); err != nil {
 		return nil, err
 	}
 	normalizeLegacyStatuses(db)
 	reclaimOrphanRegistering(db)
 	reclaimOrphanGrokRegistering(db)
+	reclaimOrphanAdobeRegistering(db)
 	backfillRegistrationMailboxIDs(db)
 	return db, nil
 }
@@ -33,6 +34,11 @@ func reclaimOrphanRegistering(db *gorm.DB) {
 
 func reclaimOrphanGrokRegistering(db *gorm.DB) {
 	db.Model(&models.GrokRegistration{}).Where("status IN ?", []string{"registering", "waiting_code"}).
+		Updates(map[string]any{"status": "register_failed", "note": "程序重启中断，可重新注册"})
+}
+
+func reclaimOrphanAdobeRegistering(db *gorm.DB) {
+	db.Model(&models.AdobeRegistration{}).Where("status IN ?", []string{"registering", "waiting_code"}).
 		Updates(map[string]any{"status": "register_failed", "note": "程序重启中断，可重新注册"})
 }
 

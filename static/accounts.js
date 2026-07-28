@@ -200,11 +200,15 @@ async function downloadSelected(format) {
   if (!ids.length) return;
   await downloadByIds(ids, format, format === 'cpa' ? 'cpa_auth_' + ids.length + '.zip' : 'auth_' + ids.length + '.json');
 }
-async function downloadByIds(ids, format, fallbackFilename) {
+/* 一键导出全部“已注册未出库”，无需先勾选。 */
+async function downloadUnshipped(format) {
+  await downloadByIds([], format, format === 'cpa' ? 'cpa_auth_unshipped.zip' : 'auth_unshipped.json', true);
+}
+async function downloadByIds(ids, format, fallbackFilename, unshippedOnly) {
   const r = await api('/api/download', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ids, format }),
+    body: JSON.stringify({ ids, format, unshipped_only: !!unshippedOnly }),
   });
   if (!r.ok) {
     const d = await r.json().catch(() => ({}));

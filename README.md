@@ -92,23 +92,27 @@ chatgpt-register/
 │   │   ├── codex.go         # 注册流程自动化
 │   │   ├── geoip.go         # IP 归属地检测（代理验证）
 │   │   └── codexreg.go      # 注册任务入口
+│   ├── adobereg/            # Adobe(Firefly) 注册核心逻辑（独立浏览器自动化）
+│   ├── adobeproducer/       # Adobe 批量注册调度器（复用邮箱池自动取码）
 │   ├── db/                  # SQLite 数据库初始化（纯 Go 驱动，无需 CGO）
 │   ├── emailalias/          # 邮箱别名生成（裂变子号）
 │   ├── handlers/            # HTTP 接口层（Gin Handler）
 │   │   ├── auth.go          # 登录 / 改密接口
 │   │   ├── registration.go  # 账户 CRUD + 日志 + 截图接口
+│   │   ├── adobe.go         # Adobe 注册 CRUD + 生产 + 三种 Cookie 导出
 │   │   ├── produce.go       # 批量生产控制（启动 / 状态 / 停止）
 │   │   ├── mailbox.go       # 邮箱 CRUD + 取件接口
 │   │   ├── proxy.go         # 代理测试接口
 │   │   └── settings.go      # 系统设置接口
 │   ├── mailfetch/           # 邮件取件（自动读取验证码）
-│   ├── models/              # GORM 数据模型（Admin / Registration / Mailbox / Setting）
+│   ├── models/              # GORM 数据模型（Admin / Registration / GrokRegistration / AdobeRegistration / Mailbox / Setting）
 │   └── producer/            # 批量注册调度器（并发控制 + 裂变策略）
 └── static/                  # 前端静态页面（嵌入二进制，无需 Web 服务器）
     ├── dashboard.html        # 仪表盘
     ├── accounts.html/js      # 账户管理
     ├── mailboxes.html/js     # 邮箱管理
     ├── settings.html         # 系统设置
+    ├── adobe.html/js         # Adobe(Firefly) 注册管理
     ├── login.html            # 登录页
     ├── layout.js             # 公共布局 / 侧边栏
     └── style.css             # 毛玻璃主题 CSS（35KB 精心打磨）
@@ -193,6 +197,20 @@ ADDR=8080 ./chatgpt-register.exe
 - 邮箱管理、账户管理和仪表盘列表均提供带二次确认的“全部删除”操作
 - 「取件」弹窗：3 秒轮询实时收件，sandbox iframe 隔离展示邮件内容
 - 支持 Outlook（需填 `client_id` + `refresh_token`）：自动识别 OAuth 权限并选择 Microsoft Graph 或 Outlook IMAP XOAUTH2，兼容两类刷新令牌
+
+### Adobe 注册（Firefly 免费生图/生视频，独立模块）
+
+与 ChatGPT / Grok 注册完全分开，独立页面「Adobe 注册」、独立数据表 `adobe_registrations`、独立路由 `/api/adobe/*`，注册目标为 Adobe 账号（免费即可用 Firefly 免费额度）。
+
+- **自动流程**：打开 `account.adobe.com` → 创建账号（邮箱 + 随机密码）→ 填姓名/生日/地区 → 提交 → 打开 Firefly 触发邮箱验证码页 → 自动读取邮箱池验证码并填入。
+- **验证码自动读取**：复用现有邮箱池（同 Grok 自动模式），按发件人/主题/正文特征筛出 Adobe 邮件并提取 6 位码，每条记录独立记录所用邮箱。
+- **批量生产 / 单个注册 / 停止 / 日志 / 失败截图 / 删除**：与 Grok 页面一致。
+- **Cookie 导出（三选一，导出即出库）**：
+  - **Cookie 字符串**：`k=v; k=v; ...`（单账号 `.txt`，多账号打包 `.zip`）
+  - **Cookie JSON 对象**：单个 Adobe 的 Cookie 对象（含 `cookie_string` / `cookies_map` / 带元数据的 `cookies` / `storage`；单账号 `.json`，多账号 `.zip`）
+  - **Cookie 数组（多 Adobe 批量）**：所选账号合并为单个 `.json` 数组
+- **安全**：列表接口不返回 `auth_data`（`json:"-"`），日志与截图不含验证码或 Cookie 明文；Cookie 仅通过上述导出接口、且仅对已注册记录开放。
+- **相关设置键**：`adobe_headless`（无头）、`adobe_max_concurrency`（回退 `max_concurrency`）、`adobe_proxy_enabled` / `adobe_proxy_list`（回退全局 `proxy_*`）。
 
 ---
 

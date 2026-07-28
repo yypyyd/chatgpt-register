@@ -219,17 +219,19 @@ func (h *Handler) SetShipped(c *gin.Context) {
 
 // Download 下载选中账号。默认导出 Sub2API 聚合 JSON；format=cpa 时
 // 按 CLIProxyAPI auth-dir 格式导出，单账号为 JSON，多账号为 ZIP。
-// 请求体：{ "ids": [1,2,3], "format": "sub2api|cpa" }。
+// 请求体：{ "ids": [1,2,3], "format": "sub2api|cpa", "unshipped_only": false }。
+// unshipped_only=true 时忽略 ids，导出全部已注册且未出库的账号。
 func (h *Handler) Download(c *gin.Context) {
 	var in struct {
-		IDs    []uint `json:"ids"`
-		Format string `json:"format"`
+		IDs           []uint `json:"ids"`
+		Format        string `json:"format"`
+		UnshippedOnly bool   `json:"unshipped_only"`
 	}
 	if err := c.ShouldBindJSON(&in); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if len(in.IDs) == 0 {
+	if len(in.IDs) == 0 && !in.UnshippedOnly {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "未选择账号"})
 		return
 	}
@@ -242,12 +244,21 @@ func (h *Handler) Download(c *gin.Context) {
 	}
 
 	var regs []models.Registration
-	if err := h.DB.Where("id IN ? AND status = ? AND auth_data <> ''", in.IDs, "registered").
-		Find(&regs).Error; err != nil {
+	q := h.DB.Where("status = ? AND auth_data <> ''", "registered")
+	if in.UnshippedOnly {
+		q = q.Where("shipped = ?", false)
+	} else {
+		q = q.Where("id IN ?", in.IDs)
+	}
+	if err := q.Find(&regs).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	if len(regs) == 0 {
+		if in.UnshippedOnly {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "没有已注册未出库的账号"})
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": "所选账号没有可下载的已注册数据"})
 		return
 	}

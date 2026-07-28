@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>账户管理 · ChatGPT 注册管理</title>
-<link rel="stylesheet" href="/static/style.css?v=14">
+<link rel="stylesheet" href="/static/style.css?v=15">
 </head>
 <body data-page="accounts">
 <div class="layout">
@@ -35,6 +35,16 @@
         <option value="already_registered">停用</option>
       </select>
       <button class="px-btn primary" id="produce-btn" onclick="openProduceModal()">生产</button>
+      <div class="px-select" title="导出全部已注册未出库的账号">
+        <button type="button" class="px-select-btn" onclick="toggleExportUnshipped(event)">
+          <span class="px-select-label">导出未出库</span>
+          <svg class="px-select-arrow" viewBox="0 0 24 24"><path d="M7.41 8.59 12 13.17l4.59-4.58L18 10l-6 6-6-6z"/></svg>
+        </button>
+        <div class="px-select-menu">
+          <button type="button" class="px-select-opt" onclick="downloadUnshipped('sub2api')">Sub2API</button>
+          <button type="button" class="px-select-opt" onclick="downloadUnshipped('cpa')">CPA</button>
+        </div>
+      </div>
       <button class="px-btn danger" onclick="deleteAllAccounts()">全部删除</button>
     </div>
 
@@ -101,7 +111,7 @@
 </div>
 
 <div id="toast" class="toast" style="display:none"></div>
-<script src="/static/layout.js?v=2"></script>
-<script src="/static/accounts.js?v=13"></script>
+<script src="/static/layout.js?v=3"></script>
+<script src="/static/accounts.js?v=14"></script>
 </body>
 </html>

@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"strconv"
 
+	"chatgpt-register/internal/adobeproducer"
 	"chatgpt-register/internal/auth"
 	"chatgpt-register/internal/browserboot"
 	"chatgpt-register/internal/grokproducer"
@@ -22,6 +23,7 @@ type Handler struct {
 	Auth            *auth.Service
 	Producer        *producer.Producer
 	GrokProducer    *grokproducer.Producer
+	AdobeProducer   *adobeproducer.Producer
 	Browser         *browserboot.Manager
 	MailboxVerifier *mailverify.Service
 }
@@ -32,7 +34,7 @@ func New(db *gorm.DB, authSvc *auth.Service, browser *browserboot.Manager) (*Han
 	if err := verifier.Start(); err != nil {
 		return nil, err
 	}
-	return &Handler{DB: db, Mail: mail, Auth: authSvc, Producer: producer.New(db, mail), GrokProducer: grokproducer.New(db, mail), Browser: browser, MailboxVerifier: verifier}, nil
+	return &Handler{DB: db, Mail: mail, Auth: authSvc, Producer: producer.New(db, mail), GrokProducer: grokproducer.New(db, mail), AdobeProducer: adobeproducer.New(db, mail), Browser: browser, MailboxVerifier: verifier}, nil
 }
 
 type registrationInput struct {

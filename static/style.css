@@ -247,6 +247,10 @@ select.px-input option { background: #fff; }
   display: block; width: 100%; border: 0; text-align: left;
   background: transparent; font-family: inherit;
 }
+button.px-select-opt {
+  display: block; width: 100%; border: 0; text-align: left;
+  background: transparent; font-family: inherit;
+}
 
 .px-btn {
   height: 36px; padding: 0 15px; cursor: pointer; color: var(--text-2);

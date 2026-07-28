@@ -39,6 +39,12 @@ func main() {
 	).Error; err != nil {
 		log.Printf("reset grok registering on boot: %v", err)
 	}
+	if err := database.Exec(
+		"UPDATE adobe_registrations SET status = 'register_failed', log = log || ? WHERE status IN ('registering', 'waiting_code')",
+		"\n"+time.Now().Format("2006-01-02 15:04:05")+" ✗ 程序重启，Adobe 任务中断，判定为失败",
+	).Error; err != nil {
+		log.Printf("reset adobe registering on boot: %v", err)
+	}
 
 	authSvc, err := auth.New(database)
 	if err != nil {
@@ -109,6 +115,19 @@ func main() {
 		api.GET("/grok/registrations/:id/logs", h.GrokLog)
 		api.GET("/grok/registrations/:id/shot", h.GrokShot)
 		api.POST("/grok/download", h.GrokDownload)
+
+		api.GET("/adobe/registrations", h.AdobeList)
+		api.DELETE("/adobe/registrations", h.AdobeDeleteAll)
+		api.POST("/adobe/registrations", h.AdobeStart)
+		api.POST("/adobe/produce", h.AdobeProduce)
+		api.GET("/adobe/produce/status", h.AdobeProduceStatus)
+		api.POST("/adobe/produce/stop", h.AdobeProduceStop)
+		api.POST("/adobe/registrations/:id/code", h.AdobeSubmitCode)
+		api.POST("/adobe/registrations/:id/stop", h.AdobeStop)
+		api.DELETE("/adobe/registrations/:id", h.AdobeDelete)
+		api.GET("/adobe/registrations/:id/logs", h.AdobeLog)
+		api.GET("/adobe/registrations/:id/shot", h.AdobeShot)
+		api.POST("/adobe/download", h.AdobeDownload)
 	}
 
 	sub, err := fs.Sub(staticFS, "static")
@@ -117,7 +136,7 @@ func main() {
 	}
 	httpFS := http.FS(sub)
 	r.StaticFS("/static", httpFS)
-	for _, p := range []string{"login", "dashboard", "mailboxes", "accounts", "grok", "settings"} {
+	for _, p := range []string{"login", "dashboard", "mailboxes", "accounts", "grok", "adobe", "settings"} {
 		p := p
 		r.GET("/"+p, func(c *gin.Context) { c.FileFromFS(p+".html", httpFS) })
 	}

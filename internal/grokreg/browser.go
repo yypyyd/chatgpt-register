@@ -207,9 +207,7 @@ func registerBrowser(ctx context.Context, in Input) (res *Result, err error) {
 		}
 		clickEmailSignup(page)
 	}
-	emailInput := page.Timeout(30 * time.Second).MustElement("input[type='email']")
-	emailInput.MustWaitVisible()
-	if err = typeHuman(emailInput, in.Email); err != nil {
+	if err = typeHumanStable(page, "input[type='email']", in.Email, 60*time.Second); err != nil {
 		return nil, fmt.Errorf("输入邮箱失败: %w", err)
 	}
 	if err = clickSubmit(page, in); err != nil {
@@ -1291,11 +1289,7 @@ func fillProfileHuman(page *rod.Page, in Input) error {
 	}
 	filled := 0
 	for _, c := range candidates {
-		el, err := page.Timeout(5 * time.Second).Element(c.sel)
-		if err != nil || el == nil {
-			continue
-		}
-		if err := typeHuman(el, c.val); err != nil {
+		if err := typeHumanStable(page, c.sel, c.val, 12*time.Second); err != nil {
 			continue
 		}
 		filled++
@@ -1325,6 +1319,77 @@ func fillProfileHuman(page *rod.Page, in Input) error {
 		}
 	}
 	return nil
+}
+
+// typeHumanStable 往输入框写入文本：每次尝试重新定位元素并使用独立超时，避免元素
+// 沉淀在等待阶段的绝对 deadline 上（等待+逐字输入共用一个预算时，负载高或
+// 输入框重渲染会报 context deadline exceeded）；写入后校验实际值，连续失败后才
+// 用原生 setter 兜底（优先真实按键，Turnstile 评分更高）。
+func typeHumanStable(page *rod.Page, selector, value string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for attempt := 0; time.Now().Before(deadline); attempt++ {
+		lastErr = func() error {
+			if attempt < 2 {
+				el, err := page.Timeout(15 * time.Second).Element(selector)
+				if err != nil {
+					return err
+				}
+				if err = el.WaitVisible(); err != nil {
+					return err
+				}
+				if err = typeHuman(el, value); err != nil {
+					return err
+				}
+			} else if err := setInputValueJS(page, selector, value); err != nil {
+				return err
+			}
+			if got := readInputValue(page, selector); got != value {
+				return fmt.Errorf("写入后内容不符(实际长度 %d)", len(got))
+			}
+			return nil
+		}()
+		if lastErr == nil {
+			return nil
+		}
+		time.Sleep(1 * time.Second)
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("等待输入框超时: %s", selector)
+	}
+	return lastErr
+}
+
+// setInputValueJS 用原生 setter 赋值并派发 input/change，兼容受控组件。
+func setInputValueJS(page *rod.Page, selector, value string) error {
+	ok, err := page.Timeout(10*time.Second).Eval(`(selector, value) => {
+		const el = document.querySelector(selector);
+		if (!el) return false;
+		el.focus();
+		const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+		setter.call(el, value);
+		el.dispatchEvent(new InputEvent('input', { bubbles: true, data: value, inputType: 'insertText' }));
+		el.dispatchEvent(new Event('change', { bubbles: true }));
+		return true;
+	}`, selector, value)
+	if err != nil {
+		return err
+	}
+	if !ok.Value.Bool() {
+		return fmt.Errorf("未找到输入框: %s", selector)
+	}
+	return nil
+}
+
+func readInputValue(page *rod.Page, selector string) string {
+	got, err := page.Timeout(10*time.Second).Eval(`selector => {
+		const el = document.querySelector(selector);
+		return el ? el.value : '';
+	}`, selector)
+	if err != nil {
+		return ""
+	}
+	return got.Value.Str()
 }
 
 func typeHuman(el *rod.Element, text string) error {

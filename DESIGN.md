@@ -30,6 +30,20 @@ IMAP 读取固定使用 TLS 993 和最低 TLS 1.2，读取 `INBOX`，并通过 `
 
 注册流程只获得 ChatGPT 网页会话 access token，因此 CPA 导出的 `refresh_token` 和 `id_token` 为空。导出格式转换不改变上游授权范围，也不能解决账号本身对 Codex Responses 的 401；凭据过期后不能由 CPA 自动刷新。
 
+### 独立 Adobe 注册（Firefly 免费额度）
+
+Adobe 注册与 ChatGPT、Grok 完全隔离：独立数据表 `adobe_registrations`、独立浏览器包 `internal/adobereg`、独立生产器 `internal/adobeproducer`、独立处理器 `handlers/adobe.go`、独立路由前缀 `/api/adobe/*` 与独立页面 `static/adobe.html`+`adobe.js`。不复用 Grok 的模型、路由或前端状态，也不共享浏览器二进制（使用独立 rod 目录 `browser-adobe`）。
+
+注册目标是 Adobe 账号（免费即可用 Firefly 的免费生图/生视频额度）。浏览器流程：打开 `account.adobe.com` → 进入「创建账号」表单填邮箱+随机密码 → 第二步填姓名/生日/地区（默认 US）→ 提交创建 → 打开 Firefly 触发「验证身份」邮箱验证码页 → 自动取码填入。验证码复用现有邮箱池（`mailfetch` + `Mailbox` 凭据）：生产器按 `since` 时间轮询邮件，用发件人/主题/正文特征（`adobe`/`firefly`/`verification code` 等）筛出 Adobe 邮件并提取 6 位数字码；每条 Adobe 记录独立保存所用 `mailbox_id`。日志与列表接口都不输出验证码和 Cookie 明文。
+
+注册成功后把 Adobe 登录会话（全量 Cookie + localStorage/sessionStorage）序列化进 `auth_data`（`json:"-"`，列表接口一律清空）。导出接口 `/api/adobe/download` 仅对已注册且有会话数据的记录开放，支持三种格式，导出即出库：
+
+- `string`：浏览器 Cookie 头字符串 `k=v; k=v; ...`（单账号 `.txt`，多账号 `.zip`）。
+- `json`：单个 Adobe 的 Cookie JSON 对象（含 `cookie_string`、`cookies_map`、带元数据的 `cookies` 数组、`storage`；单账号 `.json`，多账号 `.zip`）。
+- `array`：多个 Adobe 批量导出的 Cookie 数组，始终单个 `.json` 文件。
+
+生命周期与 Grok 一致：并发受 `adobe_max_concurrency`（回退 `max_concurrency`，默认 1）约束，代理走 `adobe_proxy_*`（回退全局 `proxy_*`），无头由 `adobe_headless` 控制；服务启动时把残留的 `registering`/`waiting_code` 记录回收为 `register_failed`，可重新注册。
+
 ## 已知限制
 
 - 面向单实例 SQLite 部署，不提供分布式任务锁。
@@ -47,6 +61,14 @@ IMAP 读取固定使用 TLS 993 和最低 TLS 1.2，读取 `INBOX`，并通过 `
 - **已知风险**：管理员凭据被盗后仍可执行不可恢复的全部删除；应依赖强管理员密码、HTTPS 与数据库备份降低风险。
 
 ## 变更历史
+
+### 2026-07-28 - 新增独立 Adobe（Firefly）注册
+
+**变更内容**：新增与 ChatGPT/Grok 隔离的 Adobe 注册子系统：`models.AdobeRegistration` + `adobe_registrations` 表、`internal/adobereg` 浏览器流程、`internal/adobeproducer` 生产器（复用邮箱池自动取码）、`handlers/adobe.go`、`/api/adobe/*` 路由、`static/adobe.html`+`adobe.js` 页面与侧边栏入口；Cookie 导出支持字符串 / JSON 对象 / 批量数组三种格式。
+
+**变更理由**：用户需要在同一管理台注册可用 Firefly 免费生图/生视频的 Adobe 账号，且不能与现有平台的表、路由、页面状态混用。
+
+**影响范围**：新增独立包与页面；`main.go`（启动回收 + 路由 + 静态页）、`internal/db/db.go`（AutoMigrate + 孤儿回收）、`internal/handlers/registration.go`（Handler 注入 `AdobeProducer`）、`static/layout.js`（侧边栏）少量接线；不改动 ChatGPT/Grok 既有行为。
 
 ### 2026-07-28 - 裂变邮箱改用 plus addressing
 
