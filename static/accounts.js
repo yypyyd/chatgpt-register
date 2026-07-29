@@ -4,6 +4,7 @@ const ACC_STATUS = {
   registering: '注册中',
   registered: '已注册',
   register_failed: '注册失败',
+  register_rejected: '拒绝(Terms)',
   already_registered: '停用',
 };
 let page = 1;

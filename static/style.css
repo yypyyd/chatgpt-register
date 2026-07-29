@@ -464,6 +464,7 @@ button.px-select-opt {
 .badge.waiting_code    { color: var(--violet); background: rgba(124, 58, 237, .12); }
 .badge.registered      { color: var(--green);  background: rgba(22, 163, 74, .13); }
 .badge.register_failed { color: var(--red);    background: rgba(225, 29, 72, .12); }
+.badge.register_rejected { color: var(--red);   background: rgba(225, 29, 72, .12); }
 .badge.already_registered { color: var(--amber); background: rgba(217, 119, 6, .13); }
 
 /* ===== 生产进度条 ===== */

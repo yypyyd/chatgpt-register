@@ -17,6 +17,10 @@ import (
 // ErrAccountTaken 注册时提示"账号不存在或已被删除/停用"，视为该地址已被注册，不应重试。
 var ErrAccountTaken = errors.New("账号不存在或已被删除/停用")
 
+// ErrTermsRejected 填完资料提交后命中 "We can't create your account due to our Terms of Use"
+// 拒绝页——通常是出口 IP 风控命中。原地重试无意义，交由上层换出口 IP 后重试或标记为不可注册。
+var ErrTermsRejected = errors.New("账号创建被 Terms of Use 拒绝")
+
 // registerBrowser 启动浏览器完成 ChatGPT 账号注册并返回 accessToken。
 // in.Proxy 为空则直连；非空时 Chrome 走该代理，并按出口 IP 做 GeoIP 对齐。
 func registerBrowser(ctx context.Context, in Input) (token string, err error) {
@@ -182,10 +186,16 @@ func registerBrowser(ctx context.Context, in Input) (token string, err error) {
 	page.MustElement("input[name='code']").MustInput(code)
 	page.MustElement("button[type='submit']").MustEval(`() => this.click()`)
 	in.logf("🔑 已提交验证码")
+	// 提交后稍等，让页面离开验证码页，避免把过渡态误判为"卡在验证码"。
+	time.Sleep(3 * time.Second)
 
-	// 6. 提交验证码后的页面状态机：账户完善页(name/age) / 主界面 / 账号停用 /
-	// "Oops, an error occurred"(Operation timed out) 报错页——点击 Try again 可继续。
+	// 6. 提交验证码后的页面状态机：
+	//   主界面(成功) / 账号停用 / Terms of Use 拒绝(硬拒绝) /
+	//   "Oops"(Operation timed out) 报错页(Try again) / 资料页(name/age) /
+	//   仍停在验证码页(码无效/过期 → 重发并重填一次)。
 	ready := false
+	codeResent := false
+	profileSubmitted := false
 	for attempt := 0; attempt < 8 && !ready; attempt++ {
 		pg := page.CancelTimeout().Timeout(60 * time.Second)
 		state := ""
@@ -196,11 +206,18 @@ func registerBrowser(ctx context.Context, in Input) (token string, err error) {
 			ElementR("body", "You do not have an account|deleted or deactivated").MustHandle(func(_ *rod.Element) {
 			state = "disabled"
 		}).
+			// 仅匹配拒绝报错文案本身，不要匹配资料页底部 "you agree to our Terms of Use" 的常规声明。
+			ElementR("body", "[Cc]an.t create your account|create your account due to our Terms").MustHandle(func(_ *rod.Element) {
+			state = "terms"
+		}).
 			ElementR("button", "Try again|重试").MustHandle(func(_ *rod.Element) {
 			state = "retry"
 		}).
 			Element("input[name='name']").MustHandle(func(_ *rod.Element) {
 			state = "profile"
+		}).
+			Element("input[name='code']").MustHandle(func(_ *rod.Element) {
+			state = "stillcode"
 		}).
 			MustDo()
 		switch state {
@@ -208,11 +225,19 @@ func registerBrowser(ctx context.Context, in Input) (token string, err error) {
 			ready = true
 		case "disabled":
 			return "", ErrAccountTaken
+		case "terms":
+			in.logf("⛔ 命中 Terms of Use 拒绝页")
+			return "", ErrTermsRejected
 		case "retry":
 			in.logf("⚠ 页面报错(Operation timed out)，点击 Try again 继续")
 			pg.MustElementR("button", "Try again|重试").MustEval(`() => this.click()`)
 			time.Sleep(3 * time.Second)
 		case "profile":
+			if profileSubmitted {
+				// 已提交过资料仍停在该页（过渡态或 Terms 报错渲染中），稍等重判，避免重复提交
+				time.Sleep(2 * time.Second)
+				continue
+			}
 			in.logf("📝 账户完善页面已出现")
 			name := pg.MustElement("input[name='name']")
 			name.MustSelectAllText().MustInput(in.FullName)
@@ -220,7 +245,32 @@ func registerBrowser(ctx context.Context, in Input) (token string, err error) {
 			age.MustSelectAllText().MustInput(in.Age)
 			pg.MustElement("button[type='submit']").MustEval(`() => this.click()`)
 			in.logf("👤 已提交资料 (name/age)")
+			profileSubmitted = true
 			time.Sleep(2 * time.Second)
+		case "stillcode":
+			if codeResent {
+				return "", fmt.Errorf("验证码提交后仍停在验证码页（重发后仍未通过）")
+			}
+			in.logf("📨 仍停在验证码页，点击重发并重新读取验证码")
+			// Resend 可能是按钮/链接；找不到就直接重新抓码重填（可能只是上次码解析有误）。
+			if el, e := pg.ElementR("button, a, [role='button']", "Resend|重新发送"); e == nil && el != nil {
+				el.MustEval(`() => this.click()`)
+				time.Sleep(8 * time.Second)
+			}
+			newCode, ferr := in.FetchCode(ctx)
+			if ferr != nil {
+				return "", fmt.Errorf("重发后获取验证码失败: %w", ferr)
+			}
+			newCode = strings.TrimSpace(newCode)
+			if newCode == "" {
+				return "", fmt.Errorf("重发后未获取到验证码")
+			}
+			pg2 := page.CancelTimeout().Timeout(60 * time.Second)
+			pg2.MustElement("input[name='code']").MustSelectAllText().MustInput(newCode)
+			pg2.MustElement("button[type='submit']").MustEval(`() => this.click()`)
+			in.logf("🔑 已重新提交验证码")
+			codeResent = true
+			time.Sleep(3 * time.Second)
 		}
 	}
 	if !ready {

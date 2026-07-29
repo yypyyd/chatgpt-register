@@ -191,6 +191,9 @@ func (p *Producer) run(ctx context.Context, target int) {
 				if errors.Is(err, codexreg.ErrAccountTaken) {
 					// 账号停用不再重试，也不计为“失败”（属于跳过换号）
 					p.logf("⚠ %s 停用（%v），不再重试，换下一个地址", mask(email), err)
+				} else if errors.Is(err, codexreg.ErrTermsRejected) {
+					// Terms of Use 拒绝为终态，不再重试也不计为“失败”，换下一个地址
+					p.logf("⛔ %s Terms of Use 拒绝，标记为不可注册，换下一个地址", mask(email))
 				} else {
 					// 记为失败态；若后续重试成功会被 markSuccess 清除
 					p.markFailed(email)
@@ -288,34 +291,73 @@ func (p *Producer) produceOne(ctx context.Context, cfg Config, mb models.Mailbox
 		p.db.Model(&models.Registration{}).Where("email = ?", email).Update("log", snapshot)
 	}
 
-	since := time.Now().Add(-30 * time.Second)
-	in := codexreg.Input{
-		Email:    email,
-		Password: password,
-		Proxy:    p.nextProxy(cfg),
-		Headless: cfg.Headless,
-		Log: func(f string, a ...any) {
-			msg := fmt.Sprintf(f, a...)
-			appendLog(msg)
-			p.logf("%s", "  "+mask(email)+" "+msg)
-		},
-		FetchCode: func(ctx context.Context) (string, error) {
-			return p.fetchCode(ctx, mb, since)
-		},
-		SaveShot: func(png []byte) {
-			p.db.Model(&models.Registration{}).Where("email = ?", email).Update("shot", png)
-		},
+	// 出口 IP：轮转代理池取一个基础代理。若为 bestgo 住宅代理（可换 IP），
+	// Terms of Use 拒绝时换新住宅 session(=新 IP) 重试，最多 maxTermsAttempts 次；
+	// 直连/固定出口无法换 IP，Terms 拒绝直接标记 rejected，不空转重试。
+	const maxTermsAttempts = 3
+	baseProxy := p.nextProxy(cfg)
+	canRotate := isRotatable(baseProxy)
+	attempts := 1
+	if canRotate {
+		attempts = maxTermsAttempts
 	}
-	res, err := codexreg.Register(ctx, in)
+
+	var res *codexreg.Result
+	var err error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		proxy := baseProxy
+		if canRotate {
+			proxy = rotateBestgoSession(baseProxy) // 每次尝试换新住宅 session = 新出口 IP
+			if attempt > 1 {
+				appendLog(fmt.Sprintf("♻ Terms of Use 拒绝，更换住宅 IP 后第 %d/%d 次重试", attempt, attempts))
+			}
+		}
+		since := time.Now().Add(-30 * time.Second)
+		in := codexreg.Input{
+			Email:    email,
+			Password: password,
+			Proxy:    proxy,
+			Headless: cfg.Headless,
+			Log: func(f string, a ...any) {
+				msg := fmt.Sprintf(f, a...)
+				appendLog(msg)
+				p.logf("%s", "  "+mask(email)+" "+msg)
+			},
+			FetchCode: func(ctx context.Context) (string, error) {
+				return p.fetchCode(ctx, mb, since)
+			},
+			SaveShot: func(png []byte) {
+				p.db.Model(&models.Registration{}).Where("email = ?", email).Update("shot", png)
+			},
+		}
+		res, err = codexreg.Register(ctx, in)
+		if err == nil {
+			break
+		}
+		if errors.Is(err, codexreg.ErrTermsRejected) && canRotate && attempt < attempts {
+			continue // 换 IP 再来一次
+		}
+		break
+	}
 	if err != nil {
-		if errors.Is(err, codexreg.ErrAccountTaken) {
+		switch {
+		case errors.Is(err, codexreg.ErrAccountTaken):
 			appendLog("⚠ 停用（账号不存在或已被删除/停用），不再重试，换下一个地址继续")
 			p.setRegistrationStatus(email, "already_registered", "停用："+err.Error(), logBuf.String())
 			return err
+		case errors.Is(err, codexreg.ErrTermsRejected):
+			if canRotate {
+				appendLog("⛔ 多次更换住宅 IP 仍被 Terms of Use 拒绝，标记为不可注册")
+			} else {
+				appendLog("⛔ Terms of Use 拒绝（直连/固定出口无法换 IP），标记为不可注册")
+			}
+			p.setRegistrationStatus(email, "register_rejected", "Terms of Use 拒绝："+err.Error(), logBuf.String())
+			return err
+		default:
+			appendLog("✗ 失败: " + err.Error())
+			p.setRegistrationFailed(email, err.Error(), logBuf.String())
+			return err
 		}
-		appendLog("✗ 失败: " + err.Error())
-		p.setRegistrationFailed(email, err.Error(), logBuf.String())
-		return err
 	}
 
 	appendLog("✓ ChatGPT 注册成功（未执行 Agent Identity）")
@@ -339,20 +381,28 @@ func (p *Producer) fetchCode(ctx context.Context, mb models.Mailbox, since time.
 		}
 		msgs, err := p.mail.ListMessages(ctx, acc, 15)
 		if err == nil {
+			// 取"最新"一封 OpenAI 验证邮件里的码：重发后新码到达时能覆盖旧码，
+			// 避免重发场景下抓回已失效的旧验证码。
+			var bestCode string
+			var bestAt time.Time
 			for _, m := range msgs {
 				if m.ReceivedAt.Before(since) || !looksLikeOpenAI(m) {
 					continue
 				}
-				if code := codeRe.FindStringSubmatch(m.Subject); code != nil {
-					return code[1], nil
+				code := ""
+				if c := codeRe.FindStringSubmatch(m.Subject); c != nil {
+					code = c[1]
+				} else if full, gerr := p.mail.GetMessage(ctx, acc, m.ID); gerr == nil {
+					if c := codeRe.FindStringSubmatch(full.Subject + " " + full.Text); c != nil {
+						code = c[1]
+					}
 				}
-				full, gerr := p.mail.GetMessage(ctx, acc, m.ID)
-				if gerr != nil {
-					continue
+				if code != "" && (bestCode == "" || m.ReceivedAt.After(bestAt)) {
+					bestCode, bestAt = code, m.ReceivedAt
 				}
-				if code := codeRe.FindStringSubmatch(full.Subject + " " + full.Text); code != nil {
-					return code[1], nil
-				}
+			}
+			if bestCode != "" {
+				return bestCode, nil
 			}
 		}
 		select {
@@ -420,10 +470,11 @@ func (p *Producer) registeredCount() int {
 	return int(n)
 }
 
-// isRegistered 该地址是否已终结（注册成功或已被他人注册），不再对其发起新注册。
+// isRegistered 该地址是否已终结（注册成功 / 已被他人注册 / Terms 拒绝），不再对其发起新注册。
+// 注：register_rejected 计入终态以免同一地址被反复重试，但不计入 fissionCount 的裂变名额。
 func (p *Producer) isRegistered(email string) bool {
 	var n int64
-	p.db.Model(&models.Registration{}).Where("email = ? AND status IN ?", email, []string{"registered", "already_registered"}).Count(&n)
+	p.db.Model(&models.Registration{}).Where("email = ? AND status IN ?", email, []string{"registered", "already_registered", "register_rejected"}).Count(&n)
 	return n > 0
 }
 
@@ -484,7 +535,8 @@ func (p *Producer) loadConfig() Config {
 	if cfg.FissionCount < 0 {
 		cfg.FissionCount = defaultFissionCount
 	}
-	if p.getSetting("proxy_enabled") == "1" {
+	// 代理默认开：未设置(空)视为开，仅显式 "0" 才关闭(直连)。可在设置页开关/编辑。
+	if p.getSetting("proxy_enabled") != "0" {
 		cfg.Proxies = proxyList(p.getSetting("proxy_list"))
 	}
 	return cfg
