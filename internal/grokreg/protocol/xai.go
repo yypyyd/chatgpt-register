@@ -41,6 +41,7 @@ const (
 var (
 	siteKeyRe = regexp.MustCompile(`0x4AAAAAAA[a-zA-Z0-9_-]+`)
 	jsSrcRe   = regexp.MustCompile(`src="(/_next/static/[^"]+\.js)"`)
+	jsPathRe  = regexp.MustCompile(`/_next/static/[^"'\\ )>]+\.js`)
 	hex40Re   = regexp.MustCompile(`[a-fA-F0-9]{40,50}`)
 	flightRe  = regexp.MustCompile(`self\.__next_f\.push\(\[1,"(.*?)"\]\)`)
 )
@@ -203,6 +204,12 @@ func (c *Client) FetchConfig() (SignupConfig, error) {
 		cfg.Source += "+default_tree"
 	}
 	jsURLs := unique(jsSrcRe.FindAllStringSubmatch(html, -1))
+	if len(jsURLs) == 0 {
+		// Newer sign-up markup no longer exposes chunks via a plain
+		// src="..." attribute; fall back to any /_next/static/*.js path so the
+		// next-action id is still scraped instead of using the stale default.
+		jsURLs = uniqueStr(jsPathRe.FindAllString(html, -1))
+	}
 	for _, path := range jsURLs {
 		if cfg.ActionID != "" {
 			break
@@ -903,6 +910,19 @@ func readBody(resp *http.Response) (string, error) {
 	}
 	b, err := io.ReadAll(io.LimitReader(r, 8<<20))
 	return string(b), err
+}
+
+func uniqueStr(in []string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
 }
 
 func unique(matches [][]string) []string {

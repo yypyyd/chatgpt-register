@@ -131,7 +131,8 @@ func registerBrowser(ctx context.Context, in Input) (res *Result, err error) {
 			in.logf("已保存失败现场截图")
 		}()
 	}()
-	if proxyConfigured {
+	// 出口 IP 探测仅用于排障，默认跳过以省一次整页加载；需要时置 EgressCheck。
+	if proxyConfigured && in.EgressCheck {
 		checkPage := browser.MustPage("https://api.ipify.org?format=json")
 		checkPage.MustWaitLoad()
 		if body, berr := checkPage.Timeout(15 * time.Second).Element("body"); berr == nil && body != nil {
@@ -173,7 +174,9 @@ func registerBrowser(ctx context.Context, in Input) (res *Result, err error) {
 	if err = handleEmailVerification(ctx, page, in); err != nil {
 		return nil, err
 	}
-	if err = waitFireflyReady(ctx, page, in, 120*time.Second); err != nil {
+	// 会话无论 Firefly 是否按预期跳转都会照常采集，这里不必久等：25s 足够正常
+	// 跳转完成，超时也直接进入采集，避免像账号建成后白等两分钟。
+	if err = waitFireflyReady(ctx, page, in, 25*time.Second); err != nil {
 		in.logf("等待 Firefly 就绪超时（账号已创建），继续采集会话: %v", err)
 	}
 
@@ -201,7 +204,7 @@ func gotoStable(ctx context.Context, page *rod.Page, target string, in Input, ti
 		u := pageURL(page)
 		if strings.Contains(u, "adobe.com") {
 			if u == last {
-				if stable++; stable >= 2 {
+				if stable++; stable >= 1 {
 					return nil
 				}
 			} else {
@@ -209,7 +212,7 @@ func gotoStable(ctx context.Context, page *rod.Page, target string, in Input, ti
 				last = u
 			}
 		}
-		time.Sleep(1500 * time.Millisecond)
+		time.Sleep(700 * time.Millisecond)
 	}
 	if last != "" {
 		in.logf("页面加载完成(可能仍在跳转): %s", trimText(last, 120))
@@ -230,7 +233,7 @@ func gotoCreateForm(ctx context.Context, page *rod.Page, in Input) error {
 			return nil
 		}
 		clickByText(page, `a,span,button`, `create an account`)
-		time.Sleep(1500 * time.Millisecond)
+		time.Sleep(700 * time.Millisecond)
 	}
 	return fmt.Errorf("未能进入 Adobe 创建账号表单")
 }
@@ -302,7 +305,7 @@ func completeSignup(ctx context.Context, page *rod.Page, in Input) error {
 			in.logf("注册表单已完成: %s", trimText(u, 120))
 			return nil
 		}
-		time.Sleep(1500 * time.Millisecond)
+		time.Sleep(700 * time.Millisecond)
 	}
 	return fmt.Errorf("完成注册步骤超时（可能遇到额外校验）")
 }

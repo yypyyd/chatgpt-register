@@ -274,6 +274,8 @@ func (p *Producer) run(id uint) {
 		Password: reg.Password,
 		Proxy:    p.nextProxy(),
 		Headless: p.getSetting("adobe_headless") == "1",
+		// 出口 IP 探测默认关闭以提速；需排障时置 adobe_egress_check=1。
+		EgressCheck: p.getSetting("adobe_egress_check") == "1",
 		Log: func(f string, a ...any) {
 			p.appendLog(id, fmt.Sprintf(f, a...))
 		},

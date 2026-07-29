@@ -17,6 +17,10 @@ type Input struct {
 	Proxy     string
 	Headless  bool
 
+	// EgressCheck 为 true 时先打开 api.ipify.org 打印 Chromium 实际出口 IP（排障用）。
+	// 默认关闭，省去每次注册前的一次整页加载。
+	EgressCheck bool
+
 	// WaitCode 返回 Adobe 发到邮箱的 6 位邮箱验证码（访问 Firefly 时触发）。
 	WaitCode func(ctx context.Context) (string, error)
 	Log      func(format string, a ...any)
