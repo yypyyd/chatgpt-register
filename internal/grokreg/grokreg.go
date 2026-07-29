@@ -5,6 +5,7 @@ import (
 	cryptorand "crypto/rand"
 	"fmt"
 	"math/big"
+	"strings"
 )
 
 const userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
@@ -24,6 +25,24 @@ type Input struct {
 	TurnstilePython string
 	TurnstileScript string
 	TurnstileMode   string
+
+	// Engine selects the registration path. "protocol" (default) runs the whole
+	// flow over HTTP/gRPC and only spawns a browser to mint the Turnstile token;
+	// "browser" keeps the legacy rod flow. Empty defaults to protocol.
+	Engine string
+
+	// Impersonate / ImpersonateFallback control the TLS fingerprint of the
+	// protocol client (default chrome_131, fallback chrome_124,chrome_120).
+	Impersonate         string
+	ImpersonateFallback string
+
+	// FlareSolverrURL enables a Cloudflare clearance fallback: when the protocol
+	// client is blocked, cf_clearance cookies are fetched from FlareSolverr and
+	// reused. ClearanceProxy is the egress FlareSolverr uses; ClearanceURLs is a
+	// comma-separated list of hosts to prewarm. All optional.
+	FlareSolverrURL string
+	ClearanceProxy  string
+	ClearanceURLs   string
 
 	WaitCode func(ctx context.Context) (string, error)
 	Log      func(format string, a ...any)
@@ -61,7 +80,10 @@ func Register(ctx context.Context, in Input) (*Result, error) {
 	if in.LastName == "" {
 		in.LastName = lastNames[ri(len(lastNames))]
 	}
-	return registerBrowser(ctx, in)
+	if strings.EqualFold(strings.TrimSpace(in.Engine), "browser") {
+		return registerBrowser(ctx, in)
+	}
+	return registerProtocol(ctx, in)
 }
 
 var firstNames = []string{"Alex", "Jamie", "Taylor", "Jordan", "Casey", "Morgan", "Riley", "Avery", "Quinn", "Parker", "Cameron", "Reese"}

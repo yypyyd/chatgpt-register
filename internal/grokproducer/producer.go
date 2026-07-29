@@ -295,6 +295,14 @@ func (p *Producer) run(id uint) {
 		// Match the reference project: Grok registration is headed by default.
 		// A dedicated opt-in setting can still enable headless for diagnostics.
 		Headless: p.getSetting("grok_headless") == "1",
+		// 协议注册为默认路径：只借浏览器签发 Turnstile 令牌，拿到后立即退出、
+		// 其余全走 HTTP/gRPC。设置 grok_engine=browser 可回退到旧的全程浏览器流程。
+		Engine:              p.getSetting("grok_engine"),
+		Impersonate:         p.getSetting("grok_impersonate"),
+		ImpersonateFallback: p.getSetting("grok_impersonate_fallback"),
+		FlareSolverrURL:     p.getSetting("grok_flaresolverr_url"),
+		ClearanceProxy:      p.getSetting("grok_clearance_proxy"),
+		ClearanceURLs:       p.getSetting("grok_clearance_urls"),
 		Log: func(f string, a ...any) {
 			p.appendLog(id, fmt.Sprintf(f, a...))
 		},
