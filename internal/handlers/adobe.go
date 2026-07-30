@@ -128,6 +128,30 @@ func (h *Handler) AdobeStop(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
+// AdobeRescue 对单个被 ride 卡住的号：还原会话、自动过身份核验、重采会话并复检。
+func (h *Handler) AdobeRescue(c *gin.Context) {
+	if h.Browser == nil || !h.Browser.Ready() {
+		c.JSON(http.StatusConflict, gin.H{"error": "缺少浏览器，无法救回：浏览器正在下载或下载失败"})
+		return
+	}
+	id64, _ := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err := h.AdobeProducer.Rescue(uint(id64)); err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusAccepted, gin.H{"ok": true})
+}
+
+// AdobeRescueDead 批量救回所有失效(dead)且有会话数据的号（逐个串行执行）。
+func (h *Handler) AdobeRescueDead(c *gin.Context) {
+	if h.Browser == nil || !h.Browser.Ready() {
+		c.JSON(http.StatusConflict, gin.H{"error": "缺少浏览器，无法救回：浏览器正在下载或下载失败"})
+		return
+	}
+	ids := h.AdobeProducer.RescueAllDead()
+	c.JSON(http.StatusAccepted, gin.H{"ok": true, "started": len(ids), "ids": ids})
+}
+
 func (h *Handler) AdobeDelete(c *gin.Context) {
 	id64, _ := strconv.ParseUint(c.Param("id"), 10, 64)
 	h.AdobeProducer.Stop(uint(id64))

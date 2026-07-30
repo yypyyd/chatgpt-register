@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Adobe 注册 · ChatGPT 注册管理</title>
-<link rel="stylesheet" href="/static/style.css?v=16">
+<link rel="stylesheet" href="/static/style.css?v=17">
 </head>
 <body data-page="adobe">
 <div class="layout">
@@ -46,7 +46,10 @@
           <button type="button" class="px-select-opt" onclick="downloadUnshipped('array')">Cookie 数组</button>
         </div>
       </div>
+      <button class="px-btn" onclick="liveCheckAll()">测活</button>
+      <button class="px-btn" onclick="rescueDead()" title="对全部失效(dead)且有会话的号自动过 ride 身份核验">批量救回失效号</button>
       <button class="px-btn danger" onclick="deleteAllAdobe()">全部删除</button>
+      <span id="live-progress" class="live-progress" style="display:none"></span>
     </div>
 
     <div class="batch-bar" id="adobe-batch" style="display:none">
@@ -54,6 +57,8 @@
       <button class="px-btn" onclick="downloadSelected('string')">导出 Cookie 字符串</button>
       <button class="px-btn" onclick="downloadSelected('json')">导出 Cookie JSON</button>
       <button class="px-btn" onclick="downloadSelected('array')">导出 Cookie 数组</button>
+      <button class="px-btn" onclick="liveCheckSelected()">测活所选</button>
+      <button class="px-btn" onclick="rescueSelected()">救回所选</button>
       <button class="px-btn danger" onclick="delSelected()">删除所选</button>
       <button class="px-btn ghost" onclick="clearSelection()">取消</button>
     </div>
@@ -62,7 +67,7 @@
       <table class="px-table">
         <thead><tr>
           <th class="col-check"><input type="checkbox" id="adobe-check-all" onclick="toggleSelectAll(this.checked)"></th>
-          <th>邮箱</th><th>创建时间</th><th>状态</th><th>出库状态</th><th>操作</th>
+          <th>邮箱</th><th>创建时间</th><th>状态</th><th>存活</th><th>出库状态</th><th>操作</th>
         </tr></thead>
         <tbody id="rows"></tbody>
       </table>
@@ -114,6 +119,6 @@
 
 <div id="toast" class="toast" style="display:none"></div>
 <script src="/static/layout.js?v=4"></script>
-<script src="/static/adobe.js?v=2"></script>
+<script src="/static/adobe.js?v=3"></script>
 </body>
 </html>

@@ -25,6 +25,10 @@ type Input struct {
 	WaitCode func(ctx context.Context) (string, error)
 	Log      func(format string, a ...any)
 	SaveShot func(png []byte)
+
+	// ResetCodeBaseline 可选：把「只认此刻之后的新验证码」基线重置为当前时间，
+	// 用于过 ride 身份核验前，避免 WaitCode 误取注册阶段的旧验证码。为空则忽略。
+	ResetCodeBaseline func()
 }
 
 type Result struct {

@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"net/url"
 	"path/filepath"
 	"strconv"
@@ -21,15 +23,17 @@ import (
 const (
 	signInURL  = "https://account.adobe.com/"
 	fireflyURL = "https://firefly.adobe.com/generate/images"
+
+	// 与下游 image2api 完全一致的 cookie→token 交换端点/参数：注册末尾用它主动探测
+	// 账号是否被 Adobe ride 身份核验拦住（邮箱未验证 acct_evs），并拿到跳转链接去过验证。
+	adobeTokenURL = "https://adobeid-na1.services.adobe.com/ims/check/v6/token?jslVersion=v2-v0.48.0-1-g1e322cb"
+	adobeClientID = "clio-playground-web"
+	adobeScope    = "AdobeID,firefly_api,openid,pps.read,pps.write,additional_info.projectedProductContext,additional_info.ownerOrg,uds_read,uds_write,ab.manage,read_organizations,additional_info.roles,account_cluster.read,creative_production,profile"
 )
 
-func registerBrowser(ctx context.Context, in Input) (res *Result, err error) {
-	if in.Headless {
-		in.logf("启动无头浏览器，打开 Adobe 注册页")
-	} else {
-		in.logf("启动可见浏览器，打开 Adobe 注册页")
-	}
-
+// launchAdobeBrowser 按注册用的一整套反爬/代理配置启动并连接 Adobe 专用 Chromium。
+// 返回的 browser 由调用方负责关闭；若返回了 bridge（认证代理桥），也要一并 Close。
+func launchAdobeBrowser(in Input) (browser *rod.Browser, bridge *localAuthProxyBridge, err error) {
 	// 与 grokreg 一致：删掉 rod 默认追加的一批自动化特征标志，降低被反爬识别的概率。
 	l := launcher.New()
 	for _, flag := range []string{
@@ -69,7 +73,7 @@ func registerBrowser(ctx context.Context, in Input) (res *Result, err error) {
 		Set("disable-features", "PrivacySandboxSettings4")
 	debugPort, perr := availableLoopbackPort()
 	if perr != nil {
-		return nil, fmt.Errorf("分配 Chrome 调试端口失败: %w", perr)
+		return nil, nil, fmt.Errorf("分配 Chrome 调试端口失败: %w", perr)
 	}
 	l = l.Set("remote-debugging-port", strconv.Itoa(debugPort))
 	if chromePath, cerr := adobeChromiumBin(); cerr != nil {
@@ -79,32 +83,53 @@ func registerBrowser(ctx context.Context, in Input) (res *Result, err error) {
 		in.logf("使用 Adobe 专用 Chromium，与 GPT/Grok 浏览器隔离")
 	}
 
-	var authBridge *localAuthProxyBridge
-	proxyConfigured := strings.TrimSpace(in.Proxy) != ""
-	if proxyConfigured {
+	if strings.TrimSpace(in.Proxy) != "" {
 		server, user, pass, perr := parseProxy(in.Proxy)
 		if perr != nil {
-			return nil, fmt.Errorf("解析代理失败: %w", perr)
+			return nil, nil, fmt.Errorf("解析代理失败: %w", perr)
 		}
 		if user != "" || pass != "" {
-			authBridge, server, perr = startLocalAuthProxyBridge(in.Proxy)
+			bridge, server, perr = startLocalAuthProxyBridge(in.Proxy)
 			if perr != nil {
-				return nil, fmt.Errorf("启动认证代理桥失败: %w", perr)
+				return nil, nil, fmt.Errorf("启动认证代理桥失败: %w", perr)
 			}
-			defer authBridge.Close()
 			in.logf("已启用 Chromium 本地认证代理桥")
 		}
 		l = l.Set("proxy-server", server)
 		in.logf("使用代理: %s", server)
 	}
 
-	controlURL, err := l.Launch()
-	if err != nil {
-		return nil, fmt.Errorf("启动 Chrome 失败: %w", err)
+	controlURL, lerr := l.Launch()
+	if lerr != nil {
+		if bridge != nil {
+			bridge.Close()
+		}
+		return nil, nil, fmt.Errorf("启动 Chrome 失败: %w", lerr)
 	}
-	browser := rod.New().NoDefaultDevice().ControlURL(controlURL)
-	if err = browser.Connect(); err != nil {
-		return nil, fmt.Errorf("连接 Chrome 失败: %w", err)
+	browser = rod.New().NoDefaultDevice().ControlURL(controlURL)
+	if cerr := browser.Connect(); cerr != nil {
+		if bridge != nil {
+			bridge.Close()
+		}
+		return nil, nil, fmt.Errorf("连接 Chrome 失败: %w", cerr)
+	}
+	return browser, bridge, nil
+}
+
+func registerBrowser(ctx context.Context, in Input) (res *Result, err error) {
+	if in.Headless {
+		in.logf("启动无头浏览器，打开 Adobe 注册页")
+	} else {
+		in.logf("启动可见浏览器，打开 Adobe 注册页")
+	}
+
+	browser, authBridge, err := launchAdobeBrowser(in)
+	if err != nil {
+		return nil, err
+	}
+	proxyConfigured := strings.TrimSpace(in.Proxy) != ""
+	if authBridge != nil {
+		defer authBridge.Close()
 	}
 	defer browser.MustClose()
 
@@ -184,7 +209,206 @@ func registerBrowser(ctx context.Context, in Input) (res *Result, err error) {
 	if cerr != nil {
 		return nil, cerr
 	}
+
+	// 新号邮箱可能未验证（Adobe 现在把邮箱核验延后到换 token 时），下游用
+	// clio-playground-web 换 token 会被 ride_AdobeID_acct_evs 身份核验拦住。这里
+	// 主动做一次交换：若被拦，就打开核验页用邮箱验证码过掉，再重新采集会话，
+	// 确保导出的号下游可直接用。失败只记日志、保留原会话（账号仍算注册成功）。
+	if newAuth, ok := passAdobeRide(ctx, page, in, auth); ok {
+		auth = newAuth
+	}
 	return &Result{AuthJSON: auth}, nil
+}
+
+// passAdobeRide 用与下游一致的 cookie→token 交换探测账号是否被 Adobe ride 拦。
+// 被拦时打开跳转核验页、自动填邮箱验证码过掉核验并重新采集会话；返回是否已更新会话。
+func passAdobeRide(ctx context.Context, page *rod.Page, in Input, auth map[string]any) (map[string]any, bool) {
+	cookie := cookieHeaderFromAuth(auth)
+	if cookie == "" {
+		return auth, false
+	}
+	jump, err := adobeRideJump(ctx, cookie)
+	if err != nil {
+		in.logf("检查换 token 状态失败（不影响注册结果）: %v", err)
+		return auth, false
+	}
+	if jump == "" {
+		in.logf("cookie→token 交换成功，账号下游可用")
+		return auth, false
+	}
+	in.logf("检测到 Adobe 身份核验(ride_AdobeID_acct_evs)，打开核验页尝试用邮箱验证码通过")
+	// 重置验证码基线，确保取到的是核验页新发的验证码而非注册阶段旧码。
+	if in.ResetCodeBaseline != nil {
+		in.ResetCodeBaseline()
+	}
+	if err := gotoStable(ctx, page, jump, in, 60*time.Second); err != nil {
+		in.logf("打开身份核验页失败: %v", err)
+		return auth, false
+	}
+	// 跳转是 deeplink SPA，验证码框（PinInput）要几秒才渲染，先等它出现再处理，
+	// 否则会误判为"无需验证"直接跳过。
+	if !waitCleared(ctx, page, 30*time.Second, func() bool { return onEmailVerify(page, pageURL(page)) }) {
+		in.logf("等待身份核验页出现超时，当前页面: %s", trimText(pageURL(page), 120))
+		return auth, false
+	}
+	if err := handleEmailVerification(ctx, page, in); err != nil {
+		in.logf("自动通过身份核验失败: %v", err)
+		return auth, false
+	}
+	if err := gotoStable(ctx, page, fireflyURL, in, 60*time.Second); err != nil {
+		in.logf("核验后打开 Firefly 异常: %v", err)
+	}
+	_ = waitFireflyReady(ctx, page, in, 20*time.Second)
+	newAuth, err := captureAuth(page, in)
+	if err != nil {
+		in.logf("核验后重新采集会话失败: %v", err)
+		return auth, false
+	}
+	// 复验一次确认现在能换到 token。
+	if jump2, e := adobeRideJump(ctx, cookieHeaderFromAuth(newAuth)); e == nil && jump2 == "" {
+		in.logf("身份核验已通过，账号下游可用")
+	} else {
+		in.logf("身份核验后仍未能换到 token，可能需人工处理")
+	}
+	return newAuth, true
+}
+
+// RescueRide 针对已注册但被 ride 卡住的号：用导出的 cookie 还原会话、打开核验页
+// 自动用邮箱验证码过掉身份核验，再重新采集会话返回。cookies 为注册时导出的 cookie
+// 列表（每项含 name/value/domain 等字段）。过验证失败不报错，返回当前会话由调用方判定。
+func RescueRide(ctx context.Context, in Input, cookies []map[string]any) (res *Result, err error) {
+	if in.Headless {
+		in.logf("启动无头浏览器，还原会话过身份核验")
+	} else {
+		in.logf("启动可见浏览器，还原会话过身份核验")
+	}
+	browser, bridge, err := launchAdobeBrowser(in)
+	if err != nil {
+		return nil, err
+	}
+	if bridge != nil {
+		defer bridge.Close()
+	}
+	defer browser.MustClose()
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("Adobe 救回流程异常: %v", r)
+		}
+	}()
+
+	page := browser.MustPage("")
+	_ = (proto.EmulationSetDeviceMetricsOverride{
+		Width:             1280,
+		Height:            900,
+		DeviceScaleFactor: 1,
+		Mobile:            false,
+	}).Call(page)
+
+	if err := setAdobeCookies(page, cookies); err != nil {
+		return nil, fmt.Errorf("还原 cookie 失败: %w", err)
+	}
+	if err := gotoStable(ctx, page, fireflyURL, in, 90*time.Second); err != nil {
+		in.logf("打开 Firefly 异常（继续尝试过核验）: %v", err)
+	}
+	auth, cerr := captureAuth(page, in)
+	if cerr != nil {
+		return nil, cerr
+	}
+	if newAuth, ok := passAdobeRide(ctx, page, in, auth); ok {
+		auth = newAuth
+	}
+	return &Result{AuthJSON: auth}, nil
+}
+
+// setAdobeCookies 把导出的 cookie 列表注入浏览器，用于还原已注册号的登录态。
+func setAdobeCookies(page *rod.Page, cookies []map[string]any) error {
+	params := make([]*proto.NetworkCookieParam, 0, len(cookies))
+	for _, c := range cookies {
+		name, _ := c["name"].(string)
+		if strings.TrimSpace(name) == "" {
+			continue
+		}
+		value, _ := c["value"].(string)
+		p := &proto.NetworkCookieParam{Name: name, Value: value}
+		if d, ok := c["domain"].(string); ok {
+			p.Domain = d
+		}
+		if pt, ok := c["path"].(string); ok {
+			p.Path = pt
+		}
+		if b, ok := c["secure"].(bool); ok {
+			p.Secure = b
+		}
+		if b, ok := c["httpOnly"].(bool); ok {
+			p.HTTPOnly = b
+		}
+		if f, ok := c["expires"].(float64); ok && f > 0 {
+			p.Expires = proto.TimeSinceEpoch(f)
+		}
+		if ss, ok := c["sameSite"].(string); ok {
+			switch ss {
+			case "Strict", "Lax", "None":
+				p.SameSite = proto.NetworkCookieSameSite(ss)
+			}
+		}
+		params = append(params, p)
+	}
+	if len(params) == 0 {
+		return fmt.Errorf("无有效 cookie")
+	}
+	return page.SetCookies(params)
+}
+
+// cookieHeaderFromAuth 把 captureAuth 产出的 cookies 拼成 HTTP Cookie 请求头。
+func cookieHeaderFromAuth(auth map[string]any) string {
+	list, ok := auth["cookies"].([]map[string]any)
+	if !ok {
+		return ""
+	}
+	parts := make([]string, 0, len(list))
+	for _, ck := range list {
+		name, _ := ck["name"].(string)
+		if strings.TrimSpace(name) == "" {
+			continue
+		}
+		value, _ := ck["value"].(string)
+		parts = append(parts, name+"="+value)
+	}
+	return strings.Join(parts, "; ")
+}
+
+// adobeRideJump 做一次 cookie→token 交换：换到 token 返回空串（下游可用）；被 ride
+// 身份核验拦住则返回跳转核验页的 URL；其它错误返回 err（调用方按不阻断处理）。
+func adobeRideJump(ctx context.Context, cookie string) (string, error) {
+	body := "client_id=" + adobeClientID + "&guest_allowed=true&scope=" + url.QueryEscape(adobeScope)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, adobeTokenURL, strings.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("content-type", "application/x-www-form-urlencoded;charset=UTF-8")
+	req.Header.Set("origin", "https://firefly.adobe.com")
+	req.Header.Set("referer", "https://firefly.adobe.com/")
+	req.Header.Set("cookie", cookie)
+	req.Header.Set("user-agent", userAgent)
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode == http.StatusOK {
+		return "", nil
+	}
+	var payload struct {
+		Error string `json:"error"`
+		Jump  string `json:"jump"`
+	}
+	_ = json.Unmarshal(raw, &payload)
+	if payload.Jump != "" {
+		return payload.Jump, nil
+	}
+	return "", fmt.Errorf("换 token 失败(%d) %s", resp.StatusCode, payload.Error)
 }
 
 // gotoStable 导航到目标 URL 并容忍 Adobe 的多级跳转：
@@ -513,9 +737,9 @@ func hasSel(page *rod.Page, selector string) bool {
 	return has
 }
 
-// fillInput 往输入框写入文本：优先用原生 setter 直接赋值并校验（快且对 React
-// 受控组件稳定，避免逐字输入时节点被重渲染替换导致的 context deadline
-// exceeded），未生效再退回逐字输入。每步都有独立超时并在总预算内重试。
+// fillInput 往输入框写入文本：优先逐字符人工输入（有真实按键节奏，降低被
+// Adobe 行为风控判为机器人、进而触发 ride 身份核验的概率），人工输入未生效
+// 时再退回原生 setter 兜底。每步都有独立超时并在总预算内重试。
 func fillInput(ctx context.Context, page *rod.Page, selector, value string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	var lastErr error
@@ -525,22 +749,19 @@ func fillInput(ctx context.Context, page *rod.Page, selector, value string, time
 		}
 		lastErr = func() error {
 			// 先确认输入框已出现（有独立超时，不会拖到几分钟）。
-			if _, err := waitVisible(page, selector, 12*time.Second); err != nil {
+			el, err := waitVisible(page, selector, 12*time.Second)
+			if err != nil {
 				return err
 			}
-			// 优先用原生 setter 直接赋值（快且对 React 受控组件稳定），写完校验。
-			if err := setInputValue(page, selector, value); err != nil {
+			// 优先逐字符人工输入（真实按键事件+节奏，最像真人）。
+			if err := typeHuman(el, value); err != nil {
 				return err
 			}
 			if inputValue(page, selector) == value {
 				return nil
 			}
-			// setter 未生效（个别页面会重置），退回逐字输入，重新定位元素。
-			el, err := waitVisible(page, selector, 12*time.Second)
-			if err != nil {
-				return err
-			}
-			if err = typeHuman(el, value); err != nil {
+			// 人工输入未生效（React 重渲染替换了节点等），退回原生 setter 兜底。
+			if err := setInputValue(page, selector, value); err != nil {
 				return err
 			}
 			if got := inputValue(page, selector); got != value {

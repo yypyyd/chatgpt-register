@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Grok 注册 · ChatGPT 注册管理</title>
-<link rel="stylesheet" href="/static/style.css?v=16">
+<link rel="stylesheet" href="/static/style.css?v=17">
 </head>
 <body data-page="grok">
 <div class="layout">
@@ -44,13 +44,16 @@
           <button type="button" class="px-select-opt" onclick="downloadUnshipped('cpa')">CPA</button>
         </div>
       </div>
+      <button class="px-btn" onclick="liveCheckAll()">测活</button>
       <button class="px-btn danger" onclick="deleteAllGrok()">全部删除</button>
+      <span id="live-progress" class="live-progress" style="display:none"></span>
     </div>
 
     <div class="batch-bar" id="grok-batch" style="display:none">
       <span id="grok-batch-count">已选 0 项</span>
       <button class="px-btn" onclick="downloadSelected('sub2api')">导出 Sub2API</button>
       <button class="px-btn" onclick="downloadSelected('cpa')">导出 CPA</button>
+      <button class="px-btn" onclick="liveCheckSelected()">测活所选</button>
       <button class="px-btn danger" onclick="delSelected()">删除所选</button>
       <button class="px-btn ghost" onclick="clearSelection()">取消</button>
     </div>
@@ -59,7 +62,7 @@
       <table class="px-table">
         <thead><tr>
           <th class="col-check"><input type="checkbox" id="grok-check-all" onclick="toggleSelectAll(this.checked)"></th>
-          <th>邮箱</th><th>创建时间</th><th>状态</th><th>出库状态</th><th>操作</th>
+          <th>邮箱</th><th>创建时间</th><th>状态</th><th>存活</th><th>出库状态</th><th>操作</th>
         </tr></thead>
         <tbody id="rows"></tbody>
       </table>
@@ -111,6 +114,6 @@
 
 <div id="toast" class="toast" style="display:none"></div>
 <script src="/static/layout.js?v=4"></script>
-<script src="/static/grok.js?v=4"></script>
+<script src="/static/grok.js?v=5"></script>
 </body>
 </html>

@@ -25,7 +25,7 @@ async function load() {
   accTotal = d.total || 0;
   (d.data || []).forEach(x => { accCache[x.id] = x; });
   document.getElementById('rows').innerHTML = (d.data || []).map(rowHtml).join('')
-    || '<tr><td colspan="6" style="text-align:center;color:var(--text-3)">暂无数据</td></tr>';
+    || '<tr><td colspan="7" style="text-align:center;color:var(--text-3)">暂无数据</td></tr>';
   const maxPage = Math.max(1, Math.ceil((d.total || 0) / size));
   renderPager('pager', page, maxPage, p => { page = p; load(); });
   syncBatchBar();
@@ -39,6 +39,7 @@ function rowHtml(x) {
       <td>${esc(x.email)}</td>
       <td>${fmtTime(x.created_at)}</td>
       <td><span class="badge ${esc(x.status)}">${ACC_STATUS[x.status] || esc(x.status)}</span></td>
+      <td>${aliveCell(x)}</td>
       <td class="ship-cell">
         <span class="badge ${x.shipped ? 'registered' : 'pending'}" title="下载后自动标记，不能手动修改">${x.shipped ? '已出库' : '未出库'}</span>
       </td>
@@ -46,6 +47,7 @@ function rowHtml(x) {
         <button class="icon-btn" title="日志" onclick="showLog(${x.id})">
           <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M8 13h8M8 17h5"/></svg>
         </button>
+        <button class="icon-btn" title="测活" onclick="liveCheckOne(${x.id})" style="font-size:10px;font-weight:700">测活</button>
         <button class="icon-btn" title="下载 Sub2API" ${canDownload ? '' : 'disabled'} onclick="downloadAcc(${x.id}, 'sub2api')">
           <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/></svg>
         </button>
@@ -261,6 +263,63 @@ async function deleteAllAccounts() {
   loadProduce();
 }
 
+/* ===== 测活（手动，仅点击触发；只标状态不删号；unknown 不判死） ===== */
+const LIVE_BASE = '/api/registrations';
+const ALIVE_LABEL = { alive: '有效', dead: '失效', unknown: '未知' };
+let liveTimer = null;
+function aliveCell(x) {
+  if (!x.alive) return '<span class="badge pending" title="尚未测活">未测</span>';
+  const cls = x.alive === 'alive' ? 'registered' : (x.alive === 'dead' ? 'register_failed' : 'pending');
+  const t = x.alive_checked_at ? '最近检测: ' + fmtTime(x.alive_checked_at) : '';
+  return `<span class="badge ${cls}" title="${t}">${ALIVE_LABEL[x.alive] || esc(x.alive)}</span>`;
+}
+async function liveCheckOne(id) {
+  toast('正在测活 #' + id + ' ...');
+  const r = await api(LIVE_BASE + '/' + id + '/livecheck', { method: 'POST' });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) return toast(d.error || '测活失败', true);
+  toast('测活完成: ' + (ALIVE_LABEL[d.alive] || d.alive));
+  load();
+}
+function liveCheckAll() {
+  if (!confirm('对全部已注册账号执行测活？只更新存活状态，不会删除账号。')) return;
+  startLiveCheck([]);
+}
+function liveCheckSelected() {
+  const ids = [...accSelected];
+  if (!ids.length) return toast('请先勾选账号', true);
+  startLiveCheck(ids);
+}
+async function startLiveCheck(ids) {
+  const r = await api(LIVE_BASE + '/livecheck', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ids }),
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) return toast(d.error || '启动测活失败', true);
+  toast('已开始测活 ' + (d.total || 0) + ' 个账号');
+  pollLive();
+}
+function pollLive() {
+  clearInterval(liveTimer);
+  const el = document.getElementById('live-progress');
+  const tick = async () => {
+    try {
+      const s = await (await api(LIVE_BASE + '/livecheck/status')).json();
+      if (el && (s.running || s.done)) {
+        el.style.display = '';
+        const summary = `有效 ${s.alive} · 失效 ${s.dead} · 未知 ${s.unknown}`;
+        el.textContent = s.running ? `测活中 ${s.done}/${s.total} · ${summary}` : `测活完成 · ${summary}`;
+        if (!s.running) setTimeout(() => { if (el) el.style.display = 'none'; }, 8000);
+      }
+      if (!s.running) clearInterval(liveTimer);
+    } catch (e) { /* ignore */ }
+  };
+  tick();
+  liveTimer = setInterval(tick, 1500);
+}
+
 document.getElementById('search').addEventListener('keydown', e => {
   if (e.key === 'Enter') { page = 1; load(); }
 });
@@ -269,6 +328,7 @@ document.getElementById('filter-status').addEventListener('change', () => { page
 load();
 loadProduce();
 loadBrowserGate();
+pollLive();
 setInterval(load, 3000);
 setInterval(loadProduce, 2000);
 setInterval(loadBrowserGate, 2500);

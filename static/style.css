@@ -201,6 +201,13 @@ body {
 .toolbar { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 18px; }
 .toolbar .search { flex: 1; min-width: 220px; }
 
+/* 测活进度提示（工具栏内） */
+.live-progress {
+  align-self: center; margin-left: 4px;
+  font-size: 13px; color: var(--text-2);
+  white-space: nowrap;
+}
+
 .px-input {
   padding: 9px 13px; color: var(--text);
   background: #fff;

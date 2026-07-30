@@ -18,6 +18,10 @@ type AdobeRegistration struct {
 	Shot      []byte `gorm:"type:blob" json:"-"`
 	Note      string `gorm:"type:text" json:"note"`
 
+	// 手动测活结果：alive / dead / unknown（空=未测），unknown 不判死。
+	Alive          string     `gorm:"size:16;default:''" json:"alive"`
+	AliveCheckedAt *time.Time `json:"alive_checked_at,omitempty"`
+
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }

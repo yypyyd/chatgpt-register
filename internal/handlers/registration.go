@@ -26,6 +26,8 @@ type Handler struct {
 	AdobeProducer   *adobeproducer.Producer
 	Browser         *browserboot.Manager
 	MailboxVerifier *mailverify.Service
+	// Live 保存三个平台各自的批量测活进度（仅内存），键：chatgpt / grok / adobe。
+	Live map[string]*liveRunner
 }
 
 func New(db *gorm.DB, authSvc *auth.Service, browser *browserboot.Manager) (*Handler, error) {
@@ -34,7 +36,7 @@ func New(db *gorm.DB, authSvc *auth.Service, browser *browserboot.Manager) (*Han
 	if err := verifier.Start(); err != nil {
 		return nil, err
 	}
-	return &Handler{DB: db, Mail: mail, Auth: authSvc, Producer: producer.New(db, mail), GrokProducer: grokproducer.New(db, mail), AdobeProducer: adobeproducer.New(db, mail), Browser: browser, MailboxVerifier: verifier}, nil
+	return &Handler{DB: db, Mail: mail, Auth: authSvc, Producer: producer.New(db, mail), GrokProducer: grokproducer.New(db, mail), AdobeProducer: adobeproducer.New(db, mail), Browser: browser, MailboxVerifier: verifier, Live: newLiveRunners()}, nil
 }
 
 type registrationInput struct {

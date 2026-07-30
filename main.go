@@ -82,6 +82,10 @@ func main() {
 		api.PUT("/registrations/:id/shipped", h.SetShipped)
 		api.POST("/download", h.Download)
 
+		api.POST("/registrations/livecheck", h.LiveCheckStart)
+		api.GET("/registrations/livecheck/status", h.LiveCheckStatus)
+		api.POST("/registrations/:id/livecheck", h.LiveCheckOne)
+
 		api.POST("/produce", h.Produce)
 		api.GET("/produce/status", h.ProduceStatus)
 		api.POST("/produce/stop", h.ProduceStop)
@@ -116,6 +120,10 @@ func main() {
 		api.GET("/grok/registrations/:id/shot", h.GrokShot)
 		api.POST("/grok/download", h.GrokDownload)
 
+		api.POST("/grok/registrations/livecheck", h.GrokLiveCheckStart)
+		api.GET("/grok/registrations/livecheck/status", h.GrokLiveCheckStatus)
+		api.POST("/grok/registrations/:id/livecheck", h.GrokLiveCheckOne)
+
 		api.GET("/adobe/registrations", h.AdobeList)
 		api.DELETE("/adobe/registrations", h.AdobeDeleteAll)
 		api.POST("/adobe/registrations", h.AdobeStart)
@@ -124,10 +132,16 @@ func main() {
 		api.POST("/adobe/produce/stop", h.AdobeProduceStop)
 		api.POST("/adobe/registrations/:id/code", h.AdobeSubmitCode)
 		api.POST("/adobe/registrations/:id/stop", h.AdobeStop)
+		api.POST("/adobe/registrations/:id/rescue", h.AdobeRescue)
+		api.POST("/adobe/registrations/rescue-dead", h.AdobeRescueDead)
 		api.DELETE("/adobe/registrations/:id", h.AdobeDelete)
 		api.GET("/adobe/registrations/:id/logs", h.AdobeLog)
 		api.GET("/adobe/registrations/:id/shot", h.AdobeShot)
 		api.POST("/adobe/download", h.AdobeDownload)
+
+		api.POST("/adobe/registrations/livecheck", h.AdobeLiveCheckStart)
+		api.GET("/adobe/registrations/livecheck/status", h.AdobeLiveCheckStatus)
+		api.POST("/adobe/registrations/:id/livecheck", h.AdobeLiveCheckOne)
 	}
 
 	sub, err := fs.Sub(staticFS, "static")
