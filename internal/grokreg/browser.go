@@ -130,7 +130,11 @@ func registerBrowser(ctx context.Context, in Input) (res *Result, err error) {
 	if err = browser.Connect(); err != nil {
 		return nil, fmt.Errorf("连接 Chrome 失败: %w", err)
 	}
-	defer browser.MustClose()
+	defer func() {
+		// 关浏览器后清理 launcher 临时用户数据目录，避免残留 Profile 堆积
+		_ = rod.Try(browser.MustClose)
+		l.Cleanup()
+	}()
 
 	var page *rod.Page
 	defer func() {
@@ -1370,11 +1374,8 @@ func typeHumanStable(page *rod.Page, selector, value string, timeout time.Durati
 	for attempt := 0; time.Now().Before(deadline); attempt++ {
 		lastErr = func() error {
 			if attempt < 2 {
-				el, err := page.Timeout(15 * time.Second).Element(selector)
+				el, err := visibleElement(page, selector, 15*time.Second)
 				if err != nil {
-					return err
-				}
-				if err = el.WaitVisible(); err != nil {
 					return err
 				}
 				if err = typeHuman(el, value); err != nil {
@@ -1399,10 +1400,32 @@ func typeHumanStable(page *rod.Page, selector, value string, timeout time.Durati
 	return lastErr
 }
 
+// visibleElement 在选择器的所有匹配里挑第一个「可见」的：页面可能同时渲染
+// 多份表单（一份隐藏），首个匹配不一定可见。
+func visibleElement(page *rod.Page, selector string, timeout time.Duration) (*rod.Element, error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		els, err := page.Timeout(6 * time.Second).Elements(selector)
+		if err == nil {
+			for _, el := range els {
+				if v, verr := el.Visible(); verr == nil && v {
+					return el.CancelTimeout().Timeout(15 * time.Second), nil
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("等待可见元素超时: %s", selector)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
 // setInputValueJS 用原生 setter 赋值并派发 input/change，兼容受控组件。
 func setInputValueJS(page *rod.Page, selector, value string) error {
 	ok, err := page.Timeout(10*time.Second).Eval(`(selector, value) => {
-		const el = document.querySelector(selector);
+		const els = [...document.querySelectorAll(selector)];
+		const visible = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+		const el = els.find(visible) || els[0];
 		if (!el) return false;
 		el.focus();
 		const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
@@ -1422,7 +1445,9 @@ func setInputValueJS(page *rod.Page, selector, value string) error {
 
 func readInputValue(page *rod.Page, selector string) string {
 	got, err := page.Timeout(10*time.Second).Eval(`selector => {
-		const el = document.querySelector(selector);
+		const els = [...document.querySelectorAll(selector)];
+		const visible = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+		const el = els.find(visible) || els[0];
 		return el ? el.value : '';
 	}`, selector)
 	if err != nil {
@@ -1436,8 +1461,11 @@ func typeHuman(el *rod.Element, text string) error {
 		return fmt.Errorf("nil element")
 	}
 	_ = el.ScrollIntoView()
-	if err := el.Click(proto.InputMouseButtonLeft, 1); err != nil {
-		return err
+	// 点击聚焦可能因浮层遮挡一直等「可交互」直到超时；限时尝试，失败改用 JS 聚焦
+	if err := rod.Try(func() { el.Timeout(5 * time.Second).MustClick() }); err != nil {
+		if _, ferr := el.Eval(`() => this.focus()`); ferr != nil {
+			return ferr
+		}
 	}
 	// clear existing
 	_ = el.SelectAllText()

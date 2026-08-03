@@ -57,7 +57,11 @@ func registerBrowser(ctx context.Context, in Input) (token string, err error) {
 	if err := browser.Connect(); err != nil {
 		return "", fmt.Errorf("连接 Chrome 失败: %w", err)
 	}
-	defer browser.MustClose()
+	defer func() {
+		// 关浏览器后清理 launcher 临时用户数据目录，避免残留 Profile 堆积
+		_ = rod.Try(browser.MustClose)
+		l.Cleanup()
+	}()
 
 	// 失败现场截图：无论是返回错误还是 MustXxx panic，都在关浏览器前把当前页面截图交给 SaveShot。
 	var page *rod.Page

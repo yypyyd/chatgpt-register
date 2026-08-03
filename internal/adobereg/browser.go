@@ -32,8 +32,9 @@ const (
 )
 
 // launchAdobeBrowser 按注册用的一整套反爬/代理配置启动并连接 Adobe 专用 Chromium。
-// 返回的 browser 由调用方负责关闭；若返回了 bridge（认证代理桥），也要一并 Close。
-func launchAdobeBrowser(in Input) (browser *rod.Browser, bridge *localAuthProxyBridge, err error) {
+// 返回的 browser 由调用方负责关闭；若返回了 bridge（认证代理桥），也要一并 Close；
+// cleanup 在浏览器关闭后调用，负责清理 launcher 的临时用户数据目录。
+func launchAdobeBrowser(in Input) (browser *rod.Browser, bridge *localAuthProxyBridge, cleanup func(), err error) {
 	// 与 grokreg 一致：删掉 rod 默认追加的一批自动化特征标志，降低被反爬识别的概率。
 	l := launcher.New()
 	for _, flag := range []string{
@@ -73,7 +74,7 @@ func launchAdobeBrowser(in Input) (browser *rod.Browser, bridge *localAuthProxyB
 		Set("disable-features", "PrivacySandboxSettings4")
 	debugPort, perr := availableLoopbackPort()
 	if perr != nil {
-		return nil, nil, fmt.Errorf("分配 Chrome 调试端口失败: %w", perr)
+		return nil, nil, nil, fmt.Errorf("分配 Chrome 调试端口失败: %w", perr)
 	}
 	l = l.Set("remote-debugging-port", strconv.Itoa(debugPort))
 	if chromePath, cerr := adobeChromiumBin(); cerr != nil {
@@ -86,12 +87,12 @@ func launchAdobeBrowser(in Input) (browser *rod.Browser, bridge *localAuthProxyB
 	if strings.TrimSpace(in.Proxy) != "" {
 		server, user, pass, perr := parseProxy(in.Proxy)
 		if perr != nil {
-			return nil, nil, fmt.Errorf("解析代理失败: %w", perr)
+			return nil, nil, nil, fmt.Errorf("解析代理失败: %w", perr)
 		}
 		if user != "" || pass != "" {
 			bridge, server, perr = startLocalAuthProxyBridge(in.Proxy)
 			if perr != nil {
-				return nil, nil, fmt.Errorf("启动认证代理桥失败: %w", perr)
+				return nil, nil, nil, fmt.Errorf("启动认证代理桥失败: %w", perr)
 			}
 			in.logf("已启用 Chromium 本地认证代理桥")
 		}
@@ -104,16 +105,16 @@ func launchAdobeBrowser(in Input) (browser *rod.Browser, bridge *localAuthProxyB
 		if bridge != nil {
 			bridge.Close()
 		}
-		return nil, nil, fmt.Errorf("启动 Chrome 失败: %w", lerr)
+		return nil, nil, nil, fmt.Errorf("启动 Chrome 失败: %w", lerr)
 	}
 	browser = rod.New().NoDefaultDevice().ControlURL(controlURL)
 	if cerr := browser.Connect(); cerr != nil {
 		if bridge != nil {
 			bridge.Close()
 		}
-		return nil, nil, fmt.Errorf("连接 Chrome 失败: %w", cerr)
+		return nil, nil, nil, fmt.Errorf("连接 Chrome 失败: %w", cerr)
 	}
-	return browser, bridge, nil
+	return browser, bridge, l.Cleanup, nil
 }
 
 func registerBrowser(ctx context.Context, in Input) (res *Result, err error) {
@@ -123,7 +124,7 @@ func registerBrowser(ctx context.Context, in Input) (res *Result, err error) {
 		in.logf("启动可见浏览器，打开 Adobe 注册页")
 	}
 
-	browser, authBridge, err := launchAdobeBrowser(in)
+	browser, authBridge, cleanup, err := launchAdobeBrowser(in)
 	if err != nil {
 		return nil, err
 	}
@@ -131,7 +132,11 @@ func registerBrowser(ctx context.Context, in Input) (res *Result, err error) {
 	if authBridge != nil {
 		defer authBridge.Close()
 	}
-	defer browser.MustClose()
+	defer func() {
+		// 关浏览器后清理 launcher 临时用户数据目录，避免残留 Profile 堆积
+		_ = rod.Try(browser.MustClose)
+		cleanup()
+	}()
 
 	var page *rod.Page
 	defer func() {
@@ -282,14 +287,18 @@ func RescueRide(ctx context.Context, in Input, cookies []map[string]any) (res *R
 	} else {
 		in.logf("启动可见浏览器，还原会话过身份核验")
 	}
-	browser, bridge, err := launchAdobeBrowser(in)
+	browser, bridge, cleanup, err := launchAdobeBrowser(in)
 	if err != nil {
 		return nil, err
 	}
 	if bridge != nil {
 		defer bridge.Close()
 	}
-	defer browser.MustClose()
+	defer func() {
+		// 关浏览器后清理 launcher 临时用户数据目录，避免残留 Profile 堆积
+		_ = rod.Try(browser.MustClose)
+		cleanup()
+	}()
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("Adobe 救回流程异常: %v", r)
@@ -784,7 +793,9 @@ func fillInput(ctx context.Context, page *rod.Page, selector, value string, time
 // 受控组件。带独立超时，避免 CDP 卡顿时单次 eval 阻塞过久。
 func setInputValue(page *rod.Page, selector, value string) error {
 	ok, err := page.Timeout(10*time.Second).Eval(`(selector, value) => {
-		const el = document.querySelector(selector);
+		const els = [...document.querySelectorAll(selector)];
+		const visible = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+		const el = els.find(visible) || els[0];
 		if (!el) return false;
 		el.focus();
 		const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
@@ -804,7 +815,9 @@ func setInputValue(page *rod.Page, selector, value string) error {
 
 func inputValue(page *rod.Page, selector string) string {
 	got, err := page.Timeout(8*time.Second).Eval(`selector => {
-		const el = document.querySelector(selector);
+		const els = [...document.querySelectorAll(selector)];
+		const visible = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+		const el = els.find(visible) || els[0];
 		return el ? el.value : '';
 	}`, selector)
 	if err != nil {
@@ -813,15 +826,24 @@ func inputValue(page *rod.Page, selector string) string {
 	return got.Value.Str()
 }
 
+// waitVisible 等待选择器命中的「可见」元素：页面可能同时渲染多份表单
+// （一份隐藏），首个匹配不一定可见，这里在所有匹配里挑第一个可见的。
 func waitVisible(page *rod.Page, selector string, timeout time.Duration) (*rod.Element, error) {
-	el, err := page.Timeout(timeout).Element(selector)
-	if err != nil {
-		return nil, err
+	deadline := time.Now().Add(timeout)
+	for {
+		els, err := page.Timeout(6 * time.Second).Elements(selector)
+		if err == nil {
+			for _, el := range els {
+				if v, verr := el.Visible(); verr == nil && v {
+					return el.CancelTimeout().Timeout(15 * time.Second), nil
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("等待可见元素超时: %s", selector)
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
-	if err = el.WaitVisible(); err != nil {
-		return nil, err
-	}
-	return el, nil
 }
 
 func waitCleared(ctx context.Context, page *rod.Page, timeout time.Duration, cleared func() bool) bool {
@@ -860,8 +882,11 @@ func typeHuman(el *rod.Element, text string) error {
 		return fmt.Errorf("nil element")
 	}
 	_ = el.ScrollIntoView()
-	if err := el.Click(proto.InputMouseButtonLeft, 1); err != nil {
-		return err
+	// 点击聚焦可能因浮层遮挡一直等「可交互」直到超时；限时尝试，失败改用 JS 聚焦
+	if err := rod.Try(func() { el.Timeout(5 * time.Second).MustClick() }); err != nil {
+		if _, ferr := el.Eval(`() => this.focus()`); ferr != nil {
+			return ferr
+		}
 	}
 	_ = el.SelectAllText()
 	_ = el.Input("")
