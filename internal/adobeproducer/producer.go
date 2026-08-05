@@ -14,6 +14,7 @@ import (
 	"chatgpt-register/internal/livecheck"
 	"chatgpt-register/internal/mailfetch"
 	"chatgpt-register/internal/models"
+	"chatgpt-register/internal/proxyutil"
 
 	"gorm.io/gorm"
 )
@@ -637,7 +638,7 @@ func (p *Producer) nextProxy() string {
 	proxy := proxies[p.pxIdx%len(proxies)]
 	p.pxIdx++
 	p.mu.Unlock()
-	return proxy
+	return proxyutil.WithBestGoTaskSession(proxy)
 }
 
 func proxyList(raw string) []string {

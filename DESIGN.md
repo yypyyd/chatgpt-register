@@ -42,7 +42,7 @@ Adobe 注册与 ChatGPT、Grok 完全隔离：独立数据表 `adobe_registratio
 - `json`：单个 Adobe 的 Cookie JSON 对象（含 `cookie_string`、`cookies_map`、带元数据的 `cookies` 数组、`storage`；单账号 `.json`，多账号 `.zip`）。
 - `array`：多个 Adobe 批量导出的 Cookie 数组，始终单个 `.json` 文件。
 
-生命周期与 Grok 一致：并发受 `adobe_max_concurrency`（回退 `max_concurrency`，默认 1）约束，代理走 `adobe_proxy_*`（回退全局 `proxy_*`），无头由 `adobe_headless` 控制；服务启动时把残留的 `registering`/`waiting_code` 记录回收为 `register_failed`，可重新注册。
+生命周期与 Grok 一致：并发受 `adobe_max_concurrency`（回退 `max_concurrency`，默认 1）约束，代理走 `adobe_proxy_*`（回退全局 `proxy_*`），无头由 `adobe_headless` 控制；服务启动时把残留的 `registering`/`waiting_code` 记录回收为 `register_failed`，可重新注册。Adobe 与 Grok 共用任务级代理会话策略：BestGo 动态住宅代理若未显式配置 `-session-`，生产器会为每个注册任务生成独立 session，不同任务允许轮换出口，但同一浏览器/协议流程（含 Turnstile 与 OAuth）保持出口 IP 稳定；认证代理日志同时记录本地桥入口和不含凭据的上游地址，避免把 `127.0.0.1` 误认为直连。
 
 ## 已知限制
 

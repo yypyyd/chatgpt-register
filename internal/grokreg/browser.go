@@ -106,15 +106,16 @@ func registerBrowser(ctx context.Context, in Input) (res *Result, err error) {
 			return nil, fmt.Errorf("解析代理失败: %w", perr)
 		}
 		if user != "" || pass != "" {
+			upstreamServer := server
 			authBridge, server, perr = startLocalAuthProxyBridge(in.Proxy)
 			if perr != nil {
 				return nil, fmt.Errorf("启动认证代理桥失败: %w", perr)
 			}
 			defer authBridge.Close()
-			in.logf("已按参考项目启用 Chromium 本地认证代理桥")
+			in.logf("已启用 Chromium 本地认证代理桥，本地 %s → 上游 %s", server, upstreamServer)
 		}
 		l = l.Set("proxy-server", server)
-		in.logf("使用代理: %s", server)
+		in.logf("Chromium 使用代理入口: %s", server)
 		// The Turnstile mint reuses this loopback endpoint so its token is signed
 		// from the same egress IP as the registration.
 		in.mintProxy = server

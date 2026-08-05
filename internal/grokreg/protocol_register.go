@@ -18,6 +18,13 @@ import (
 // exits as soon as the token is issued — everything else is protocol traffic.
 func registerProtocol(ctx context.Context, in Input) (*Result, error) {
 	in.logf("Grok 协议注册启动（浏览器仅用于签发 Turnstile 令牌）")
+	if strings.TrimSpace(in.Proxy) != "" {
+		server, _, _, perr := parseProxy(in.Proxy)
+		if perr != nil {
+			return nil, fmt.Errorf("解析代理失败: %w", perr)
+		}
+		in.logf("Grok 协议客户端使用上游代理: %s", server)
+	}
 
 	impersonate := firstNonEmpty(in.Impersonate, "chrome_131")
 	fallbacks := protocol.FallbackProfiles(in.ImpersonateFallback)
