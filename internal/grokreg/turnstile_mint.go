@@ -6,30 +6,74 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/go-rod/rod"
 )
 
-// The CloakBrowser mint helper (turnstile_mint.py) renders x.ai's Turnstile
-// widget in a patched Chromium and returns a signed token. These defaults match
-// the server deployment; override them per registration via the Input fields or
-// the GROK_TURNSTILE_* environment variables.
+// The CloakBrowser mint helper (scripts/turnstile_mint.py) renders x.ai's
+// Turnstile widget in a patched Chromium and returns a signed token. The script
+// ships with this repo; override the interpreter/script per registration via the
+// Input fields or the GROK_TURNSTILE_* environment variables.
 const (
 	defaultTurnstilePython   = "/opt/cloakbrowser-venv/bin/python"
-	defaultTurnstileScript   = "/usr/local/share/grok-reg/turnstile_mint.py"
 	defaultTurnstileMode     = "offscreen"
 	fallbackTurnstileSitekey = "0x4AAAAAAAhr9JGVDZbrZOo0"
 	turnstileSignURL         = "https://accounts.x.ai/sign-up"
 )
 
+// turnstileScriptDirs 列出仓库自带脚本的可能位置：开发时在仓库根的
+// scripts/，部署时安装到 <prefix>/share/chatgpt-register/scripts/。
+func turnstileScriptDirs() []string {
+	var dirs []string
+	if exe, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exe)
+		dirs = append(dirs,
+			filepath.Join(exeDir, "scripts"),
+			filepath.Join(exeDir, "..", "share", "chatgpt-register", "scripts"),
+		)
+	}
+	if wd, err := os.Getwd(); err == nil {
+		dirs = append(dirs, filepath.Join(wd, "scripts"))
+	}
+	return append(dirs, "/usr/local/share/chatgpt-register/scripts")
+}
+
+// turnstileScriptPath 只认仓库自带的脚本，不再回落到其他项目装在系统目录的副本。
+func turnstileScriptPath(name string) string {
+	for _, dir := range turnstileScriptDirs() {
+		p := filepath.Join(dir, name)
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			return p
+		}
+	}
+	return ""
+}
+
+// turnstilePython 优先用装了 cloakbrowser + playwright 的专用 venv，
+// 缺失时回落到系统 python3（依赖见 scripts/requirements.txt）。
+func turnstilePython() string {
+	if st, err := os.Stat(defaultTurnstilePython); err == nil && !st.IsDir() {
+		return defaultTurnstilePython
+	}
+	if p, err := exec.LookPath("python3"); err == nil {
+		return p
+	}
+	return defaultTurnstilePython
+}
+
 // mintTurnstileToken shells out to the CloakBrowser mint helper and returns the
 // signed Turnstile token. It routes through the registration's loopback proxy so
 // the token's remote IP matches the account being created.
 func mintTurnstileToken(ctx context.Context, in Input, sitekey, pageURL string) (string, error) {
-	python := firstNonEmpty(in.TurnstilePython, os.Getenv("GROK_TURNSTILE_PYTHON"), defaultTurnstilePython)
-	script := firstNonEmpty(in.TurnstileScript, os.Getenv("GROK_TURNSTILE_SCRIPT"), defaultTurnstileScript)
+	python := firstNonEmpty(in.TurnstilePython, os.Getenv("GROK_TURNSTILE_PYTHON"), turnstilePython())
+	script := firstNonEmpty(in.TurnstileScript, os.Getenv("GROK_TURNSTILE_SCRIPT"),
+		turnstileScriptPath("turnstile_mint.py"))
+	if script == "" {
+		return "", fmt.Errorf("找不到 turnstile_mint.py，已查找: %s", strings.Join(turnstileScriptDirs(), ", "))
+	}
 	mode := firstNonEmpty(in.TurnstileMode, os.Getenv("TURNSTILE_MODE"), defaultTurnstileMode)
 	if strings.TrimSpace(sitekey) == "" {
 		sitekey = fallbackTurnstileSitekey
@@ -37,6 +81,8 @@ func mintTurnstileToken(ctx context.Context, in Input, sitekey, pageURL string) 
 	if strings.TrimSpace(pageURL) == "" {
 		pageURL = turnstileSignURL
 	}
+
+	in.logf("Turnstile 签发脚本: %s (python=%s mode=%s)", script, python, mode)
 
 	cctx, cancel := context.WithTimeout(ctx, 140*time.Second)
 	defer cancel()

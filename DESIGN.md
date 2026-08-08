@@ -62,6 +62,14 @@ Adobe 注册与 ChatGPT、Grok 完全隔离：独立数据表 `adobe_registratio
 
 ## 变更历史
 
+### 2026-08-08 - Turnstile 签发脚本纳入仓库
+
+**变更内容**：把 `turnstile_mint.py` / `turnstile_pool.py` 收进 `scripts/`（附 `scripts/requirements.txt` 记录 venv 依赖版本），`turnstileScriptPath` 只在我们自己的位置查找，顺序为「可执行文件同目录 scripts → `<prefix>/share/chatgpt-register/scripts` → 当前目录 scripts → `/usr/local/share/chatgpt-register/scripts`」，都找不到直接报错并列出查找过的目录，不再回落到其他项目装在 `/usr/local/share/grok-reg` 的副本；venv 缺失时 python 回落到系统 `python3`；日志新增一行打印实际使用的脚本与解释器。
+
+**变更理由**：这两个脚本原本是另一个项目（/opt/Grok-Register）的 install.sh 装到 `/usr/local/share/grok-reg/` 的，同机的 grok-web.service 也在用同一份——仓库里没有，本地开发跑不了签令牌，对方卸载/升级还会连带把我们的注册搞挂。
+
+**影响范围**：`internal/grokreg/turnstile_mint.go`、`scripts/`。部署需把 `scripts/*.py` 装到 `/usr/local/share/chatgpt-register/scripts/`（服务器已装）；实测服务二进制解析到部署副本、仓库内跑解析到 `scripts/` 副本，直连注册一个号 31 秒、Console 额度正常。CloakBrowser 的 venv（`/opt/cloakbrowser-venv`）仍是外部依赖，按 requirements.txt 可重建。
+
 ### 2026-08-08 - Grok 代理跟随全局开关
 
 **变更内容**：删除 `grok_proxy_enabled` / `grok_proxy_list` 这两个隐藏键的读取逻辑，Grok 注册直接跟设置页上的 `proxy_enabled` + `proxy_list`。

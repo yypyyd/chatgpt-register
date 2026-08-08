@@ -1,0 +1,6 @@
+# scripts/turnstile_*.py 的运行依赖（版本与服务器上的 /opt/cloakbrowser-venv 一致）。
+# 建环境：python3 -m venv /opt/cloakbrowser-venv
+#          /opt/cloakbrowser-venv/bin/pip install -r scripts/requirements.txt
+#          /opt/cloakbrowser-venv/bin/python -m cloakbrowser install   # 拉 patched chromium
+cloakbrowser==0.5.1
+playwright==1.61.0
