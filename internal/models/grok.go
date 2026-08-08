@@ -19,6 +19,8 @@ type GrokRegistration struct {
 	// 手动测活结果：alive / dead / unknown（空=未测），unknown 不判死。
 	Alive          string     `gorm:"size:16;default:''" json:"alive"`
 	AliveCheckedAt *time.Time `json:"alive_checked_at,omitempty"`
+	// 测活时从 Grok Console /v1/usage 读到的额度摘要，如「chat 20/20 · image 5/5」。
+	ConsoleQuota string `gorm:"size:255;default:''" json:"console_quota"`
 
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`

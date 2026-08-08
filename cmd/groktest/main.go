@@ -1,7 +1,9 @@
-// Command groktest runs one headless Grok registration with a single mailbox.
+// Command groktest runs headless Grok registrations, one per config file.
 //
-//	usage: groktest <config.json>
+//	usage: groktest <config.json> [config2.json ...]
 //	config: {"email","client_id","refresh_token","proxy","headless"}
+//
+// 多个配置按顺序在同一进程内跑，用于验证注册配置缓存等跨账号复用逻辑。
 package main
 
 import (
@@ -29,13 +31,27 @@ type cfg struct {
 var (
 	digitCodeRe = regexp.MustCompile(`\b(\d{6})\b`)
 	xaiCodeRe   = regexp.MustCompile(`(?i)\b([a-z0-9]{3})-([a-z0-9]{3})\b`)
+	safeNameRe  = regexp.MustCompile(`[^a-zA-Z0-9._-]+`)
 )
 
 func main() {
-	path := "groktest.json"
-	if len(os.Args) > 1 {
-		path = os.Args[1]
+	paths := os.Args[1:]
+	if len(paths) == 0 {
+		paths = []string{"groktest.json"}
 	}
+	failed := 0
+	for _, path := range paths {
+		if err := runOne(path); err != nil {
+			failed++
+			fmt.Println("RESULT: FAIL ->", err)
+		}
+	}
+	if failed > 0 {
+		os.Exit(2)
+	}
+}
+
+func runOne(path string) error {
 	var raw []byte
 	var err error
 	if path == "-" {
@@ -44,17 +60,14 @@ func main() {
 		raw, err = os.ReadFile(path)
 	}
 	if err != nil {
-		fmt.Println("读取配置失败:", err)
-		os.Exit(1)
+		return fmt.Errorf("读取配置失败: %w", err)
 	}
 	var c cfg
 	if err := json.Unmarshal(raw, &c); err != nil {
-		fmt.Println("解析配置失败:", err)
-		os.Exit(1)
+		return fmt.Errorf("解析配置失败: %w", err)
 	}
 	if c.Email == "" || c.ClientID == "" || c.RefreshToken == "" {
-		fmt.Println("配置缺少 email / client_id / refresh_token")
-		os.Exit(1)
+		return fmt.Errorf("配置缺少 email / client_id / refresh_token")
 	}
 
 	mail := mailfetch.New()
@@ -106,7 +119,7 @@ func main() {
 			return "", fmt.Errorf("超时未收到 Grok 验证码邮件")
 		},
 		SaveShot: func(png []byte) {
-			out := "groktest-fail.png"
+			out := "groktest-fail-" + safeName(c.Email) + ".png"
 			if err := os.WriteFile(out, png, 0o644); err == nil {
 				fmt.Println(time.Now().Format("15:04:05"), "失败截图已保存:", out)
 			}
@@ -115,13 +128,18 @@ func main() {
 
 	res, err := grokreg.Register(ctx, in)
 	if err != nil {
-		fmt.Println("RESULT: FAIL ->", err)
-		os.Exit(2)
+		return err
 	}
 	b, _ := json.MarshalIndent(res.AuthJSON, "", "  ")
-	_ = os.WriteFile("groktest-auth.json", b, 0o644)
+	out := "groktest-auth-" + safeName(c.Email) + ".json"
+	_ = os.WriteFile(out, b, 0o644)
 	fmt.Println("RESULT: OK email=", c.Email)
-	fmt.Println("会话已写入 groktest-auth.json")
+	fmt.Println("会话已写入", out)
+	return nil
+}
+
+func safeName(s string) string {
+	return safeNameRe.ReplaceAllString(s, "_")
 }
 
 func extractGrokCode(s string) string {

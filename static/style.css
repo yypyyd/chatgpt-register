@@ -731,6 +731,9 @@ button.px-select-opt {
 .switch-row input:checked + .switch-ui { background: var(--primary); }
 .switch-row input:checked + .switch-ui::after { transform: translateX(18px); }
 .switch-label { font-size: 13.5px; color: var(--text-2); font-weight: 500; }
+/* 存活列里的 Console 额度摘要 */
+.quota-cell { margin-left: 6px; font-size: 12px; color: var(--text-2); white-space: nowrap; }
+
 /* 表格出库列：开关垂直/水平居中 */
 .ship-cell { text-align: center; }
 .ship-cell .switch-row { margin-bottom: 0; vertical-align: middle; }

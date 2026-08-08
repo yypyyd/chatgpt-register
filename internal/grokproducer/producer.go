@@ -502,19 +502,9 @@ func (p *Producer) getSetting(key string) string {
 }
 
 func (p *Producer) nextProxy() string {
-	// Prefer Grok-specific settings when they exist. The current settings page
-	// only writes the global proxy keys, so inherit those keys by default.
-	// An explicitly configured Grok switch still overrides the global switch.
-	enabled := strings.TrimSpace(p.getSetting("grok_proxy_enabled"))
-	raw := p.getSetting("grok_proxy_list")
-	if enabled == "" {
-		enabled = strings.TrimSpace(p.getSetting("proxy_enabled"))
-		raw = p.getSetting("proxy_list")
-	} else if strings.TrimSpace(raw) == "" {
-		// A dedicated Grok switch with no dedicated list means: keep Grok's
-		// enablement independent, but always follow the latest global list.
-		raw = p.getSetting("proxy_list")
-	}
+	// Grok 跟随设置页上的全局代理开关与代理列表，不再有独立的 Grok 开关。
+	enabled := strings.TrimSpace(p.getSetting("proxy_enabled"))
+	raw := p.getSetting("proxy_list")
 	if enabled != "1" {
 		return ""
 	}

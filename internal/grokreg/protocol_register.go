@@ -5,12 +5,49 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"chatgpt-register/internal/grokreg/clearance"
-	"chatgpt-register/internal/grokreg/oauth"
 	"chatgpt-register/internal/grokreg/protocol"
 )
+
+// signupConfigTTL 是注册配置（sitekey / Next-Action id / router state tree）的
+// 缓存时长。这些值跟着 x.ai 发版才变，批量注册时每个号重抓一遍要多花十几秒。
+const signupConfigTTL = 20 * time.Minute
+
+var signupCfg struct {
+	mu  sync.Mutex
+	cfg protocol.SignupConfig
+	at  time.Time
+}
+
+// cachedSignupConfig 返回仍在有效期内的注册配置。
+func cachedSignupConfig() (protocol.SignupConfig, bool) {
+	signupCfg.mu.Lock()
+	defer signupCfg.mu.Unlock()
+	if signupCfg.cfg.ActionID == "" || time.Since(signupCfg.at) > signupConfigTTL {
+		return protocol.SignupConfig{}, false
+	}
+	return signupCfg.cfg, true
+}
+
+// storeSignupConfig 在注册成功后记下这套配置，供后续账号复用。
+func storeSignupConfig(cfg protocol.SignupConfig) {
+	if cfg.ActionID == "" || cfg.StateTree == "" {
+		return
+	}
+	signupCfg.mu.Lock()
+	signupCfg.cfg, signupCfg.at = cfg, time.Now()
+	signupCfg.mu.Unlock()
+}
+
+// invalidateSignupConfig 丢弃缓存，让下一个号重新抓取。
+func invalidateSignupConfig() {
+	signupCfg.mu.Lock()
+	signupCfg.cfg, signupCfg.at = protocol.SignupConfig{}, time.Time{}
+	signupCfg.mu.Unlock()
+}
 
 // registerProtocol drives the whole Grok signup over HTTP/gRPC using a
 // Chrome-impersonating TLS client. A browser is spawned only to mint the
@@ -43,7 +80,21 @@ func registerProtocol(ctx context.Context, in Input) (*Result, error) {
 	// Protocol-first: on Cloudflare block try fingerprint fallbacks, then (when
 	// configured) fall back to a FlareSolverr clearance bundle.
 	var cm *clearance.Manager
-	scfg, err := client.FetchConfig()
+	var scfg protocol.SignupConfig
+	// 抢到缓存时只做一次 warm（养 cookie + 探 Cloudflare），省掉抓 JS chunk
+	// 找 Next-Action id 的开销；warm 不过或无缓存时走完整拓。
+	if cached, ok := cachedSignupConfig(); ok {
+		if status, _, werr := client.WarmSignup(); werr == nil && status == 200 {
+			scfg = cached
+			in.logf("复用缓存的注册配置 site_key=%s action=%s…", scfg.SiteKey, trimText(scfg.ActionID, 12))
+		} else {
+			in.logf("缓存配置 warm 失败(status=%d err=%v)，重新抓取", status, werr)
+			invalidateSignupConfig()
+		}
+	}
+	if scfg.ActionID == "" {
+		scfg, err = client.FetchConfig()
+	}
 	if err != nil {
 		in.logf("⚠ 首选指纹 warm 失败(profile=%s): %v，尝试指纹回退", client.Profile(), err)
 		tried := map[string]struct{}{client.Profile(): {}}
@@ -96,11 +147,26 @@ func registerProtocol(ctx context.Context, in Input) (*Result, error) {
 		in.mintProxy = addr
 	}
 
+	// 立即开始并行签发 Turnstile 令牌（有效期约 5 分钟），与取码、等码完全
+	// 重叠，把这一步从关键路径上拿掉。
+	type mintOutcome struct {
+		token string
+		err   error
+	}
+	mintCh := make(chan mintOutcome, 1)
+	mintCtx, cancelMint := context.WithCancel(ctx)
+	defer cancelMint()
+	go func() {
+		tok, merr := mintTurnstileToken(mintCtx, in, scfg.SiteKey, protocol.SiteURL+"/sign-up")
+		mintCh <- mintOutcome{token: tok, err: merr}
+	}()
+
 	// 1) request email validation code, wait for the mailbox to deliver it.
 	if err := client.CreateEmailCode(in.Email); err != nil {
 		return nil, fmt.Errorf("发送邮箱验证码失败: %w", err)
 	}
 	in.logf("已请求邮箱验证码，等待收码…")
+
 	code, err := in.WaitCode(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("等待验证码失败: %w", err)
@@ -116,62 +182,29 @@ func registerProtocol(ctx context.Context, in Input) (*Result, error) {
 		in.logf("ValidatePassword 跳过/失败(非致命): %v", err)
 	}
 
-	// 2) mint a Turnstile token (the only browser step) then submit signup.
-	token, err := mintTurnstileToken(ctx, in, scfg.SiteKey, protocol.SiteURL+"/sign-up")
-	if err != nil {
-		return nil, fmt.Errorf("签发 Turnstile 令牌失败: %w", err)
+	// 2) collect the token minted in parallel, then submit signup.
+	mint := <-mintCh
+	if mint.err != nil {
+		return nil, fmt.Errorf("签发 Turnstile 令牌失败: %w", mint.err)
 	}
-	in.logf("Turnstile 令牌已签发(len=%d)，浏览器已退出，转协议注册", len(token))
+	token := mint.token
+	in.logf("Turnstile 令牌已就绪(len=%d)，转协议注册", len(token))
 
 	body := protocol.BuildSignupBody(in.Email, in.Password, code, token)
 	text, sso, err := client.SignupServerAction(body, scfg.ActionID, scfg.StateTree)
 	if sso == "" {
 		sso = protocol.ExtractSSOFromText(text)
 	}
-	if err != nil && sso == "" {
-		return nil, fmt.Errorf("协议注册失败: %w", err)
-	}
 	if sso == "" {
+		// action id / state tree 可能已随 x.ai 发版失效，丢控缓存让下一个号重新抓。
+		invalidateSignupConfig()
+		if err != nil {
+			return nil, fmt.Errorf("协议注册失败: %w", err)
+		}
 		return nil, fmt.Errorf("协议注册未返回会话 SSO")
 	}
+	storeSignupConfig(scfg)
 	in.logf("注册成功，已获得会话 SSO")
-
-	// 3) a fresh password login SSO is more reliable for device authorization
-	// than the signup Server Action SSO; keep the latter as fallback.
-	if fresh, ferr := createFreshSessionSSOProto(ctx, in, client, cm, scfg); ferr != nil {
-		in.logf("CreateSession 获取新 SSO 失败，沿用注册 SSO: %v", ferr)
-	} else if fresh != "" {
-		sso = fresh
-		in.logf("CreateSession 已换取新会话 SSO")
-	}
-
-	// 4) OAuth device flow → CLIProxyAPI (CPA) xAI credential.
-	var cpaXAI map[string]any
-	if oauthClient, oerr := oauth.NewClient(in.Proxy, cm, 0); oerr != nil {
-		in.logf("创建 OAuth 客户端失败(跳过 CPA 凭证): %v", oerr)
-	} else {
-		// Brand-new SSO is occasionally rejected by auth.x.ai device verify; settle.
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(2 * time.Second):
-		}
-		cred, exErr := oauthClient.ExchangeWithFlow(ctx, sso, func(f oauth.DeviceFlow) {
-			in.logf("OAuth 设备码流程 user_code=%s", f.UserCode)
-		})
-		if exErr != nil {
-			in.logf("⚠ OAuth 设备授权失败(CPA 凭证缺失): %v", exErr)
-		} else {
-			cpaXAI = buildCPAXAIAuth(in.Email, xaiTokenResult{
-				AccessToken:  cred.AccessToken,
-				RefreshToken: cred.RefreshToken,
-				IDToken:      cred.IDToken,
-				TokenType:    cred.TokenType,
-				ExpiresIn:    cred.ExpiresIn,
-			}, cred.TokenEndpoint)
-			in.logf("CPA xAI 凭证已铸造")
-		}
-	}
 
 	auth := map[string]any{
 		"auth_mode":   "grok_protocol_session",
@@ -189,51 +222,7 @@ func registerProtocol(ctx context.Context, in Input) (*Result, error) {
 			"path":   "/",
 		}},
 	}
-	if cpaXAI != nil {
-		auth["cpa_xai"] = cpaXAI
-	}
 	return &Result{AuthJSON: auth}, nil
-}
-
-// createFreshSessionSSOProto performs a password login (WarmSignin → fresh
-// Turnstile token → CreateSession) to obtain a session SSO minted the same way
-// grok.com issues it after sign-in.
-func createFreshSessionSSOProto(ctx context.Context, in Input, base *protocol.Client, cm *clearance.Manager, scfg protocol.SignupConfig) (string, error) {
-	var last error
-	for attempt := 1; attempt <= 2; attempt++ {
-		login, err := protocol.NewClientOpts(protocol.ClientOptions{
-			Proxy:       in.Proxy,
-			Clearance:   cm,
-			Impersonate: base.Profile(),
-			Timeout:     45 * time.Second,
-		})
-		if err != nil {
-			return "", err
-		}
-		if _, err = login.WarmSignin(); err != nil {
-			last = err
-			continue
-		}
-		token, terr := mintTurnstileToken(ctx, in, scfg.SiteKey, protocol.SigninURLGrok)
-		if terr != nil {
-			last = terr
-			continue
-		}
-		fresh, serr := login.CreateSession(strings.ToLower(strings.TrimSpace(in.Email)), in.Password, token)
-		if serr == nil && fresh != "" {
-			return fresh, nil
-		}
-		last = serr
-		select {
-		case <-ctx.Done():
-			return "", ctx.Err()
-		case <-time.After(1200 * time.Millisecond):
-		}
-	}
-	if last == nil {
-		last = fmt.Errorf("CreateSession 未返回 SSO")
-	}
-	return "", last
 }
 
 // maybeAuthBridge starts a loopback proxy bridge only when the upstream proxy

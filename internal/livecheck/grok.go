@@ -17,22 +17,34 @@ const (
 	defaultXaiClientID      = "b1a00492-073a-47ea-816f-4c329264a828"
 )
 
-// GrokItem 一个待测活的 Grok 账号：ID + 从 cpa_xai 取出的 refresh_token 及可选端点/客户端。
+// GrokItem 一个待测活的 Grok 账号：ID + sso token（Console 探测用），
+// 以及从 cpa_xai 取出的 refresh_token 及可选端点/客户端（回退用）。
 type GrokItem struct {
 	ID            uint
+	SSO           string
 	RefreshToken  string
 	TokenEndpoint string
 	ClientID      string
 }
 
-// CheckGrok 批量测活 Grok 账号。Grok 不需要浏览器：用注册时铸造的 xAI OAuth
-// refresh_token 向 token 端点做一次 refresh_token 授权——这是最轻量且稳定的活性信号。
+// GrokResult 一个账号的测活结果：三态状态 + Console 额度摘要（无则为空）。
+type GrokResult struct {
+	Status string
+	Quota  string
+}
+
+// GrokChunk 是 Grok 批量测活的增量回调：每完成一个账号就回传结果。
+type GrokChunk func(map[uint]GrokResult)
+
+// CheckGrok 批量测活 Grok 账号，不需要浏览器：
+// 有 sso token 时探测 Grok Console 的 /v1/usage，直接得到 chat/image/video 额度；
+// 没有 sso 的旧账号回退到用 xAI OAuth refresh_token 做一次授权。
 //
-//	200 且返回 access_token           -> alive
-//	400/401 且 invalid_grant 等认证错 -> dead
-//	网络 / 429 / 5xx / 超时 / 无 refresh_token -> unknown
-func CheckGrok(ctx context.Context, items []GrokItem, onChunk Chunk) map[uint]string {
-	out := make(map[uint]string, len(items))
+//	Console usage 200 / refresh 返回 access_token -> alive
+//	401 或明确的认证错误                          -> dead
+//	Cloudflare / 429 / 5xx / 超时 / 无可用凭据     -> unknown
+func CheckGrok(ctx context.Context, items []GrokItem, onChunk GrokChunk) map[uint]GrokResult {
+	out := make(map[uint]GrokResult, len(items))
 	if len(items) == 0 {
 		return out
 	}
@@ -43,21 +55,23 @@ func CheckGrok(ctx context.Context, items []GrokItem, onChunk Chunk) map[uint]st
 		wg  sync.WaitGroup
 		sem = make(chan struct{}, 5)
 	)
-	record := func(id uint, st string) {
+	record := func(id uint, res GrokResult) {
 		mu.Lock()
-		out[id] = st
+		out[id] = res
 		mu.Unlock()
-		emit(onChunk, map[uint]string{id: st})
+		if onChunk != nil {
+			onChunk(map[uint]GrokResult{id: res})
+		}
 	}
 
 	for _, it := range items {
 		if ctx.Err() != nil {
-			record(it.ID, StatusUnknown)
+			record(it.ID, GrokResult{Status: StatusUnknown})
 			continue
 		}
-		if strings.TrimSpace(it.RefreshToken) == "" {
-			// 没有 refresh_token（如仅有 sso 的旧账号）无法用该方式验证，判 unknown。
-			record(it.ID, StatusUnknown)
+		if strings.TrimSpace(it.SSO) == "" && strings.TrimSpace(it.RefreshToken) == "" {
+			// 既没有 sso 也没有 refresh_token 时无法验证，判 unknown。
+			record(it.ID, GrokResult{Status: StatusUnknown})
 			continue
 		}
 		wg.Add(1)
@@ -72,7 +86,24 @@ func CheckGrok(ctx context.Context, items []GrokItem, onChunk Chunk) map[uint]st
 	return out
 }
 
-func probeGrokOne(ctx context.Context, client *http.Client, it GrokItem) string {
+func probeGrokOne(ctx context.Context, client *http.Client, it GrokItem) GrokResult {
+	if strings.TrimSpace(it.SSO) != "" {
+		// Console 是导出目标，优先探测它：既验活也拿到额度。
+		usageCtx, cancel := context.WithTimeout(ctx, 40*time.Second)
+		defer cancel()
+		usage := ProbeConsole(usageCtx, client, it.SSO)
+		if usage.Status != StatusUnknown || strings.TrimSpace(it.RefreshToken) == "" {
+			return GrokResult{Status: usage.Status, Quota: usage.Summary()}
+		}
+	}
+	return GrokResult{Status: probeGrokRefresh(ctx, client, it)}
+}
+
+// probeGrokRefresh 用 xAI OAuth refresh_token 做一次授权，作为无 sso 时的回退探测。
+func probeGrokRefresh(ctx context.Context, client *http.Client, it GrokItem) string {
+	if strings.TrimSpace(it.RefreshToken) == "" {
+		return StatusUnknown
+	}
 	endpoint := strings.TrimSpace(it.TokenEndpoint)
 	if endpoint == "" {
 		endpoint = defaultXaiTokenEndpoint

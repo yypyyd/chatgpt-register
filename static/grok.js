@@ -45,10 +45,10 @@ function rowHtml(x) {
           <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M8 13h8M8 17h5"/></svg>
         </button>
         <button class="icon-btn" title="测活" onclick="liveCheckOne(${x.id})" style="font-size:10px;font-weight:700">测活</button>
-        <button class="icon-btn" title="下载 Sub2API" ${canDownload ? '' : 'disabled'} onclick="downloadGrok(${x.id}, 'sub2api')">
+        <button class="icon-btn" title="下载 Console" ${canDownload ? '' : 'disabled'} onclick="downloadGrok(${x.id}, 'console')">
           <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/></svg>
         </button>
-        <button class="icon-btn" title="下载 CPA" ${canDownload ? '' : 'disabled'} onclick="downloadGrok(${x.id}, 'cpa')" style="font-size:10px;font-weight:700">CPA</button>
+        <button class="icon-btn" title="下载 Sub2API" ${canDownload ? '' : 'disabled'} onclick="downloadGrok(${x.id}, 'sub2api')" style="font-size:10px;font-weight:700">Sub</button>
         <button class="icon-btn danger" title="删除" onclick="del(${x.id})">
           <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2m2 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M10 11v6M14 11v6"/></svg>
         </button>
@@ -134,7 +134,7 @@ function syncBatchBar() {
   all.checked = ids.length > 0 && ids.every(id => grokSelected.has(id));
 }
 
-/* ===== 下载（Sub2API 聚合 JSON / CPA 单账号 JSON 或多账号 ZIP；下载即出库） ===== */
+/* ===== 下载（Console 账号导入 JSON / Sub2API sso 池 JSON；下载即出库） ===== */
 async function downloadGrok(id, format) {
   await downloadByIds([id], format);
 }
@@ -162,7 +162,7 @@ async function downloadByIds(ids, format, unshippedOnly) {
   const match = disposition.match(/filename="?([^";]+)"?/i);
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = match ? match[1] : (format === 'cpa' ? 'grok_cpa.json' : 'grok_auth.json');
+  a.download = match ? match[1] : (format === 'sub2api' ? 'grok2api_token.json' : 'grok_console_token.json');
   a.click();
   URL.revokeObjectURL(a.href);
   load();
@@ -253,14 +253,15 @@ function aliveCell(x) {
   if (!x.alive) return '<span class="badge pending" title="尚未测活">未测</span>';
   const cls = x.alive === 'alive' ? 'registered' : (x.alive === 'dead' ? 'register_failed' : 'pending');
   const t = x.alive_checked_at ? '最近检测: ' + fmtTime(x.alive_checked_at) : '';
-  return `<span class="badge ${cls}" title="${t}">${ALIVE_LABEL[x.alive] || esc(x.alive)}</span>`;
+  const quota = x.console_quota ? `<span class="quota-cell" title="Grok Console 额度">${esc(x.console_quota)}</span>` : '';
+  return `<span class="badge ${cls}" title="${t}">${ALIVE_LABEL[x.alive] || esc(x.alive)}</span>${quota}`;
 }
 async function liveCheckOne(id) {
   toast('正在测活 #' + id + ' ...');
   const r = await api(LIVE_BASE + '/' + id + '/livecheck', { method: 'POST' });
   const d = await r.json().catch(() => ({}));
   if (!r.ok) return toast(d.error || '测活失败', true);
-  toast('测活完成: ' + (ALIVE_LABEL[d.alive] || d.alive));
+  toast('测活完成: ' + (ALIVE_LABEL[d.alive] || d.alive) + (d.console_quota ? '（' + d.console_quota + '）' : ''));
   load();
 }
 function liveCheckAll() {

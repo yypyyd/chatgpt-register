@@ -56,8 +56,12 @@ func registerBrowser(ctx context.Context, in Input) (res *Result, err error) {
 	} {
 		l = l.Delete(launcherflags.Flag(flag))
 	}
+	if in.Headless {
+		// Chrome 128 的 --headless 仍是旧无头（忽略扩展），必须显式 new headless
+		// 才能加载 Turnstile 补丁扩展。
+		l = l.Set("headless", "new")
+	}
 	l = l.
-		Headless(in.Headless).
 		NoSandbox(true).
 		Set("no-default-browser-check").
 		Set("disable-suggestions-ui").
@@ -86,16 +90,14 @@ func registerBrowser(ctx context.Context, in Input) (res *Result, err error) {
 	// Load the Turnstile-Patch extension like the reference project. It rewrites
 	// MouseEvent.screenX/screenY at document_start in every frame so x.ai's
 	// invisible managed Turnstile issues a token to a real checkbox click — no
-	// third-party solver required. Extensions are ignored in headless Chrome, so
-	// only load it in headed mode (Grok registration is headed by default).
-	if !in.Headless {
-		if patchDir, perr := extractTurnstilePatch(); perr != nil {
-			in.logf("释放 Turnstile 补丁扩展失败，回退到无扩展模式: %v", perr)
-		} else {
-			defer os.RemoveAll(patchDir)
-			l = l.Set("disable-extensions-except", patchDir).Set("load-extension", patchDir)
-			in.logf("已加载 Turnstile 补丁扩展")
-		}
+	// third-party solver required. It also exposes window.__cfSolve, which the
+	// minted-token injection needs, so it is loaded in headless (new) mode too.
+	if patchDir, perr := extractTurnstilePatch(); perr != nil {
+		in.logf("释放 Turnstile 补丁扩展失败，回退到无扩展模式: %v", perr)
+	} else {
+		defer os.RemoveAll(patchDir)
+		l = l.Set("disable-extensions-except", patchDir).Set("load-extension", patchDir)
+		in.logf("已加载 Turnstile 补丁扩展")
 	}
 
 	var authBridge *localAuthProxyBridge
@@ -187,6 +189,19 @@ func registerBrowser(ctx context.Context, in Input) (res *Result, err error) {
 		DeviceScaleFactor: 1,
 		Mobile:            false,
 	}).Call(page)
+	if in.Headless {
+		// 无头 Chrome 的 UA 带 HeadlessChrome 标记，会被 Cloudflare 直接拦，改回普通 Chrome。
+		if ver, verr := (proto.BrowserGetVersion{}).Call(browser); verr == nil {
+			if ua := cleanUserAgent(ver.UserAgent); ua != "" {
+				_ = (proto.EmulationSetUserAgentOverride{
+					UserAgent:      ua,
+					AcceptLanguage: acceptLang,
+					Platform:       "Linux x86_64",
+				}).Call(page)
+				in.logf("无头 UA 已修正: %s", ua)
+			}
+		}
+	}
 	in.logf("浏览器语言: %s", acceptLang)
 	if geo != nil {
 		applyGeo(page, geo, in)
@@ -239,22 +254,16 @@ func registerBrowser(ctx context.Context, in Input) (res *Result, err error) {
 		return nil, err
 	}
 
-	// 附加后处理：注册成功后立刻铸造 CLIProxyAPI 使用的 xAI OAuth 凭证（CPA 导出用），
-	// 并提取 sso token（Sub2API/grok2api 导出用）。失败不影响已注册的账号。
+	// 附加后处理：提取 sso token（Console / Sub2API 导出用）。
 	if sso := ssoFromCookies(auth); sso != "" {
 		auth["sso"] = sso
-	}
-	if cpa, mintErr := mintXAIToken(ctx, page, in); mintErr != nil {
-		in.logf("CPA 凭证铸造失败（不影响注册结果）: %v", mintErr)
-	} else {
-		auth["cpa_xai"] = cpa
 	}
 
 	in.logf("Grok 注册完成")
 	return &Result{AuthJSON: auth}, nil
 }
 
-// ssoFromCookies 取出 Grok 的 sso cookie 值，供 Sub2API/grok2api 池使用。
+// ssoFromCookies 取出 Grok 的 sso cookie 值，供 Console / Sub2API 导出使用。
 func ssoFromCookies(auth map[string]any) string {
 	list, _ := auth["cookies"].([]map[string]any)
 	for _, c := range list {

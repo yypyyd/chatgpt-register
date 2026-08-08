@@ -1,13 +1,10 @@
 package handlers
 
 import (
-	"archive/zip"
-	"bytes"
 	"encoding/json"
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 
 	"chatgpt-register/internal/models"
 
@@ -183,10 +180,9 @@ func (h *Handler) GrokShot(c *gin.Context) {
 }
 
 // GrokDownload 下载选中 Grok 账号。
-// format=sub2api：导出 grok2api/Sub2API 使用的 sso token 池 JSON。
-// format=cpa：导出 CLIProxyAPI 使用的 xAI OAuth 凭证（注册时用设备码流程铸造，
-// 每账号一个 xai-<邮箱>.json，单账号为 JSON，多账号为 ZIP）。
-// 请求体：{ "ids": [1,2,3], "format": "sub2api|cpa", "unshipped_only": false }。
+// format=console：导出 grok2api 的 Grok Console 账号导入 JSON（sso_token 列表）。
+// format=sub2api：导出 Sub2API 的 sso token 池（ssoBasic）。
+// 请求体：{ "ids": [1,2,3], "format": "console|sub2api", "unshipped_only": false }。
 // unshipped_only=true 时忽略 ids，导出全部已注册且未出库的账号。
 func (h *Handler) GrokDownload(c *gin.Context) {
 	var in struct {
@@ -203,9 +199,9 @@ func (h *Handler) GrokDownload(c *gin.Context) {
 		return
 	}
 	if in.Format == "" {
-		in.Format = "sub2api"
+		in.Format = "console"
 	}
-	if in.Format != "sub2api" && in.Format != "cpa" {
+	if in.Format != "console" && in.Format != "sub2api" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "不支持的导出格式"})
 		return
 	}
@@ -229,11 +225,11 @@ func (h *Handler) GrokDownload(c *gin.Context) {
 		return
 	}
 
-	if in.Format == "cpa" {
-		h.downloadGrokCPA(c, regs)
+	if in.Format == "sub2api" {
+		h.downloadGrokSub2API(c, regs)
 		return
 	}
-	h.downloadGrokSub2API(c, regs)
+	h.downloadGrokConsole(c, regs)
 }
 
 // grokSSOToken 取出账号的 sso token：优先用注册时提取的 sso 字段，否则回退扫描 cookie。
@@ -255,7 +251,38 @@ func grokSSOToken(authData string) string {
 	return ""
 }
 
-// downloadGrokSub2API 导出 grok2api/Sub2API 的 sso token 池（ssoBasic）。
+// downloadGrokConsole 导出 grok2api 的 Grok Console 账号导入 JSON。
+func (h *Handler) downloadGrokConsole(c *gin.Context, regs []models.GrokRegistration) {
+	accounts := make([]map[string]any, 0, len(regs))
+	ids := make([]uint, 0, len(regs))
+	for _, r := range regs {
+		sso := grokSSOToken(r.AuthData)
+		if sso == "" {
+			continue
+		}
+		accounts = append(accounts, map[string]any{
+			"name":      "Grok Console " + r.Email,
+			"email":     r.Email,
+			"sso_token": sso,
+		})
+		ids = append(ids, r.ID)
+	}
+	if len(accounts) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "所选 Grok 账号没有可用的 sso token"})
+		return
+	}
+	h.DB.Model(&models.GrokRegistration{}).Where("id IN ?", ids).Update("shipped", true)
+
+	out, _ := json.MarshalIndent(map[string]any{"provider": "console", "accounts": accounts}, "", "  ")
+	name := "grok_console_token.json"
+	if len(accounts) == 1 {
+		name = "grok-console-" + safeFileName(regs[0].Email) + ".json"
+	}
+	c.Header("Content-Disposition", `attachment; filename="`+name+`"`)
+	c.Data(http.StatusOK, "application/json; charset=utf-8", out)
+}
+
+// downloadGrokSub2API 导出 Sub2API 的 sso token 池（ssoBasic）。
 func (h *Handler) downloadGrokSub2API(c *gin.Context, regs []models.GrokRegistration) {
 	pool := make([]map[string]any, 0, len(regs))
 	ids := make([]uint, 0, len(regs))
@@ -284,76 +311,6 @@ func (h *Handler) downloadGrokSub2API(c *gin.Context, regs []models.GrokRegistra
 	}
 	c.Header("Content-Disposition", `attachment; filename="`+name+`"`)
 	c.Data(http.StatusOK, "application/json; charset=utf-8", out)
-}
-
-// grokCPAAuth 取出注册时铸造的 CLIProxyAPI xAI OAuth 凭证（cpa_xai 字段）。
-func grokCPAAuth(authData string) (map[string]any, bool) {
-	var auth map[string]any
-	_ = json.Unmarshal([]byte(authData), &auth)
-	cpa, ok := auth["cpa_xai"].(map[string]any)
-	if !ok || cpa == nil {
-		return nil, false
-	}
-	if v, _ := cpa["access_token"].(string); strings.TrimSpace(v) == "" {
-		return nil, false
-	}
-	return cpa, true
-}
-
-func grokCPAFileName(email string) string {
-	return "xai-" + safeFileName(email) + ".json"
-}
-
-func (h *Handler) downloadGrokCPA(c *gin.Context, regs []models.GrokRegistration) {
-	type cpaFile struct {
-		email   string
-		id      uint
-		payload map[string]any
-	}
-	files := make([]cpaFile, 0, len(regs))
-	for _, r := range regs {
-		cpa, ok := grokCPAAuth(r.AuthData)
-		if !ok {
-			continue
-		}
-		files = append(files, cpaFile{email: r.Email, id: r.ID, payload: cpa})
-	}
-	if len(files) == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "所选 Grok 账号没有 CPA(xAI OAuth) 凭证；可能注册时铸造失败或为旧账号"})
-		return
-	}
-	ids := make([]uint, 0, len(files))
-	for _, f := range files {
-		ids = append(ids, f.id)
-	}
-	h.DB.Model(&models.GrokRegistration{}).Where("id IN ?", ids).Update("shipped", true)
-
-	if len(files) == 1 {
-		out, _ := json.MarshalIndent(files[0].payload, "", "  ")
-		c.Header("Content-Disposition", `attachment; filename="`+grokCPAFileName(files[0].email)+`"`)
-		c.Data(http.StatusOK, "application/json; charset=utf-8", out)
-		return
-	}
-	var buf bytes.Buffer
-	zw := zip.NewWriter(&buf)
-	for _, f := range files {
-		entry, err := zw.Create(grokCPAFileName(f.email))
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "创建 CPA 压缩包失败"})
-			return
-		}
-		out, _ := json.MarshalIndent(f.payload, "", "  ")
-		if _, err = entry.Write(out); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "写入 CPA 压缩包失败"})
-			return
-		}
-	}
-	if err := zw.Close(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "完成 CPA 压缩包失败"})
-		return
-	}
-	c.Header("Content-Disposition", `attachment; filename="cpa_xai_`+time.Now().UTC().Format("20060102_150405")+`.zip"`)
-	c.Data(http.StatusOK, "application/zip", buf.Bytes())
 }
 
 func safeFileName(s string) string {

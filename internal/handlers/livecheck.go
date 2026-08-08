@@ -241,10 +241,10 @@ func (h *Handler) GrokLiveCheckStart(c *gin.Context) {
 		defer runner.finish("")
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 		defer cancel()
-		livecheck.CheckGrok(ctx, items, func(chunk map[uint]string) {
-			for id, st := range chunk {
-				h.applyGrokAlive(id, st)
-				runner.tally(st)
+		livecheck.CheckGrok(ctx, items, func(chunk map[uint]livecheck.GrokResult) {
+			for id, res := range chunk {
+				h.applyGrokAlive(id, res)
+				runner.tally(res.Status)
 			}
 		})
 	}()
@@ -262,21 +262,24 @@ func (h *Handler) GrokLiveCheckOne(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "该 Grok 账号没有可测活的会话数据"})
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	res := livecheck.CheckGrok(ctx, []livecheck.GrokItem{item}, nil)
-	st := res[item.ID]
-	if st == "" {
-		st = livecheck.StatusUnknown
+	res := livecheck.CheckGrok(ctx, []livecheck.GrokItem{item}, nil)[item.ID]
+	if res.Status == "" {
+		res.Status = livecheck.StatusUnknown
 	}
-	now := h.applyGrokAlive(item.ID, st)
-	c.JSON(http.StatusOK, gin.H{"id": item.ID, "alive": st, "checked_at": now})
+	now := h.applyGrokAlive(item.ID, res)
+	c.JSON(http.StatusOK, gin.H{"id": item.ID, "alive": res.Status, "console_quota": res.Quota, "checked_at": now})
 }
 
-func (h *Handler) applyGrokAlive(id uint, st string) time.Time {
+// applyGrokAlive 写回测活结果；额度只在本次拿到时覆盖，避免 unknown 抹掉旧值。
+func (h *Handler) applyGrokAlive(id uint, res livecheck.GrokResult) time.Time {
 	now := time.Now()
-	h.DB.Model(&models.GrokRegistration{}).Where("id = ?", id).
-		Updates(map[string]any{"alive": st, "alive_checked_at": now})
+	fields := map[string]any{"alive": res.Status, "alive_checked_at": now}
+	if res.Quota != "" {
+		fields["console_quota"] = res.Quota
+	}
+	h.DB.Model(&models.GrokRegistration{}).Where("id = ?", id).Updates(fields)
 	return now
 }
 
@@ -293,10 +296,7 @@ func (h *Handler) loadGrokItems(ids []uint) ([]livecheck.GrokItem, error) {
 	}
 	items := make([]livecheck.GrokItem, 0, len(regs))
 	for _, r := range regs {
-		refresh, endpoint, clientID := grokRefreshCreds(r.AuthData)
-		items = append(items, livecheck.GrokItem{
-			ID: r.ID, RefreshToken: refresh, TokenEndpoint: endpoint, ClientID: clientID,
-		})
+		items = append(items, grokLiveItem(r))
 	}
 	return items, nil
 }
@@ -309,8 +309,16 @@ func (h *Handler) loadGrokItem(id uint) (livecheck.GrokItem, bool) {
 	if r.AuthData == "" {
 		return livecheck.GrokItem{}, false
 	}
+	return grokLiveItem(r), true
+}
+
+// grokLiveItem 组装测活所需凭据：sso token（Console 探测）+ cpa 刷新凭据（回退）。
+func grokLiveItem(r models.GrokRegistration) livecheck.GrokItem {
 	refresh, endpoint, clientID := grokRefreshCreds(r.AuthData)
-	return livecheck.GrokItem{ID: r.ID, RefreshToken: refresh, TokenEndpoint: endpoint, ClientID: clientID}, true
+	return livecheck.GrokItem{
+		ID: r.ID, SSO: grokSSOToken(r.AuthData),
+		RefreshToken: refresh, TokenEndpoint: endpoint, ClientID: clientID,
+	}
 }
 
 // grokRefreshCreds 从 AuthData.cpa_xai 取出 refresh_token / token 端点 / client_id。

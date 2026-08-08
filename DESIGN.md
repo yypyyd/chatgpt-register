@@ -62,6 +62,64 @@ Adobe 注册与 ChatGPT、Grok 完全隔离：独立数据表 `adobe_registratio
 
 ## 变更历史
 
+### 2026-08-08 - Grok 代理跟随全局开关
+
+**变更内容**：删除 `grok_proxy_enabled` / `grok_proxy_list` 这两个隐藏键的读取逻辑，Grok 注册直接跟设置页上的 `proxy_enabled` + `proxy_list`。
+
+**变更理由**：设置页只有全局开关，Grok 私有开关在库里为 1 时，页面显示"未启用代理"但实际在走代理，看不出来也没法关。
+
+**影响范围**：`internal/grokproducer/producer.go`。服务器上这两个键已删。
+
+### 2026-08-08 - Grok 注册配置缓存
+
+**变更内容**：`sitekey / Next-Action id / router state tree` 在进程内缓存 20 分钟（`signupConfigTTL`），命中缓存时只做一次 `WarmSignup` 养 cookie + 探 Cloudflare，跳过抓 `_next` JS chunk 找 action id；注册成功后写入缓存，注册未拿到 SSO 或缓存 warm 不过则丢控重抓。Turnstile 令牌签发也提前到取码之前启动，与取码、等码全程重叠。`cmd/groktest` 支持一次传多个配置在同进程内顺序注册，便于验证跨账号复用。
+
+**变更理由**：这三个值只跟着 x.ai 发版变，每个号重抓要多花 3～22 秒。
+
+**影响范围**：`internal/grokreg/protocol_register.go`、`cmd/groktest/main.go`。实测同进程连续注册：首号 37 秒（抓配置 10 秒），次号 26 秒（复用配置 1 秒）。此时耗时几乎全在 Turnstile 签发（经住宅代理约 23 秒，直连 13 秒），且已完全与收码重叠。
+
+### 2026-08-08 - Grok 协议注册提速
+
+**变更内容**：Turnstile 令牌改为在等验证码期间并行签发（令牌有效期约 5 分钟，与收码重叠后基本不占关键路径）；删除注册后的 `CreateSession` 换新 SSO 步骤（`createFreshSessionSSOProto`），直接用 Server Action 返回的注册 SSO。
+
+**变更理由**：换新 SSO 那步原本是为 CPA 设备授权准备的（设备授权对全新 SSO 更挑），CPA 已移除后不再需要；它自身还要再签一次 Turnstile，实测占用约 28 秒。实跑验证：注册 SSO 直接过 Console DPoP + `/v1/usage`，额度 chat 10/10 · image 5/5 · video 2/2。
+
+**影响范围**：`internal/grokreg/protocol_register.go`。单号实测 77 秒（旧 browser 引擎）→ 47 秒；并发 2 时 2 个号 56 秒完成（约 28 秒/号），瓶颈是 CloakBrowser 签发令牌的 CPU 占用。
+
+### 2026-08-08 - Grok 无头注册可用
+
+**变更内容**：`grok_headless=1` 时改用 new headless（`--headless=new`），Turnstile 补丁扩展在无头下同样加载（`window.__cfSolve` 是注入签发 token 的必要条件），并把无头 UA 里的 `HeadlessChrome` 标记改回普通 Chrome（`Emulation.setUserAgentOverride`）。
+
+**变更理由**：旧 `--headless` 在 Chrome 128 下忽略扩展，无头会拿不到 `__cfSolve`，且 UA 暴露 HeadlessChrome 会被 Cloudflare 直接拦。
+
+**影响范围**：`internal/grokreg/browser.go`。默认引擎 `protocol` 本身就不开可见浏览器（浏览器只用于签 Turnstile，且 CloakBrowser 走 offscreen），实测一个号约 57 秒；`grok_engine=browser` 的旧全程浏览器流程约 77 秒。
+
+### 2026-08-08 - Grok 导出去掉 CPA，只留 Console 与 Sub2API
+
+**变更内容**：Grok 下载接口的 `format` 只接受 `console`（默认）与 `sub2api`，删除 CPA(xAI OAuth) 导出分支与打包逻辑；页面按钮改为「导出 Console」/「导出 Sub2API」，行内按钮为 Console 与 Sub。
+
+**变更理由**：CPA 号池不再使用，Grok 只出 Console 号和 Sub2API 的 sso 池。
+
+注册流程里为 CPA 加的那步（OAuth 设备码流程铸造 `cpa_xai`）也一并移除：删掉 `internal/grokreg/cpa_mint.go` 和 `internal/grokreg/oauth/`，协议注册与浏览器注册都不再跑设备授权，注册少一次外部往返和一处失败点。新号 `AuthData` 不再有 `cpa_xai`，测活只走 Console 探测（老号仍可用 refresh_token 回退）。
+
+**影响范围**：`internal/handlers/grok.go`（删除 `grokCPAAuth`/`downloadGrokCPA`，恢复 `downloadGrokSub2API`）、`internal/grokreg/browser.go`、`internal/grokreg/protocol_register.go`、删除 `internal/grokreg/cpa_mint.go` 与 `internal/grokreg/oauth/oauth.go`、`static/grok.html`、`static/grok.js`。
+
+### 2026-08-08 - Grok 测活改为 Console 额度探测
+
+**变更内容**：Grok 测活优先用账号 sso token 走 console.x.ai 的 DPoP 流程（`POST /v1/dpop/token` 换一次性 token，再带 DPoP proof 读 `GET /v1/usage`），把 chat/image/video 额度写入新字段 `console_quota` 并在列表「存活」列展示；没有 sso 的旧账号仍回退到 xAI OAuth refresh_token 授权探测。401 或非 Cloudflare 的 403 判死，Cloudflare / 429 / 5xx / 超时保持 unknown。
+
+**变更理由**：导出目标已经是 Console 号，测活也应该验证 Console 这条链路，并顺带给出账号真实可用额度，而不是只验证 OAuth 凭据。
+
+**影响范围**：新增 `internal/livecheck/grokconsole.go`；`internal/livecheck/grok.go`（`GrokItem.SSO` + `GrokResult`）、`internal/handlers/livecheck.go`、`internal/models/grok.go`（新增 `console_quota` 列，AutoMigrate 自动补）、`static/grok.js`、`static/style.css`；ChatGPT/Adobe 测活不变。
+
+### 2026-08-08 - Grok 导出改用 grok2api Console 格式
+
+**变更内容**：Grok 页面的 sso 导出由旧的 `{"ssoBasic":[…]}` 池改为 grok2api 的 Grok Console 账号导入 JSON（`{"provider":"console","accounts":[{"name","email","sso_token"}]}`），`format` 取值改为 `console`；旧值 `sub2api` 与缺省仍按 `console` 处理。
+
+**变更理由**：grok2api 现在按 Provider 导入账号，Console 号池只认 `provider=console` + `sso_token` 的文档格式，旧 `ssoBasic` 池无法直接导入。
+
+**影响范围**：`internal/handlers/grok.go` 的 Grok 下载接口与文件名，`static/grok.html`、`static/grok.js` 的导出入口文案；不改动 CPA 导出和 ChatGPT/Adobe 导出。
+
 ### 2026-07-28 - 新增独立 Adobe（Firefly）注册
 
 **变更内容**：新增与 ChatGPT/Grok 隔离的 Adobe 注册子系统：`models.AdobeRegistration` + `adobe_registrations` 表、`internal/adobereg` 浏览器流程、`internal/adobeproducer` 生产器（复用邮箱池自动取码）、`handlers/adobe.go`、`/api/adobe/*` 路由、`static/adobe.html`+`adobe.js` 页面与侧边栏入口；Cookie 导出支持字符串 / JSON 对象 / 批量数组三种格式。
