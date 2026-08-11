@@ -42,7 +42,7 @@ Adobe 注册与 ChatGPT、Grok 完全隔离：独立数据表 `adobe_registratio
 - `json`：单个 Adobe 的 Cookie JSON 对象（含 `cookie_string`、`cookies_map`、带元数据的 `cookies` 数组、`storage`；单账号 `.json`，多账号 `.zip`）。
 - `array`：多个 Adobe 批量导出的 Cookie 数组，始终单个 `.json` 文件。
 
-生命周期与 Grok 一致：并发受 `adobe_max_concurrency`（回退 `max_concurrency`，默认 1）约束，代理走 `adobe_proxy_*`（回退全局 `proxy_*`），无头由 `adobe_headless` 控制；服务启动时把残留的 `registering`/`waiting_code` 记录回收为 `register_failed`，可重新注册。Adobe 与 Grok 共用任务级代理会话策略：BestGo 动态住宅代理若未显式配置 `-session-`，生产器会为每个注册任务生成独立 session，不同任务允许轮换出口，但同一浏览器/协议流程（含 Turnstile 与 OAuth）保持出口 IP 稳定；认证代理日志同时记录本地桥入口和不含凭据的上游地址，避免把 `127.0.0.1` 误认为直连。
+生命周期与 Grok 一致：并发受全局 `max_concurrency`（默认 1）约束，代理走全局 `proxy_enabled` / `proxy_list`，无头由 `adobe_headless` 控制；服务启动时把残留的 `registering`/`waiting_code` 记录回收为 `register_failed`，可重新注册。Adobe 与 Grok 共用任务级代理会话策略：BestGo 动态住宅代理若未显式配置 `-session-`，生产器会为每个注册任务生成独立 session，不同任务允许轮换出口，但同一浏览器/协议流程（含 Turnstile 与 OAuth）保持出口 IP 稳定；认证代理日志同时记录本地桥入口和不含凭据的上游地址，避免把 `127.0.0.1` 误认为直连。
 
 ## 已知限制
 
@@ -61,6 +61,16 @@ Adobe 注册与 ChatGPT、Grok 完全隔离：独立数据表 `adobe_registratio
 - **已知风险**：管理员凭据被盗后仍可执行不可恢复的全部删除；应依赖强管理员密码、HTTPS 与数据库备份降低风险。
 
 ## 变更历史
+
+### 2026-08-10 - Adobe 注册不再使用裂变账号
+
+**变更内容**：`adobeproducer.StartFromAccounts` 从 ChatGPT 账号池取号时加 `is_mother = 1` 过滤，只用母号；裂变号是 `+别名` 邮箱，Adobe 把它视作同一邮箱，用来注册会撞号。不足部分仍从已验证邮箱池补齐，逻辑不变。
+
+### 2026-08-10 - Adobe 注册提速与并发/代理配置归一
+
+**变更内容**：Adobe 建号后先用浏览器 Cookie 直接探一次 cookie→token，命中身份核验就直奔核验页（核验取码与页面加载并行），不再先打开 Firefly 白等就绪超时；探测失败才回退原来的 `passAdobeRide` 路径，Firefly 就绪等待从 25 秒收到 15 秒，各处页面轮询从 700ms~1s 收到 250~300ms，收码轮询 5 秒收到 3 秒。配置上删掉 `adobe_max_concurrency` / `grok_max_concurrency`，两个生产器只读全局 `max_concurrency`；Adobe 代理不再读 `adobe_proxy_enabled` / `adobe_proxy_list`，统一跟全局 `proxy_enabled` / `proxy_list`。无头仍按平台分开（`adobe_headless` / `grok_headless`）；Adobe 无头照搬 grokreg 的方案——显式 `--headless=new` 并把 UA 里的 HeadlessChrome 标记改回普通 Chrome（否则注册页停在加载动画进不了表单）。后续再收紧：收码轮询 3 秒收到 2 秒，模拟人手输入间隔 40~110ms 收到 25~70ms；验证码提交失败重试前先点「重新发送」，否则重试会一直等一封不会再来的新邮件直到收码超时。实测无头并发 2 单号约 52~58 秒；并发提到 4 时单号退化到 71~78 秒且一半卡在验证码重试，故全局并发保持 2。同 IP 连注约 30 个号后 Adobe 会弹 hCaptcha 图形验证（提交步永远推进不了）：`submitAndAdvance` 超时前检测 `iframe[src*="hcaptcha.com"]`，命中直接报 `errCaptchaPuzzle` 快速失败并提示开代理，第一步也不再做无意义的整页重试；规避方式是开启全局代理（BestGo 动态住宅代理按任务轮换出口 IP）。
+
+**动机**：线上日志显示单号约 83 秒里有 32 秒是「先开 Firefly、等就绪超时、才发现被核验拦住」的纯白等；同时按平台各一把并发/代理键容易和设置页上的全局值不一致，出现 Adobe 排队逐个跑的情况。
 
 ### 2026-08-08 - Turnstile 签发脚本纳入仓库
 

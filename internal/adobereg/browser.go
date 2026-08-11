@@ -3,6 +3,7 @@ package adobereg
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -62,8 +63,12 @@ func launchAdobeBrowser(in Input) (browser *rod.Browser, bridge *localAuthProxyB
 	} {
 		l = l.Delete(launcherflags.Flag(flag))
 	}
+	if in.Headless {
+		// 与 grokreg 一致：Chrome 128 的 --headless 仍是旧无头，指纹差异大容易被拦，
+		// 必须显式 new headless。
+		l = l.Set("headless", "new")
+	}
 	l = l.
-		Headless(in.Headless).
 		NoSandbox(true).
 		Set("no-default-browser-check").
 		Set("disable-suggestions-ui").
@@ -181,6 +186,20 @@ func registerBrowser(ctx context.Context, in Input) (res *Result, err error) {
 		DeviceScaleFactor: 1,
 		Mobile:            false,
 	}).Call(page)
+	if in.Headless {
+		// 与 grokreg 一致：无头 Chrome 的 UA 带 HeadlessChrome 标记，会被 Adobe 风控拦住
+		// （页面停在加载动画），改回普通 Chrome。
+		if ver, verr := (proto.BrowserGetVersion{}).Call(browser); verr == nil {
+			if ua := cleanUserAgent(ver.UserAgent); ua != "" {
+				_ = (proto.EmulationSetUserAgentOverride{
+					UserAgent:      ua,
+					AcceptLanguage: "en-US,en;q=0.9",
+					Platform:       "Linux x86_64",
+				}).Call(page)
+				in.logf("无头 UA 已修正: %s", ua)
+			}
+		}
+	}
 
 	if err = gotoStable(ctx, page, signInURL, in, 120*time.Second); err != nil {
 		return nil, err
@@ -198,16 +217,37 @@ func registerBrowser(ctx context.Context, in Input) (res *Result, err error) {
 		return nil, err
 	}
 
-	in.logf("账号创建完成，打开 Firefly 确认会话")
+	// 新号邮箱可能未验证（Adobe 把邮箱核验延后到换 token 时），下游用
+	// clio-playground-web 换 token 会被 ride_AdobeID_acct_evs 身份核验拦住。建号后
+	// 立刻用浏览器 cookie 探一次交换：命中核验就直接去核验页，省掉先打开 Firefly
+	// 白等一轮就绪超时。探测本身失败（网络等）则回退到采集会话后再探的老路径。
+	in.logf("账号创建完成，检查换 token 状态")
+	probed := false
+	if cookie := cookieHeaderFromPage(page); cookie != "" {
+		switch jump, perr := adobeRideJump(ctx, cookie); {
+		case perr != nil:
+			in.logf("检查换 token 状态失败（稍后重试）: %v", perr)
+		case jump == "":
+			probed = true
+			in.logf("cookie→token 交换成功，账号下游可用")
+		default:
+			probed = true
+			if verr := rideVerify(ctx, page, in, jump); verr != nil {
+				in.logf("自动通过身份核验失败: %v", verr)
+			}
+		}
+	}
+
+	in.logf("打开 Firefly 确认会话")
 	if err = gotoStable(ctx, page, fireflyURL, in, 120*time.Second); err != nil {
 		in.logf("打开 Firefly 时页面跳转异常，继续检测验证页: %v", err)
 	}
 	if err = handleEmailVerification(ctx, page, in); err != nil {
 		return nil, err
 	}
-	// 会话无论 Firefly 是否按预期跳转都会照常采集，这里不必久等：25s 足够正常
-	// 跳转完成，超时也直接进入采集，避免像账号建成后白等两分钟。
-	if err = waitFireflyReady(ctx, page, in, 25*time.Second); err != nil {
+	// 会话无论 Firefly 是否按预期跳转都会照常采集，这里不必久等：超时也直接进入
+	// 采集，避免账号建成后白等。
+	if err = waitFireflyReady(ctx, page, in, 15*time.Second); err != nil {
 		in.logf("等待 Firefly 就绪超时（账号已创建），继续采集会话: %v", err)
 	}
 
@@ -216,14 +256,26 @@ func registerBrowser(ctx context.Context, in Input) (res *Result, err error) {
 		return nil, cerr
 	}
 
-	// 新号邮箱可能未验证（Adobe 现在把邮箱核验延后到换 token 时），下游用
-	// clio-playground-web 换 token 会被 ride_AdobeID_acct_evs 身份核验拦住。这里
-	// 主动做一次交换：若被拦，就打开核验页用邮箱验证码过掉，再重新采集会话，
+	// 建号后那次探测没跑通时，用采集到的会话再探一次并按需过核验，
 	// 确保导出的号下游可直接用。失败只记日志、保留原会话（账号仍算注册成功）。
-	if newAuth, ok := passAdobeRide(ctx, page, in, auth); ok {
-		auth = newAuth
+	if !probed {
+		if newAuth, ok := passAdobeRide(ctx, page, in, auth); ok {
+			auth = newAuth
+		}
 	}
 	return &Result{AuthJSON: auth}, nil
+}
+
+// cleanUserAgent 与 grokreg 一致：去掉无头 Chrome UA 里的 Headless 标记。
+func cleanUserAgent(ua string) string {
+	ua = strings.TrimSpace(ua)
+	ua = strings.ReplaceAll(ua, "HeadlessChrome", "Chrome")
+	ua = strings.ReplaceAll(ua, "Headless", "")
+	ua = strings.Join(strings.Fields(ua), " ")
+	if !strings.Contains(ua, "Chrome/") {
+		return userAgent
+	}
+	return ua
 }
 
 // passAdobeRide 用与下游一致的 cookie→token 交换探测账号是否被 Adobe ride 拦。
@@ -242,22 +294,7 @@ func passAdobeRide(ctx context.Context, page *rod.Page, in Input, auth map[strin
 		in.logf("cookie→token 交换成功，账号下游可用")
 		return auth, false
 	}
-	in.logf("检测到 Adobe 身份核验(ride_AdobeID_acct_evs)，打开核验页尝试用邮箱验证码通过")
-	// 重置验证码基线，确保取到的是核验页新发的验证码而非注册阶段旧码。
-	if in.ResetCodeBaseline != nil {
-		in.ResetCodeBaseline()
-	}
-	if err := gotoStable(ctx, page, jump, in, 60*time.Second); err != nil {
-		in.logf("打开身份核验页失败: %v", err)
-		return auth, false
-	}
-	// 跳转是 deeplink SPA，验证码框（PinInput）要几秒才渲染，先等它出现再处理，
-	// 否则会误判为"无需验证"直接跳过。
-	if !waitCleared(ctx, page, 30*time.Second, func() bool { return onEmailVerify(page, pageURL(page)) }) {
-		in.logf("等待身份核验页出现超时，当前页面: %s", trimText(pageURL(page), 120))
-		return auth, false
-	}
-	if err := handleEmailVerification(ctx, page, in); err != nil {
+	if err := rideVerify(ctx, page, in, jump); err != nil {
 		in.logf("自动通过身份核验失败: %v", err)
 		return auth, false
 	}
@@ -277,6 +314,45 @@ func passAdobeRide(ctx context.Context, page *rod.Page, in Input, auth map[strin
 		in.logf("身份核验后仍未能换到 token，可能需人工处理")
 	}
 	return newAuth, true
+}
+
+// rideVerify 打开 ride 身份核验页并用邮箱验证码过掉。取码与打开核验页并行：
+// 核验页是 deeplink SPA，验证码框要几秒才渲染，这段时间正好用来收码。
+func rideVerify(ctx context.Context, page *rod.Page, in Input, jump string) error {
+	in.logf("检测到 Adobe 身份核验(ride_AdobeID_acct_evs)，打开核验页尝试用邮箱验证码通过")
+	// 重置验证码基线，确保取到的是核验页新发的验证码而非注册阶段旧码。
+	if in.ResetCodeBaseline != nil {
+		in.ResetCodeBaseline()
+	}
+	codeCtx, cancelCode := context.WithCancel(ctx)
+	defer cancelCode()
+	type codeOutcome struct {
+		code string
+		err  error
+	}
+	codeCh := make(chan codeOutcome, 1)
+	go func() {
+		code, err := in.WaitCode(codeCtx)
+		codeCh <- codeOutcome{code: code, err: err}
+	}()
+	verifyIn := in
+	verifyIn.WaitCode = func(ctx context.Context) (string, error) {
+		select {
+		case out := <-codeCh:
+			return out.code, out.err
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+
+	if err := gotoStable(ctx, page, jump, in, 60*time.Second); err != nil {
+		return fmt.Errorf("打开身份核验页失败: %w", err)
+	}
+	// 先等验证码框出现再处理，否则会误判为"无需验证"直接跳过。
+	if !waitCleared(ctx, page, 30*time.Second, func() bool { return onEmailVerify(page, pageURL(page)) }) {
+		return fmt.Errorf("等待身份核验页出现超时，当前页面: %s", trimText(pageURL(page), 120))
+	}
+	return handleEmailVerification(ctx, page, verifyIn)
 }
 
 // RescueRide 针对已注册但被 ride 卡住的号：用导出的 cookie 还原会话、打开核验页
@@ -369,6 +445,23 @@ func setAdobeCookies(page *rod.Page, cookies []map[string]any) error {
 	return page.SetCookies(params)
 }
 
+// cookieHeaderFromPage 直接从浏览器读全量 cookie 拼成 HTTP Cookie 请求头，
+// 用于建号后立即探测换 token 状态（不必先采集整份会话）。
+func cookieHeaderFromPage(page *rod.Page) string {
+	all, err := proto.NetworkGetAllCookies{}.Call(page)
+	if err != nil {
+		return ""
+	}
+	parts := make([]string, 0, len(all.Cookies))
+	for _, c := range all.Cookies {
+		if strings.TrimSpace(c.Name) == "" {
+			continue
+		}
+		parts = append(parts, c.Name+"="+c.Value)
+	}
+	return strings.Join(parts, "; ")
+}
+
 // cookieHeaderFromAuth 把 captureAuth 产出的 cookies 拼成 HTTP Cookie 请求头。
 func cookieHeaderFromAuth(auth map[string]any) string {
 	list, ok := auth["cookies"].([]map[string]any)
@@ -446,7 +539,7 @@ func gotoStable(ctx context.Context, page *rod.Page, target string, in Input, ti
 				last = u
 			}
 		}
-		time.Sleep(700 * time.Millisecond)
+		time.Sleep(300 * time.Millisecond)
 	}
 	if last != "" {
 		in.logf("页面加载完成(可能仍在跳转): %s", trimText(last, 120))
@@ -467,7 +560,7 @@ func gotoCreateForm(ctx context.Context, page *rod.Page, in Input) error {
 			return nil
 		}
 		clickByText(page, `a,span,button`, `create an account`)
-		time.Sleep(700 * time.Millisecond)
+		time.Sleep(300 * time.Millisecond)
 	}
 	return fmt.Errorf("未能进入 Adobe 创建账号表单")
 }
@@ -506,6 +599,9 @@ func fillStep1(ctx context.Context, page *rod.Page, in Input) error {
 		}
 		if err := submitAndAdvance(ctx, page, in, leftStep1, 60*time.Second); err != nil {
 			lastErr = fmt.Errorf("提交第一步失败: %w", err)
+			if errors.Is(err, errCaptchaPuzzle) {
+				break // 图形验证是 IP 级风控，重新加载注册页也过不去
+			}
 			continue
 		}
 		return nil
@@ -539,7 +635,7 @@ func completeSignup(ctx context.Context, page *rod.Page, in Input) error {
 			in.logf("注册表单已完成: %s", trimText(u, 120))
 			return nil
 		}
-		time.Sleep(700 * time.Millisecond)
+		time.Sleep(300 * time.Millisecond)
 	}
 	return fmt.Errorf("完成注册步骤超时（可能遇到额外校验）")
 }
@@ -587,6 +683,15 @@ func fillStep2(ctx context.Context, page *rod.Page, in Input) error {
 	return nil
 }
 
+// errCaptchaPuzzle 表示 Adobe 弹出了 hCaptcha 图形验证（同一出口 IP 注册过多触发），
+// 刷新页面无法消除，直接失败并提示换 IP 比反复重试更省时间。
+var errCaptchaPuzzle = errors.New("触发 Adobe 图形验证（同 IP 注册过多），建议开启代理 proxy_enabled=1 或降低注册频率")
+
+// onCaptchaPuzzle 检测 hCaptcha 验证弹窗（"Please solve a few puzzles"）。
+func onCaptchaPuzzle(page *rod.Page) bool {
+	return hasSel(page, `iframe[src*="hcaptcha.com"]`)
+}
+
 // submitAndAdvance 点击当前表单主 CTA（Continue / Create account）并确认页面
 // 真正进入下一步；Adobe 的提交按钮在表单校验通过前为 disabled，且偶尔首次
 // 点击不生效，因此等按钮可点后点击，未推进则重试。
@@ -600,11 +705,15 @@ func submitAndAdvance(ctx context.Context, page *rod.Page, in Input, advanced fu
 			return nil
 		}
 		clickPrimary(page)
-		for i := 0; i < 8; i++ {
+		// 细粒度轮询：页面通常 1~2 秒内推进，1 秒一探会白等大半秒。
+		for i := 0; i < 24; i++ {
 			if advanced() {
 				return nil
 			}
-			time.Sleep(1 * time.Second)
+			time.Sleep(250 * time.Millisecond)
+		}
+		if onCaptchaPuzzle(page) {
+			return errCaptchaPuzzle
 		}
 	}
 	if advanced() {
@@ -652,7 +761,10 @@ func handleEmailVerification(ctx context.Context, page *rod.Page, in Input) erro
 			in.logf("邮箱验证码校验通过")
 			return nil
 		}
-		in.logf("验证码提交后仍停留在验证页，重试")
+		// 旧码已被消费或被拒，Adobe 不会自动再发；点「重新发送」让重试等的
+		// 是新邮件，否则会一直等到收码超时。
+		clickByText(page, `button,a,span`, `resend`)
+		in.logf("验证码提交后仍停留在验证页，已请求重发验证码后重试")
 	}
 	return fmt.Errorf("邮箱验证码校验未通过")
 }
@@ -672,7 +784,7 @@ func waitFireflyReady(ctx context.Context, page *rod.Page, in Input, timeout tim
 			in.logf("Firefly/Adobe 会话就绪: %s", trimText(u, 120))
 			return nil
 		}
-		time.Sleep(1 * time.Second)
+		time.Sleep(300 * time.Millisecond)
 	}
 	return fmt.Errorf("等待 Firefly 就绪超时")
 }
@@ -782,7 +894,7 @@ func fillInput(ctx context.Context, page *rod.Page, selector, value string, time
 		if lastErr == nil {
 			return nil
 		}
-		time.Sleep(1 * time.Second)
+		time.Sleep(400 * time.Millisecond)
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("等待输入框超时")
@@ -843,7 +955,7 @@ func waitVisible(page *rod.Page, selector string, timeout time.Duration) (*rod.E
 		if time.Now().After(deadline) {
 			return nil, fmt.Errorf("等待可见元素超时: %s", selector)
 		}
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
 	}
 }
 
@@ -857,7 +969,7 @@ func waitCleared(ctx context.Context, page *rod.Page, timeout time.Duration, cle
 			return true
 		}
 		_ = page
-		time.Sleep(1 * time.Second)
+		time.Sleep(300 * time.Millisecond)
 	}
 	return cleared()
 }
@@ -895,7 +1007,7 @@ func typeHuman(el *rod.Element, text string) error {
 		if err := el.Input(string(r)); err != nil {
 			return err
 		}
-		time.Sleep(40*time.Millisecond + time.Duration(ri(70))*time.Millisecond)
+		time.Sleep(25*time.Millisecond + time.Duration(ri(45))*time.Millisecond)
 	}
 	return nil
 }

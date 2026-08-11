@@ -22,12 +22,13 @@ import (
 const (
 	codeWaitTimeout  = 10 * time.Minute
 	codePollTimeout  = 4 * time.Minute
-	codePollInterval = 5 * time.Second
+	// 收码轮询间隔：验证码邮件通常几秒内到，间隔越大平均多等半个间隔。
+	codePollInterval = 2 * time.Second
 	maxLogBytes      = 64 * 1024
 
-	// defaultMaxConcurrency 未配置任何并发键时的默认值：逐个开工。批量注册时多个
-	// 有头浏览器同时抢 CPU 会互相超时，串行最稳。可用设置页「最大并发数」
-	// (max_concurrency) 或专用键 adobe_max_concurrency 调大。
+	// defaultMaxConcurrency 未配置并发时的默认值：逐个开工。批量注册时多个
+	// 有头浏览器同时抢 CPU 会互相超时，串行最稳。
+	// 可用设置页「最大并发数」(max_concurrency) 调大。
 	defaultMaxConcurrency = 1
 )
 
@@ -133,9 +134,10 @@ func (p *Producer) StartFromAccounts(count int) ([]models.AdobeRegistration, err
 	}
 
 	// 优先用已注册 ChatGPT 账号（其邮箱已在邮箱池且可读验证码）。
+	// 只取母号：裂变号是 +别名 邮箱，Adobe 视作同一邮箱，不能用来注册。
 	var accounts []models.Registration
 	if err := p.db.
-		Where("status = ? AND mailbox_id <> 0", "registered").
+		Where("status = ? AND mailbox_id <> 0 AND is_mother = ?", "registered", true).
 		Where("email NOT IN (?)", p.db.Model(&models.AdobeRegistration{}).Select("email")).
 		Order("id asc").
 		Limit(count).
@@ -558,12 +560,9 @@ func (p *Producer) appendLog(id uint, line string) {
 	p.db.Model(&models.AdobeRegistration{}).Where("id = ?", id).Update("log", log)
 }
 
-// maxConcurrency 优先用 Adobe 专用键 adobe_max_concurrency，未设置继承 max_concurrency，默认 1。
+// maxConcurrency 跟设置页「最大并发数」(max_concurrency)，未设置则默认 1。
 func (p *Producer) maxConcurrency() int {
-	raw := strings.TrimSpace(p.getSetting("adobe_max_concurrency"))
-	if raw == "" {
-		raw = strings.TrimSpace(p.getSetting("max_concurrency"))
-	}
+	raw := strings.TrimSpace(p.getSetting("max_concurrency"))
 	n := defaultMaxConcurrency
 	if raw != "" {
 		if parsed, err := strconv.Atoi(raw); err == nil {
@@ -618,15 +617,10 @@ func (p *Producer) getSetting(key string) string {
 	return s.Value
 }
 
+// nextProxy 跟设置页上的全局代理开关与代理列表，按任务轮换出口。
 func (p *Producer) nextProxy() string {
-	enabled := strings.TrimSpace(p.getSetting("adobe_proxy_enabled"))
-	raw := p.getSetting("adobe_proxy_list")
-	if enabled == "" {
-		enabled = strings.TrimSpace(p.getSetting("proxy_enabled"))
-		raw = p.getSetting("proxy_list")
-	} else if strings.TrimSpace(raw) == "" {
-		raw = p.getSetting("proxy_list")
-	}
+	enabled := strings.TrimSpace(p.getSetting("proxy_enabled"))
+	raw := p.getSetting("proxy_list")
 	if enabled != "1" {
 		return ""
 	}

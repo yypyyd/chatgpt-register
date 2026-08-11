@@ -24,9 +24,9 @@ const (
 	codePollInterval = 5 * time.Second
 	maxLogBytes      = 64 * 1024
 
-	// defaultMaxConcurrency 未配置任何并发键时的默认值：逐个开工。批量注册时多个
-	// 有头浏览器 + Turnstile 令牌池同时抢 CPU 会互相超时，串行最稳。可用设置页
-	// 「最大并发数」(max_concurrency) 或专用键 grok_max_concurrency 调大。
+	// defaultMaxConcurrency 未配置并发时的默认值：逐个开工。批量注册时多个
+	// 有头浏览器 + Turnstile 令牌池同时抢 CPU 会互相超时，串行最稳。
+	// 可用设置页「最大并发数」(max_concurrency) 调大。
 	defaultMaxConcurrency = 1
 )
 
@@ -437,13 +437,10 @@ func (p *Producer) appendLog(id uint, line string) {
 	p.db.Model(&models.GrokRegistration{}).Where("id = ?", id).Update("log", log)
 }
 
-// maxConcurrency 读取并发上限：优先用 Grok 专用键 grok_max_concurrency，
-// 未设置时继承设置页「最大并发数」(max_concurrency)，都没有则默认 1，最小为 1。
+// maxConcurrency 读取并发上限：跟设置页「最大并发数」(max_concurrency)，
+// 未设置则默认 1，最小为 1。
 func (p *Producer) maxConcurrency() int {
-	raw := strings.TrimSpace(p.getSetting("grok_max_concurrency"))
-	if raw == "" {
-		raw = strings.TrimSpace(p.getSetting("max_concurrency"))
-	}
+	raw := strings.TrimSpace(p.getSetting("max_concurrency"))
 	n := defaultMaxConcurrency
 	if raw != "" {
 		if parsed, err := strconv.Atoi(raw); err == nil {

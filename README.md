@@ -210,7 +210,7 @@ ADDR=8080 ./chatgpt-register.exe
   - **Cookie JSON 对象**：单个 Adobe 的 Cookie 对象（含 `cookie_string` / `cookies_map` / 带元数据的 `cookies` / `storage`；单账号 `.json`，多账号 `.zip`）
   - **Cookie 数组（多 Adobe 批量）**：所选账号合并为单个 `.json` 数组
 - **安全**：列表接口不返回 `auth_data`（`json:"-"`），日志与截图不含验证码或 Cookie 明文；Cookie 仅通过上述导出接口、且仅对已注册记录开放。
-- **相关设置键**：`adobe_headless`（无头）、`adobe_max_concurrency`（回退 `max_concurrency`）、`adobe_proxy_enabled` / `adobe_proxy_list`（回退全局 `proxy_*`）。
+- **相关设置键**：`adobe_headless`（无头）；并发跟全局 `max_concurrency`，代理跟全局 `proxy_enabled` / `proxy_list`。
 
 ---
 
