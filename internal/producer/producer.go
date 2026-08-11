@@ -32,6 +32,9 @@ import (
 const (
 	defaultMaxConcurrency = 3
 	defaultFissionCount   = 5
+	// 注册失败后的重试冷却（分钟），避免短时间内反复重试触发风控。
+	// 可在系统设置 retry_cooldown_min 覆盖，0 = 不冷却。
+	defaultRetryCooldownMin = 30
 	codePollTimeout       = 3 * time.Minute
 	codePollInterval      = 5 * time.Second
 	maxLogLines           = 300
@@ -45,7 +48,8 @@ type Config struct {
 	MaxConcurrency int
 	FissionCount   int
 	Headless       bool
-	Proxies        []string // 代理池，按账户轮转；空=直连
+	Proxies        []string      // 代理池，按账户轮转；空=直连
+	RetryCooldown  time.Duration // 失败地址的重试冷却时间
 }
 
 // Progress 生产进度快照，供 /api/produce/status 展示。
@@ -153,10 +157,19 @@ func (p *Producer) run(ctx context.Context, target int) {
 			continue
 		}
 
-		mb, email, isMother, ok := p.nextJob(cfg)
+		mb, email, isMother, ok, cooling := p.nextJob(cfg)
 		if !ok {
-			// 暂无可开的新任务：若还有在跑的，等它们（可能失败后要补），否则容量耗尽
+			// 暂无可开的新任务：若还有在跑的，等它们（可能失败后要补）；
+			// 若有地址在失败冷却期，等冷却结束后重试；否则容量耗尽
 			if p.inflightCount() == 0 {
+				if cooling {
+					p.setMessage("失败地址冷却中，等待重试…")
+					select {
+					case <-ctx.Done():
+					case <-time.After(15 * time.Second):
+					}
+					continue
+				}
 				p.logf("没有更多可用邮箱容量，本次已产出 %d 个", p.producedThisRun())
 				break
 			}
@@ -219,13 +232,15 @@ func (p *Producer) run(ctx context.Context, target int) {
 
 // nextJob 领取下一个要注册的账号：先在所有邮箱补齐母号，再开裂变子号。
 // 每个邮箱同一时刻只允许一个在跑任务（避免验证码串号，也保证母号先行）。
-func (p *Producer) nextJob(cfg Config) (models.Mailbox, string, bool, bool) {
+// 返回的 cooling 表示当前虽无可领任务，但有地址处于失败冷却期，稍后可重试。
+func (p *Producer) nextJob(cfg Config) (models.Mailbox, string, bool, bool, bool) {
 	p.claimMu.Lock()
 	defer p.claimMu.Unlock()
 
+	cooling := false
 	var mailboxes []models.Mailbox
 	if err := p.db.Where("status = ?", "verified").Order("id asc").Find(&mailboxes).Error; err != nil {
-		return models.Mailbox{}, "", false, false
+		return models.Mailbox{}, "", false, false, false
 	}
 
 	// Pass 1：母号（邮箱本身地址）未注册成功且该邮箱空闲 → 注册母号
@@ -234,8 +249,12 @@ func (p *Producer) nextJob(cfg Config) (models.Mailbox, string, bool, bool) {
 			continue
 		}
 		if !p.isRegistered(mb.Email) {
+			if p.failedRecently(mb.Email, cfg.RetryCooldown) {
+				cooling = true // 母号刚失败过，冷却期内不重试
+				continue
+			}
 			p.markInflight(mb.Email, mb.ID)
-			return mb, mb.Email, true, true
+			return mb, mb.Email, true, true, false
 		}
 	}
 
@@ -250,14 +269,17 @@ func (p *Producer) nextJob(cfg Config) (models.Mailbox, string, bool, bool) {
 		if p.fissionCount(mb) >= cfg.FissionCount {
 			continue
 		}
-		alias := p.nextFissionEmail(mb.Email)
+		alias, aliasCooling := p.nextFissionEmail(mb.Email, cfg.RetryCooldown)
+		if aliasCooling {
+			cooling = true
+		}
 		if alias == "" {
 			continue
 		}
 		p.markInflight(alias, mb.ID)
-		return mb, alias, false, true
+		return mb, alias, false, true, false
 	}
-	return models.Mailbox{}, "", false, false
+	return models.Mailbox{}, "", false, false, cooling
 }
 
 // produceOne 完整生产一个账号：注册 ChatGPT → 保存账号凭据 → 入库。
@@ -496,11 +518,15 @@ func (p *Producer) fissionCount(mb models.Mailbox) int {
 	return count
 }
 
-func (p *Producer) nextFissionEmail(base string) string {
+// nextFissionEmail 取该邮箱下一个可用的裂变别名。
+// 失败(register_failed)的别名会被优先复用重试，而不是每次失败都分配新编号，
+// 避免同一邮箱不断“裂变”出 +012/+018/+056 这类跳号的失败记录。
+// 失败别名处于冷却期内时整个邮箱暂停开新裂变（cooling=true），避免频繁重试触发风控。
+func (p *Producer) nextFissionEmail(base string, cooldown time.Duration) (string, bool) {
 	for i := 1; i <= 999; i++ {
 		email := emailalias.Address(base, fmt.Sprintf("%03d", i))
 		if email == base {
-			return ""
+			return "", false
 		}
 		p.mu.Lock()
 		_, busy := p.inflight[email]
@@ -508,16 +534,39 @@ func (p *Producer) nextFissionEmail(base string) string {
 		if busy {
 			continue
 		}
-		if !p.registrationExists(email) {
-			return email
+		if p.aliasFinalized(email) {
+			continue
 		}
+		if p.failedRecently(email, cooldown) {
+			return "", true // 冷却中：不开新号、也不提前重试，等冷却结束后复用该别名
+		}
+		return email, false
 	}
-	return ""
+	return "", false
 }
 
-func (p *Producer) registrationExists(email string) bool {
+// failedRecently 该地址当前处于 register_failed 且距上次失败不足冷却时间。
+func (p *Producer) failedRecently(email string, cooldown time.Duration) bool {
+	if cooldown <= 0 {
+		return false
+	}
+	var reg models.Registration
+	err := p.db.Select("updated_at").
+		Where("email = ? AND status = ?", email, "register_failed").
+		First(&reg).Error
+	if err != nil {
+		return false
+	}
+	return time.Since(reg.UpdatedAt) < cooldown
+}
+
+// aliasFinalized 该别名是否已终结（注册成功/已被注册/Terms 拒绝），终结的不再复用；
+// register_failed / 遗留的 registering 视为可复用，下一轮重试同一别名。
+func (p *Producer) aliasFinalized(email string) bool {
 	var n int64
-	p.db.Model(&models.Registration{}).Where("email = ?", email).Count(&n)
+	p.db.Model(&models.Registration{}).
+		Where("email = ? AND status IN ?", email, []string{"registered", "already_registered", "register_rejected"}).
+		Count(&n)
 	return n > 0
 }
 
@@ -535,6 +584,11 @@ func (p *Producer) loadConfig() Config {
 	if cfg.FissionCount < 0 {
 		cfg.FissionCount = defaultFissionCount
 	}
+	cooldownMin := atoiDefault(p.getSetting("retry_cooldown_min"), defaultRetryCooldownMin)
+	if cooldownMin < 0 {
+		cooldownMin = 0
+	}
+	cfg.RetryCooldown = time.Duration(cooldownMin) * time.Minute
 	// 代理默认开：未设置(空)视为开，仅显式 "0" 才关闭(直连)。可在设置页开关/编辑。
 	if p.getSetting("proxy_enabled") != "0" {
 		cfg.Proxies = proxyList(p.getSetting("proxy_list"))

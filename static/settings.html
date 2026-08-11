@@ -39,6 +39,14 @@
             <span class="suffix">次</span>
           </div>
         </div>
+        <div class="field">
+          <label>失败重试冷却</label>
+          <span class="field-hint">注册失败后隔多久才重试同一地址，避免频繁重试触发风控（0 = 不冷却）</span>
+          <div class="input-suffix">
+            <input id="set-retry-cooldown" class="px-input" type="number" min="0" max="1440" placeholder="默认 30">
+            <span class="suffix">分钟</span>
+          </div>
+        </div>
         <div class="settings-foot">
           <button class="px-btn primary" onclick="saveSettings()">保存设置</button>
         </div>
@@ -113,6 +121,7 @@ async function loadSettings() {
   const d = await r.json();
   document.getElementById('set-max-concurrency').value = d.max_concurrency || '10';
   document.getElementById('set-fission-count').value = d.fission_count || '5';
+  document.getElementById('set-retry-cooldown').value = d.retry_cooldown_min || '30';
   document.getElementById('set-proxy-enabled').checked = d.proxy_enabled === '1';
   document.getElementById('set-proxy-list').value = d.proxy_list || '';
   updateProxyCount();
@@ -183,6 +192,7 @@ async function saveSettings() {
   const body = {
     max_concurrency: document.getElementById('set-max-concurrency').value.trim(),
     fission_count: document.getElementById('set-fission-count').value.trim(),
+    retry_cooldown_min: document.getElementById('set-retry-cooldown').value.trim(),
   };
   const r = await api('/api/settings', {
     method: 'PUT',
