@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"chatgpt-register/internal/grokoauth"
 	"chatgpt-register/internal/grokreg"
 	"chatgpt-register/internal/mailfetch"
 	"chatgpt-register/internal/models"
@@ -28,6 +29,15 @@ const (
 	// 有头浏览器 + Turnstile 令牌池同时抢 CPU 会互相超时，串行最稳。
 	// 可用设置页「最大并发数」(max_concurrency) 调大。
 	defaultMaxConcurrency = 1
+
+	// defaultRetryCooldownMin 注册失败后重试同一邮箱前的等待分钟数，避免连续重试
+	// 撞风控。可在系统设置 retry_cooldown_min 覆盖，0 = 不冷却。
+	defaultRetryCooldownMin = 30
+
+	// defaultMailboxIntervalMin 同一个母邮箱两次注册之间的最小间隔分钟数：刚注册完
+	// 就接着开下一个裂变，两封验证码邮件容易互相干扰。
+	// 可在系统设置 mailbox_interval_min 覆盖，0 = 不限。
+	defaultMailboxIntervalMin = 5
 )
 
 var (
@@ -44,6 +54,8 @@ type Producer struct {
 	cancel  map[uint]context.CancelFunc
 	active  int // 当前真正在跑（已获得并发槽位）的任务数
 	pxIdx   int
+	// topUpCancel 非空表示补任务循环在跑，StopAll 用它停掉补任务。
+	topUpCancel context.CancelFunc
 }
 
 func New(db *gorm.DB, mail *mailfetch.Client) *Producer {
@@ -96,94 +108,282 @@ func (p *Producer) Start(email, note string) (*models.GrokRegistration, error) {
 	return &reg, nil
 }
 
+// StartFromAccounts 从账号管理 / 邮箱管理取号开工，并在后台补任务：注册失败的邮箱
+// 过了「失败重试冷却」(retry_cooldown_min，默认 30 分钟) 会被重新拿来重试，直到本次
+// 拿到 count 个已注册的账号，或者再也没有可用邮箱。
 func (p *Producer) StartFromAccounts(count int) ([]models.GrokRegistration, error) {
 	if count < 1 {
 		return nil, fmt.Errorf("数量必须 >= 1")
 	}
+	// 首批只按并发数取号，跑完一条再补一条，避免一次把上百个邮箱全标成注册中。
+	started, cooling, err := p.claimTargets(minInt(count, p.maxConcurrency()))
+	if err != nil {
+		return nil, err
+	}
+	if len(started) == 0 {
+		if cooling {
+			return nil, fmt.Errorf("可重试的邮箱都还在失败冷却中，请稍后再试")
+		}
+		return nil, fmt.Errorf("账号管理和邮箱管理里都没有可用于 Grok 注册的账号")
+	}
+	for _, reg := range started {
+		go p.run(reg.ID)
+	}
+	go p.topUp(count, started)
+	return started, nil
+}
+
+// claimTargets 取最多 count 个可注册的邮箱并置为 registering。
+// cooling=true 表示暂时无号可领、但等一会儿会有（失败地址在冷却、或某邮箱刚跑过）。
+func (p *Producer) claimTargets(count int) ([]models.GrokRegistration, bool, error) {
+	cutoff := time.Now().Add(-p.retryCooldown())
+	// 已注册/在跑的邮箱要排除；失败的邮箱过了冷却才允许重试。
+	blocked := p.db.Model(&models.GrokRegistration{}).
+		Select("email").
+		Where("status <> ? OR updated_at > ?", "register_failed", cutoff)
+	// 同一个母邮箱同时只跑一个，且两次注册之间留出间隔：刚注册完就接着开下一个
+	// 裂变，两封验证码邮件挤在一起容易读错/读不到。
+	busyCutoff := time.Now().Add(-p.mailboxInterval())
+	busyMailboxes := p.db.Model(&models.GrokRegistration{}).
+		Select("mailbox_id").
+		Where("mailbox_id <> 0").
+		Where("status IN ? OR updated_at > ?", []string{"registering", "waiting_code"}, busyCutoff)
+
+	started := make([]models.GrokRegistration, 0, count)
+	// 同一批里也要按母邮箱去重：+001/+002 属于同一个邮箱，一起开会撞验证码。
+	claimed := map[uint]bool{}
 	var accounts []models.Registration
 	if err := p.db.
 		Where("status = ? AND mailbox_id <> 0", "registered").
-		Where("email NOT IN (?)",
-			p.db.Model(&models.GrokRegistration{}).Select("email")).
+		Where("email NOT IN (?)", blocked).
+		Where("mailbox_id NOT IN (?)", busyMailboxes).
 		Order("id asc").
-		Limit(count).
+		Limit(count * 20).
 		Find(&accounts).Error; err != nil {
+		return nil, false, err
+	}
+	for _, acc := range accounts {
+		if len(started) >= count {
+			break
+		}
+		if claimed[acc.MailboxID] {
+			continue
+		}
+		reg, err := p.claimOne(acc.Email, acc.MailboxID,
+			fmt.Sprintf("来源: ChatGPT账号 #%d，自动读取验证码", acc.ID))
+		if err != nil {
+			return started, false, err
+		}
+		claimed[acc.MailboxID] = true
+		started = append(started, *reg)
+	}
+	if len(started) < count {
+		var mailboxes []models.Mailbox
+		if err := p.db.
+			Where("status = ?", "verified").
+			Where("email NOT IN (?)", blocked).
+			Where("id NOT IN (?)", busyMailboxes).
+			Order("id asc").
+			Limit(count * 20).
+			Find(&mailboxes).Error; err != nil {
+			return started, false, err
+		}
+		for _, mb := range mailboxes {
+			if len(started) >= count {
+				break
+			}
+			if claimed[mb.ID] {
+				continue
+			}
+			reg, err := p.claimOne(mb.Email, mb.ID,
+				fmt.Sprintf("来源: 邮箱管理 #%d，自动读取验证码", mb.ID))
+			if err != nil {
+				return started, false, err
+			}
+			claimed[mb.ID] = true
+			started = append(started, *reg)
+		}
+	}
+	if len(started) > 0 {
+		return started, false, nil
+	}
+	return started, p.hasCoolingFailure(cutoff) || p.hasBusyMailbox(busyCutoff), nil
+}
+
+// claimOne 把一个邮箱置为 registering：已有记录就复用（重试同一条），否则新建。
+func (p *Producer) claimOne(email string, mailboxID uint, note string) (*models.GrokRegistration, error) {
+	reg := models.GrokRegistration{
+		Email:     email,
+		MailboxID: mailboxID,
+		Password:  grokreg.GenPassword(16),
+		Status:    "registering",
+		Note:      note,
+	}
+	var existing models.GrokRegistration
+	if err := p.db.Where("email = ?", email).First(&existing).Error; err == nil {
+		existing.MailboxID = mailboxID
+		existing.Status = "registering"
+		existing.Shipped = false
+		existing.Password = reg.Password
+		existing.Note = note
+		existing.AuthData = ""
+		existing.Shot = nil
+		if err := p.db.Save(&existing).Error; err != nil {
+			return nil, err
+		}
+		return &existing, nil
+	}
+	if err := p.db.Create(&reg).Error; err != nil {
 		return nil, err
 	}
+	return &reg, nil
+}
 
-	started := make([]models.GrokRegistration, 0, len(accounts))
-	for _, acc := range accounts {
-		reg := models.GrokRegistration{
-			Email:     acc.Email,
-			MailboxID: acc.MailboxID,
-			Password:  grokreg.GenPassword(16),
-			Status:    "registering",
-			Note:      fmt.Sprintf("来源: ChatGPT账号 #%d，自动读取验证码", acc.ID),
-		}
-		var existing models.GrokRegistration
-		if err := p.db.Where("email = ?", acc.Email).First(&existing).Error; err == nil {
-			existing.MailboxID = acc.MailboxID
-			existing.Status = "registering"
-			existing.Shipped = false
-			existing.Password = reg.Password
-			existing.Note = reg.Note
-			existing.AuthData = ""
-			existing.Shot = nil
-			if err := p.db.Save(&existing).Error; err != nil {
-				return started, err
-			}
-			reg = existing
-		} else if err := p.db.Create(&reg).Error; err != nil {
-			return started, err
-		}
-		started = append(started, reg)
-		go p.run(reg.ID)
-	}
-	if len(started) >= count {
-		return started, nil
-	}
+// hasCoolingFailure 是否还有失败邮箱只是没到冷却时间（此时值得等，而不是收工）。
+func (p *Producer) hasCoolingFailure(cutoff time.Time) bool {
+	var n int64
+	p.db.Model(&models.GrokRegistration{}).
+		Where("status = ? AND updated_at > ?", "register_failed", cutoff).
+		Count(&n)
+	return n > 0
+}
 
-	var mailboxes []models.Mailbox
-	if err := p.db.
-		Where("status = ?", "verified").
-		Where("email NOT IN (?)",
-			p.db.Model(&models.GrokRegistration{}).Select("email")).
-		Order("id asc").
-		Limit(count - len(started)).
-		Find(&mailboxes).Error; err != nil {
-		return started, err
+// hasBusyMailbox 是否有邮箱只是刚跑过、等间隔到了就能继续。
+func (p *Producer) hasBusyMailbox(cutoff time.Time) bool {
+	var n int64
+	p.db.Model(&models.GrokRegistration{}).
+		Where("mailbox_id <> 0 AND updated_at > ?", cutoff).
+		Count(&n)
+	return n > 0
+}
+
+// mailboxInterval 同一邮箱两次注册之间的最小间隔，跟设置页 mailbox_interval_min，
+// 0 = 不限。
+func (p *Producer) mailboxInterval() time.Duration {
+	return time.Duration(p.settingInt("mailbox_interval_min", defaultMailboxIntervalMin)) * time.Minute
+}
+
+// retryCooldown 失败地址的重试冷却，跟设置页 retry_cooldown_min，0 = 不冷却。
+func (p *Producer) retryCooldown() time.Duration {
+	return time.Duration(p.settingInt("retry_cooldown_min", defaultRetryCooldownMin)) * time.Minute
+}
+
+// settingInt 读一个非负整型设置，未设置或非法时用默认值。
+func (p *Producer) settingInt(key string, def int) int {
+	raw := strings.TrimSpace(p.getSetting(key))
+	if raw == "" {
+		return def
 	}
-	for _, mb := range mailboxes {
-		reg := models.GrokRegistration{
-			Email:     mb.Email,
-			MailboxID: mb.ID,
-			Password:  grokreg.GenPassword(16),
-			Status:    "registering",
-			Note:      fmt.Sprintf("来源: 邮箱管理 #%d，自动读取验证码", mb.ID),
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
+		return def
+	}
+	return n
+}
+
+// topUp 边跑边补：始终让在跑任务数维持在并发上限，直到本次生产拿到 count 个已注册
+// 账号。失败的邮箱在冷却期内不会被重试，此时循环等待而不是提前收工。
+func (p *Producer) topUp(count int, started []models.GrokRegistration) {
+	ctx, ok := p.beginTopUp()
+	if !ok { // 已有补任务循环在跑，交给它继续
+		return
+	}
+	defer p.endTopUp()
+
+	tracked := make([]uint, 0, count)
+	for _, reg := range started {
+		tracked = append(tracked, reg.ID)
+	}
+	for {
+		if !sleepCtx(ctx, 5*time.Second) {
+			return
 		}
-		var existing models.GrokRegistration
-		if err := p.db.Where("email = ?", mb.Email).First(&existing).Error; err == nil {
-			existing.MailboxID = mb.ID
-			existing.Status = "registering"
-			existing.Shipped = false
-			existing.Password = reg.Password
-			existing.Note = reg.Note
-			existing.AuthData = ""
-			existing.Shot = nil
-			if err := p.db.Save(&existing).Error; err != nil {
-				return started, err
+		running := p.runningNum()
+		remaining := count - p.countRegistered(tracked) - running
+		if remaining <= 0 {
+			if running > 0 {
+				continue // 等在跑的任务出结果，失败了再补
 			}
-			reg = existing
-		} else if err := p.db.Create(&reg).Error; err != nil {
-			return started, err
+			return
 		}
-		started = append(started, reg)
-		go p.run(reg.ID)
+		slots := p.maxConcurrency() - running
+		if slots <= 0 {
+			continue
+		}
+		regs, cooling, err := p.claimTargets(minInt(remaining, slots))
+		if err != nil {
+			return
+		}
+		if len(regs) == 0 {
+			if running > 0 {
+				continue
+			}
+			if cooling && sleepCtx(ctx, 60*time.Second) {
+				continue // 等失败地址过冷却
+			}
+			return
+		}
+		for _, reg := range regs {
+			tracked = append(tracked, reg.ID)
+			go p.run(reg.ID)
+		}
 	}
-	if len(started) == 0 {
-		return nil, fmt.Errorf("账号管理和邮箱管理里都没有可用于 Grok 注册的账号")
+}
+
+// beginTopUp 保证同一时间只有一个补任务循环；返回的 ctx 在 StopAll 时取消。
+func (p *Producer) beginTopUp() (context.Context, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.topUpCancel != nil {
+		return nil, false
 	}
-	return started, nil
+	ctx, cancel := context.WithCancel(context.Background())
+	p.topUpCancel = cancel
+	return ctx, true
+}
+
+func (p *Producer) endTopUp() {
+	p.mu.Lock()
+	if p.topUpCancel != nil {
+		p.topUpCancel()
+		p.topUpCancel = nil
+	}
+	p.mu.Unlock()
+}
+
+func (p *Producer) runningNum() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.cancel)
+}
+
+// countRegistered 本次生产里已经注册成功的数量。
+func (p *Producer) countRegistered(ids []uint) int {
+	if len(ids) == 0 {
+		return 0
+	}
+	var n int64
+	p.db.Model(&models.GrokRegistration{}).
+		Where("id IN ? AND status = ?", ids, "registered").
+		Count(&n)
+	return int(n)
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// sleepCtx 等一段时间；被取消时返回 false。
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(d):
+		return true
+	}
 }
 
 func (p *Producer) SubmitCode(id uint, code string) error {
@@ -215,8 +415,9 @@ func (p *Producer) Stop(id uint) {
 	}
 }
 
-// StopAll 请求停止所有在跑的 Grok 注册任务。
+// StopAll 请求停止所有在跑的 Grok 注册任务，并停掉失败重试的补任务循环。
 func (p *Producer) StopAll() {
+	p.endTopUp()
 	p.mu.Lock()
 	cancels := make([]context.CancelFunc, 0, len(p.cancel))
 	for _, cancel := range p.cancel {
@@ -241,6 +442,7 @@ type Progress struct {
 func (p *Producer) Snapshot() Progress {
 	p.mu.Lock()
 	runningNum := len(p.cancel)
+	topUp := p.topUpCancel != nil
 	p.mu.Unlock()
 
 	count := func(statuses ...string) int {
@@ -249,12 +451,37 @@ func (p *Producer) Snapshot() Progress {
 		return int(n)
 	}
 	return Progress{
-		Running:    runningNum > 0,
-		Pending:    count("pending"),
+		Running:    runningNum > 0 || topUp,
+		Pending:    p.pendingCount(),
 		RunningNum: runningNum,
 		Registered: count("registered"),
 		Failed:     count("register_failed"),
 	}
+}
+
+// pendingCount 还能取多少个号：账号管理 + 邮箱管理里尚未注册（或已过失败冷却）的
+// 邮箱数。这两个生产流程直接把记录置为 registering，不写 pending 状态，所以待生产
+// 不能按记录状态统计。
+func (p *Producer) pendingCount() int {
+	blocked := p.db.Model(&models.GrokRegistration{}).
+		Select("email").
+		Where("status <> ? OR updated_at > ?", "register_failed", time.Now().Add(-p.retryCooldown()))
+
+	emails := map[string]struct{}{}
+	var accountEmails []string
+	p.db.Model(&models.Registration{}).
+		Where("status = ? AND mailbox_id <> 0", "registered").
+		Where("email NOT IN (?)", blocked).
+		Pluck("email", &accountEmails)
+	var mailboxEmails []string
+	p.db.Model(&models.Mailbox{}).
+		Where("status = ?", "verified").
+		Where("email NOT IN (?)", blocked).
+		Pluck("email", &mailboxEmails)
+	for _, e := range append(accountEmails, mailboxEmails...) {
+		emails[e] = struct{}{}
+	}
+	return len(emails)
 }
 
 func (p *Producer) run(id uint) {
@@ -328,12 +555,35 @@ func (p *Producer) run(id uint) {
 		return
 	}
 
+	p.mintOAuth(ctx, id, in.Proxy, reg.Email, res.AuthJSON)
+
 	authBytes, _ := json.MarshalIndent(res.AuthJSON, "", "  ")
 	p.appendLog(id, "Grok 注册成功")
 	p.db.Model(&models.GrokRegistration{}).Where("id = ?", id).Updates(map[string]any{
 		"status":    "registered",
 		"auth_data": string(authBytes),
 	})
+}
+
+// mintOAuth 注册成功后立刻用 sso 换一份 xAI Build OAuth 令牌，写进 auth JSON 的 oauth
+// 字段：Sub2API 与 CPA 都只认 OAuth 令牌，趁注册用的代理和出口还在换成功率最高，
+// 导出时也就不用再等。换不到只记日志，不影响注册结果（导出时还会补换）。
+func (p *Producer) mintOAuth(ctx context.Context, id uint, proxy, email string, auth map[string]any) {
+	if auth == nil {
+		return
+	}
+	sso := grokoauth.SSOFromAuth(auth)
+	if sso == "" {
+		return
+	}
+	p.appendLog(id, "正在换取 Grok OAuth 令牌（Sub2API / CPA 导出用）")
+	info, err := grokoauth.ConvertSSO(ctx, proxy, sso)
+	if err != nil {
+		p.appendLog(id, "换取 OAuth 令牌失败，导出时会重试: "+err.Error())
+		return
+	}
+	auth["oauth"] = grokoauth.Credentials(info, email)
+	p.appendLog(id, "已换取 Grok OAuth 令牌")
 }
 
 func (p *Producer) waitManualCode(ctx context.Context, id uint) (string, error) {

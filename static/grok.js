@@ -48,7 +48,9 @@ function rowHtml(x) {
         <button class="icon-btn" title="下载 Console" ${canDownload ? '' : 'disabled'} onclick="downloadGrok(${x.id}, 'console')">
           <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/></svg>
         </button>
+        <button class="icon-btn" title="下载 grok2api" ${canDownload ? '' : 'disabled'} onclick="downloadGrok(${x.id}, 'grok2api')" style="font-size:10px;font-weight:700">G2A</button>
         <button class="icon-btn" title="下载 Sub2API" ${canDownload ? '' : 'disabled'} onclick="downloadGrok(${x.id}, 'sub2api')" style="font-size:10px;font-weight:700">Sub</button>
+        <button class="icon-btn" title="下载 CPA（CLIProxyAPI xAI 凭证）" ${canDownload ? '' : 'disabled'} onclick="downloadGrok(${x.id}, 'cpa')" style="font-size:10px;font-weight:700">CPA</button>
         <button class="icon-btn danger" title="删除" onclick="del(${x.id})">
           <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2m2 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M10 11v6M14 11v6"/></svg>
         </button>
@@ -134,7 +136,14 @@ function syncBatchBar() {
   all.checked = ids.length > 0 && ids.every(id => grokSelected.has(id));
 }
 
-/* ===== 下载（Console 账号导入 JSON / Sub2API sso 池 JSON；下载即出库） ===== */
+/* ===== 下载（Console 账号导入 JSON / grok2api sso 池 JSON /
+   Sub2API 账号备份 JSON / CPA xAI 凭证；下载即出库） ===== */
+const GROK_EXPORT_FILES = {
+  console: 'grok_console_token.json',
+  grok2api: 'grok2api_token.json',
+  sub2api: 'grok-sub2api.json',
+  cpa: 'grok-cpa-xai.zip',
+};
 async function downloadGrok(id, format) {
   await downloadByIds([id], format);
 }
@@ -148,6 +157,7 @@ async function downloadUnshipped(format) {
   await downloadByIds([], format, true);
 }
 async function downloadByIds(ids, format, unshippedOnly) {
+  if (format === 'sub2api' || format === 'cpa') toast('导出中，旧账号需要现场补换 OAuth 令牌，请稍候…');
   const r = await api('/api/grok/download', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -162,9 +172,11 @@ async function downloadByIds(ids, format, unshippedOnly) {
   const match = disposition.match(/filename="?([^";]+)"?/i);
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = match ? match[1] : (format === 'sub2api' ? 'grok2api_token.json' : 'grok_console_token.json');
+  a.download = match ? match[1] : (GROK_EXPORT_FILES[format] || 'grok_console_token.json');
   a.click();
   URL.revokeObjectURL(a.href);
+  const skipped = parseInt(r.headers.get('X-Export-Skipped') || '0', 10);
+  if (skipped > 0) toast(skipped + ' 个账号未能换到 OAuth 令牌，已跳过', true);
   load();
 }
 

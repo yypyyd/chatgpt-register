@@ -41,7 +41,9 @@
         </button>
         <div class="px-select-menu">
           <button type="button" class="px-select-opt" onclick="downloadUnshipped('console')">Console</button>
+          <button type="button" class="px-select-opt" onclick="downloadUnshipped('grok2api')">grok2api</button>
           <button type="button" class="px-select-opt" onclick="downloadUnshipped('sub2api')">Sub2API</button>
+          <button type="button" class="px-select-opt" onclick="downloadUnshipped('cpa')">CPA</button>
         </div>
       </div>
       <button class="px-btn" onclick="liveCheckAll()">测活</button>
@@ -52,7 +54,9 @@
     <div class="batch-bar" id="grok-batch" style="display:none">
       <span id="grok-batch-count">已选 0 项</span>
       <button class="px-btn" onclick="downloadSelected('console')">导出 Console</button>
+      <button class="px-btn" onclick="downloadSelected('grok2api')">导出 grok2api</button>
       <button class="px-btn" onclick="downloadSelected('sub2api')">导出 Sub2API</button>
+      <button class="px-btn" onclick="downloadSelected('cpa')">导出 CPA</button>
       <button class="px-btn" onclick="liveCheckSelected()">测活所选</button>
       <button class="px-btn danger" onclick="delSelected()">删除所选</button>
       <button class="px-btn ghost" onclick="clearSelection()">取消</button>

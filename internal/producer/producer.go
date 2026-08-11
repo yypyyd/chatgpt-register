@@ -35,6 +35,10 @@ const (
 	// 注册失败后的重试冷却（分钟），避免短时间内反复重试触发风控。
 	// 可在系统设置 retry_cooldown_min 覆盖，0 = 不冷却。
 	defaultRetryCooldownMin = 30
+	// 同一个邮箱两次注册之间的最小间隔（分钟）：刚注册完就接着开下一个裂变，
+	// 两封验证码邮件挤在一起容易读错/读不到。可在系统设置 mailbox_interval_min
+	// 覆盖，0 = 不限。
+	defaultMailboxIntervalMin = 5
 	codePollTimeout       = 3 * time.Minute
 	codePollInterval      = 5 * time.Second
 	maxLogLines           = 300
@@ -50,6 +54,8 @@ type Config struct {
 	Headless       bool
 	Proxies        []string      // 代理池，按账户轮转；空=直连
 	RetryCooldown  time.Duration // 失败地址的重试冷却时间
+	// MailboxInterval 同一邮箱两次注册之间的最小间隔，避免验证码邮件互相干扰
+	MailboxInterval time.Duration
 }
 
 // Progress 生产进度快照，供 /api/produce/status 展示。
@@ -248,6 +254,10 @@ func (p *Producer) nextJob(cfg Config) (models.Mailbox, string, bool, bool, bool
 		if p.mailboxBusy(mb.ID) {
 			continue
 		}
+		if p.mailboxUsedRecently(mb.ID, cfg.MailboxInterval) {
+			cooling = true // 该邮箱刚跑过，等间隔到了再开下一个
+			continue
+		}
 		if !p.isRegistered(mb.Email) {
 			if p.failedRecently(mb.Email, cfg.RetryCooldown) {
 				cooling = true // 母号刚失败过，冷却期内不重试
@@ -261,6 +271,10 @@ func (p *Producer) nextJob(cfg Config) (models.Mailbox, string, bool, bool, bool
 	// Pass 2：母号已成功、该邮箱空闲、裂变未满 → 注册一个新的别名子号
 	for _, mb := range mailboxes {
 		if p.mailboxBusy(mb.ID) {
+			continue
+		}
+		if p.mailboxUsedRecently(mb.ID, cfg.MailboxInterval) {
+			cooling = true
 			continue
 		}
 		if !p.isRegistered(mb.Email) {
@@ -545,6 +559,19 @@ func (p *Producer) nextFissionEmail(base string, cooldown time.Duration) (string
 	return "", false
 }
 
+// mailboxUsedRecently 该邮箱最近一次注册（成功或失败）距今不足间隔时间。
+// 刚注册完就接着开同一邮箱的下一个裂变，两封验证码邮件容易互相干扰。
+func (p *Producer) mailboxUsedRecently(mbID uint, interval time.Duration) bool {
+	if interval <= 0 {
+		return false
+	}
+	var n int64
+	p.db.Model(&models.Registration{}).
+		Where("mailbox_id = ? AND updated_at > ?", mbID, time.Now().Add(-interval)).
+		Count(&n)
+	return n > 0
+}
+
 // failedRecently 该地址当前处于 register_failed 且距上次失败不足冷却时间。
 func (p *Producer) failedRecently(email string, cooldown time.Duration) bool {
 	if cooldown <= 0 {
@@ -589,6 +616,11 @@ func (p *Producer) loadConfig() Config {
 		cooldownMin = 0
 	}
 	cfg.RetryCooldown = time.Duration(cooldownMin) * time.Minute
+	intervalMin := atoiDefault(p.getSetting("mailbox_interval_min"), defaultMailboxIntervalMin)
+	if intervalMin < 0 {
+		intervalMin = 0
+	}
+	cfg.MailboxInterval = time.Duration(intervalMin) * time.Minute
 	// 代理默认开：未设置(空)视为开，仅显式 "0" 才关闭(直连)。可在设置页开关/编辑。
 	if p.getSetting("proxy_enabled") != "0" {
 		cfg.Proxies = proxyList(p.getSetting("proxy_list"))

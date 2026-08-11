@@ -30,6 +30,10 @@ const (
 	// 有头浏览器同时抢 CPU 会互相超时，串行最稳。
 	// 可用设置页「最大并发数」(max_concurrency) 调大。
 	defaultMaxConcurrency = 1
+
+	// defaultRetryCooldownMin 注册失败后重试同一邮箱前的等待分钟数，避免连续重试
+	// 撞风控。可在系统设置 retry_cooldown_min 覆盖，0 = 不冷却。
+	defaultRetryCooldownMin = 30
 )
 
 var digitCodeRe = regexp.MustCompile(`\b(\d{6})\b`)
@@ -43,6 +47,8 @@ type Producer struct {
 	cancel  map[uint]context.CancelFunc
 	active  int
 	pxIdx   int
+	// topUpCancel 非空表示补任务循环在跑，StopAll 用它停掉补任务。
+	topUpCancel context.CancelFunc
 }
 
 func New(db *gorm.DB, mail *mailfetch.Client) *Producer {
@@ -96,82 +102,241 @@ func (p *Producer) Start(email, note string) (*models.AdobeRegistration, error) 
 	return &reg, nil
 }
 
+// StartFromAccounts 从账号管理 / 邮箱管理取号开工，并在后台补任务：注册失败的邮箱
+// 过了「失败重试冷却」(retry_cooldown_min，默认 30 分钟) 会被重新拿来重试，直到本次
+// 拿到 count 个已注册的账号，或者再也没有可用邮箱。
 func (p *Producer) StartFromAccounts(count int) ([]models.AdobeRegistration, error) {
 	if count < 1 {
 		return nil, fmt.Errorf("数量必须 >= 1")
 	}
-	started := make([]models.AdobeRegistration, 0, count)
-
-	upsert := func(email string, mailboxID uint, note string) error {
-		reg := models.AdobeRegistration{
-			Email:     email,
-			MailboxID: mailboxID,
-			Product:   "firefly",
-			Password:  adobereg.GenPassword(16),
-			Status:    "registering",
-			Note:      note,
-		}
-		var existing models.AdobeRegistration
-		if err := p.db.Where("email = ?", email).First(&existing).Error; err == nil {
-			existing.MailboxID = mailboxID
-			existing.Product = "firefly"
-			existing.Status = "registering"
-			existing.Shipped = false
-			existing.Password = reg.Password
-			existing.Note = note
-			existing.AuthData = ""
-			existing.Shot = nil
-			if err := p.db.Save(&existing).Error; err != nil {
-				return err
-			}
-			reg = existing
-		} else if err := p.db.Create(&reg).Error; err != nil {
-			return err
-		}
-		started = append(started, reg)
-		go p.run(reg.ID)
-		return nil
+	// 首批只按并发数取号，跑完一条再补一条，避免一次把上百个邮箱全标成注册中。
+	started, cooling, err := p.claimTargets(minInt(count, p.maxConcurrency()))
+	if err != nil {
+		return nil, err
 	}
+	if len(started) == 0 {
+		if cooling {
+			return nil, fmt.Errorf("可重试的邮箱都还在失败冷却中，请稍后再试")
+		}
+		return nil, fmt.Errorf("账号管理和邮箱管理里都没有可用于 Adobe 注册的账号")
+	}
+	for _, reg := range started {
+		go p.run(reg.ID)
+	}
+	go p.topUp(count, started)
+	return started, nil
+}
 
+// claimTargets 取最多 count 个可注册的邮箱并置为 registering。
+// cooling=true 表示还有失败邮箱可重试、只是没到冷却时间。
+func (p *Producer) claimTargets(count int) ([]models.AdobeRegistration, bool, error) {
+	cutoff := time.Now().Add(-p.retryCooldown())
+	// 已注册/在跑的邮箱要排除；失败的邮箱过了冷却才允许重试。
+	blocked := p.db.Model(&models.AdobeRegistration{}).
+		Select("email").
+		Where("status <> ? OR updated_at > ?", "register_failed", cutoff)
+
+	started := make([]models.AdobeRegistration, 0, count)
 	// 优先用已注册 ChatGPT 账号（其邮箱已在邮箱池且可读验证码）。
 	// 只取母号：裂变号是 +别名 邮箱，Adobe 视作同一邮箱，不能用来注册。
 	var accounts []models.Registration
 	if err := p.db.
 		Where("status = ? AND mailbox_id <> 0 AND is_mother = ?", "registered", true).
-		Where("email NOT IN (?)", p.db.Model(&models.AdobeRegistration{}).Select("email")).
+		Where("email NOT IN (?)", blocked).
 		Order("id asc").
 		Limit(count).
 		Find(&accounts).Error; err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	for _, acc := range accounts {
-		if err := upsert(acc.Email, acc.MailboxID, fmt.Sprintf("来源: ChatGPT账号 #%d，自动读取验证码", acc.ID)); err != nil {
-			return started, err
+		reg, err := p.claimOne(acc.Email, acc.MailboxID,
+			fmt.Sprintf("来源: ChatGPT账号 #%d，自动读取验证码", acc.ID))
+		if err != nil {
+			return started, false, err
 		}
+		started = append(started, *reg)
 	}
-
 	// 不足则从已验证邮箱池补齐。
 	if len(started) < count {
 		var mailboxes []models.Mailbox
 		if err := p.db.
 			Where("status = ?", "verified").
-			Where("email NOT IN (?)", p.db.Model(&models.AdobeRegistration{}).Select("email")).
+			Where("email NOT IN (?)", blocked).
 			Order("id asc").
 			Limit(count - len(started)).
 			Find(&mailboxes).Error; err != nil {
-			return started, err
+			return started, false, err
 		}
 		for _, mb := range mailboxes {
-			if err := upsert(mb.Email, mb.ID, fmt.Sprintf("来源: 邮箱管理 #%d，自动读取验证码", mb.ID)); err != nil {
-				return started, err
+			reg, err := p.claimOne(mb.Email, mb.ID,
+				fmt.Sprintf("来源: 邮箱管理 #%d，自动读取验证码", mb.ID))
+			if err != nil {
+				return started, false, err
 			}
+			started = append(started, *reg)
 		}
 	}
-
-	if len(started) == 0 {
-		return nil, fmt.Errorf("账号管理和邮箱管理里都没有可用于 Adobe 注册的账号")
+	if len(started) > 0 {
+		return started, false, nil
 	}
-	return started, nil
+	return started, p.hasCoolingFailure(cutoff), nil
+}
+
+// claimOne 把一个邮箱置为 registering：已有记录就复用（重试同一条），否则新建。
+func (p *Producer) claimOne(email string, mailboxID uint, note string) (*models.AdobeRegistration, error) {
+	reg := models.AdobeRegistration{
+		Email:     email,
+		MailboxID: mailboxID,
+		Product:   "firefly",
+		Password:  adobereg.GenPassword(16),
+		Status:    "registering",
+		Note:      note,
+	}
+	var existing models.AdobeRegistration
+	if err := p.db.Where("email = ?", email).First(&existing).Error; err == nil {
+		existing.MailboxID = mailboxID
+		existing.Product = "firefly"
+		existing.Status = "registering"
+		existing.Shipped = false
+		existing.Password = reg.Password
+		existing.Note = note
+		existing.AuthData = ""
+		existing.Shot = nil
+		if err := p.db.Save(&existing).Error; err != nil {
+			return nil, err
+		}
+		return &existing, nil
+	}
+	if err := p.db.Create(&reg).Error; err != nil {
+		return nil, err
+	}
+	return &reg, nil
+}
+
+// hasCoolingFailure 是否还有失败邮箱只是没到冷却时间（此时值得等，而不是收工）。
+func (p *Producer) hasCoolingFailure(cutoff time.Time) bool {
+	var n int64
+	p.db.Model(&models.AdobeRegistration{}).
+		Where("status = ? AND updated_at > ?", "register_failed", cutoff).
+		Count(&n)
+	return n > 0
+}
+
+// retryCooldown 失败地址的重试冷却，跟设置页 retry_cooldown_min，0 = 不冷却。
+func (p *Producer) retryCooldown() time.Duration {
+	raw := strings.TrimSpace(p.getSetting("retry_cooldown_min"))
+	min := defaultRetryCooldownMin
+	if raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n >= 0 {
+			min = n
+		}
+	}
+	return time.Duration(min) * time.Minute
+}
+
+// topUp 边跑边补：始终让在跑任务数维持在并发上限，直到本次生产拿到 count 个已注册
+// 账号。失败的邮箱在冷却期内不会被重试，此时循环等待而不是提前收工。
+func (p *Producer) topUp(count int, started []models.AdobeRegistration) {
+	ctx, ok := p.beginTopUp()
+	if !ok { // 已有补任务循环在跑，交给它继续
+		return
+	}
+	defer p.endTopUp()
+
+	tracked := make([]uint, 0, count)
+	for _, reg := range started {
+		tracked = append(tracked, reg.ID)
+	}
+	for {
+		if !sleepCtx(ctx, 5*time.Second) {
+			return
+		}
+		running := p.runningNum()
+		remaining := count - p.countRegistered(tracked) - running
+		if remaining <= 0 {
+			if running > 0 {
+				continue // 等在跑的任务出结果，失败了再补
+			}
+			return
+		}
+		slots := p.maxConcurrency() - running
+		if slots <= 0 {
+			continue
+		}
+		regs, cooling, err := p.claimTargets(minInt(remaining, slots))
+		if err != nil {
+			return
+		}
+		if len(regs) == 0 {
+			if running > 0 {
+				continue
+			}
+			if cooling && sleepCtx(ctx, 60*time.Second) {
+				continue // 等失败地址过冷却
+			}
+			return
+		}
+		for _, reg := range regs {
+			tracked = append(tracked, reg.ID)
+			go p.run(reg.ID)
+		}
+	}
+}
+
+// beginTopUp 保证同一时间只有一个补任务循环；返回的 ctx 在 StopAll 时取消。
+func (p *Producer) beginTopUp() (context.Context, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.topUpCancel != nil {
+		return nil, false
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	p.topUpCancel = cancel
+	return ctx, true
+}
+
+func (p *Producer) endTopUp() {
+	p.mu.Lock()
+	if p.topUpCancel != nil {
+		p.topUpCancel()
+		p.topUpCancel = nil
+	}
+	p.mu.Unlock()
+}
+
+func (p *Producer) runningNum() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.cancel)
+}
+
+// countRegistered 本次生产里已经注册成功的数量。
+func (p *Producer) countRegistered(ids []uint) int {
+	if len(ids) == 0 {
+		return 0
+	}
+	var n int64
+	p.db.Model(&models.AdobeRegistration{}).
+		Where("id IN ? AND status = ?", ids, "registered").
+		Count(&n)
+	return int(n)
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// sleepCtx 等一段时间；被取消时返回 false。
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(d):
+		return true
+	}
 }
 
 func (p *Producer) SubmitCode(id uint, code string) error {
@@ -203,7 +368,9 @@ func (p *Producer) Stop(id uint) {
 	}
 }
 
+// StopAll 请求停止所有在跑的 Adobe 注册任务，并停掉失败重试的补任务循环。
 func (p *Producer) StopAll() {
+	p.endTopUp()
 	p.mu.Lock()
 	cancels := make([]context.CancelFunc, 0, len(p.cancel))
 	for _, cancel := range p.cancel {
@@ -227,6 +394,7 @@ type Progress struct {
 func (p *Producer) Snapshot() Progress {
 	p.mu.Lock()
 	runningNum := len(p.cancel)
+	topUp := p.topUpCancel != nil
 	p.mu.Unlock()
 
 	count := func(statuses ...string) int {
@@ -235,12 +403,37 @@ func (p *Producer) Snapshot() Progress {
 		return int(n)
 	}
 	return Progress{
-		Running:    runningNum > 0,
-		Pending:    count("pending"),
+		Running:    runningNum > 0 || topUp,
+		Pending:    p.pendingCount(),
 		RunningNum: runningNum,
 		Registered: count("registered"),
 		Failed:     count("register_failed"),
 	}
+}
+
+// pendingCount 还能取多少个号：账号管理 + 邮箱管理里尚未注册（或已过失败冷却）的
+// 邮箱数。这两个生产流程直接把记录置为 registering，不写 pending 状态，所以待生产
+// 不能按记录状态统计。
+func (p *Producer) pendingCount() int {
+	blocked := p.db.Model(&models.AdobeRegistration{}).
+		Select("email").
+		Where("status <> ? OR updated_at > ?", "register_failed", time.Now().Add(-p.retryCooldown()))
+
+	emails := map[string]struct{}{}
+	var accountEmails []string
+	p.db.Model(&models.Registration{}).
+		Where("status = ? AND mailbox_id <> 0 AND is_mother = ?", "registered", true).
+		Where("email NOT IN (?)", blocked).
+		Pluck("email", &accountEmails)
+	var mailboxEmails []string
+	p.db.Model(&models.Mailbox{}).
+		Where("status = ?", "verified").
+		Where("email NOT IN (?)", blocked).
+		Pluck("email", &mailboxEmails)
+	for _, e := range append(accountEmails, mailboxEmails...) {
+		emails[e] = struct{}{}
+	}
+	return len(emails)
 }
 
 func (p *Producer) run(id uint) {

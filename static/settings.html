@@ -47,6 +47,14 @@
             <span class="suffix">分钟</span>
           </div>
         </div>
+        <div class="field">
+          <label>同邮箱间隔</label>
+          <span class="field-hint">同一个母邮箱两次注册之间至少隔多久，避免验证码邮件互相干扰（0 = 不限）</span>
+          <div class="input-suffix">
+            <input id="set-mailbox-interval" class="px-input" type="number" min="0" max="1440" placeholder="默认 5">
+            <span class="suffix">分钟</span>
+          </div>
+        </div>
         <div class="settings-foot">
           <button class="px-btn primary" onclick="saveSettings()">保存设置</button>
         </div>
@@ -122,6 +130,7 @@ async function loadSettings() {
   document.getElementById('set-max-concurrency').value = d.max_concurrency || '10';
   document.getElementById('set-fission-count').value = d.fission_count || '5';
   document.getElementById('set-retry-cooldown').value = d.retry_cooldown_min || '30';
+  document.getElementById('set-mailbox-interval').value = d.mailbox_interval_min || '5';
   document.getElementById('set-proxy-enabled').checked = d.proxy_enabled === '1';
   document.getElementById('set-proxy-list').value = d.proxy_list || '';
   updateProxyCount();
@@ -193,6 +202,7 @@ async function saveSettings() {
     max_concurrency: document.getElementById('set-max-concurrency').value.trim(),
     fission_count: document.getElementById('set-fission-count').value.trim(),
     retry_cooldown_min: document.getElementById('set-retry-cooldown').value.trim(),
+    mailbox_interval_min: document.getElementById('set-mailbox-interval').value.trim(),
   };
   const r = await api('/api/settings', {
     method: 'PUT',
