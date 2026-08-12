@@ -92,6 +92,31 @@
 
       <div class="px-panel settings-card">
         <div class="settings-head">
+          <span class="settings-icon violet">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11V7a3 3 0 0 1 6 0v4"/><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M12 15v2"/></svg>
+          </span>
+          <div>
+            <h2>打码服务</h2>
+            <p>注册时弹出图形验证（hCaptcha）自动打码</p>
+          </div>
+        </div>
+        <label class="switch-row">
+          <input id="set-captcha-enabled" type="checkbox">
+          <span class="switch-ui"></span>
+          <span class="switch-label">启用 2Captcha 打码</span>
+        </label>
+        <div class="field">
+          <label>2Captcha API Key</label>
+          <span class="field-hint">在 2captcha.com 后台获取；未启用或未填写时，弹出图形验证仍按注册失败处理</span>
+          <input id="set-captcha-key" class="px-input" type="text" spellcheck="false" autocomplete="off" placeholder="32 位 key">
+        </div>
+        <div class="settings-foot">
+          <button class="px-btn primary" onclick="saveCaptcha()">保存打码配置</button>
+        </div>
+      </div>
+
+      <div class="px-panel settings-card">
+        <div class="settings-head">
           <span class="settings-icon amber">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
           </span>
@@ -133,6 +158,8 @@ async function loadSettings() {
   document.getElementById('set-mailbox-interval').value = d.mailbox_interval_min || '5';
   document.getElementById('set-proxy-enabled').checked = d.proxy_enabled === '1';
   document.getElementById('set-proxy-list').value = d.proxy_list || '';
+  document.getElementById('set-captcha-enabled').checked = d.captcha_enabled === '1';
+  document.getElementById('set-captcha-key').value = d.captcha_2captcha_key || '';
   updateProxyCount();
 }
 
@@ -195,6 +222,20 @@ async function saveProxy() {
   });
   if (!r.ok) return toast('保存失败', true);
   toast('代理配置已保存');
+}
+
+async function saveCaptcha() {
+  const body = {
+    captcha_enabled: document.getElementById('set-captcha-enabled').checked ? '1' : '0',
+    captcha_2captcha_key: document.getElementById('set-captcha-key').value.trim(),
+  };
+  const r = await api('/api/settings', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) return toast('保存失败', true);
+  toast('打码配置已保存');
 }
 
 async function saveSettings() {

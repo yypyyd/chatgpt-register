@@ -30,6 +30,9 @@ const (
 	adobeTokenURL = "https://adobeid-na1.services.adobe.com/ims/check/v6/token?jslVersion=v2-v0.48.0-1-g1e322cb"
 	adobeClientID = "clio-playground-web"
 	adobeScope    = "AdobeID,firefly_api,openid,pps.read,pps.write,additional_info.projectedProductContext,additional_info.ownerOrg,uds_read,uds_write,ab.manage,read_organizations,additional_info.roles,account_cluster.read,creative_production,profile"
+
+	// stuckReloadAfter 登录页卡住（只转圈、没渲染出创建账号入口）多久后重新加载页面。
+	stuckReloadAfter = 25 * time.Second
 )
 
 // launchAdobeBrowser 按注册用的一整套反爬/代理配置启动并连接 Adobe 专用 Chromium。
@@ -549,8 +552,11 @@ func gotoStable(ctx context.Context, page *rod.Page, target string, in Input, ti
 }
 
 // gotoCreateForm 从登录页进入「创建账号」表单（同时出现邮箱与密码输入框）。
+// 登录页是 SPA，代理慢时偶发一直转圈、什么都不渲染；卡住就重新加载页面重试，
+// 而不是干等到超时判失败（同一个号第二次点生产往往就过，就是这个原因）。
 func gotoCreateForm(ctx context.Context, page *rod.Page, in Input) error {
 	deadline := time.Now().Add(90 * time.Second)
+	nextReload := time.Now().Add(stuckReloadAfter)
 	for time.Now().Before(deadline) {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -558,6 +564,12 @@ func gotoCreateForm(ctx context.Context, page *rod.Page, in Input) error {
 		if hasSel(page, `input[name="username"]`) && hasSel(page, `input[name="password"]`) {
 			in.logf("已进入创建账号表单")
 			return nil
+		}
+		if time.Now().After(nextReload) {
+			in.logf("登录页仍未渲染出创建账号入口，重新加载后再试")
+			_ = gotoStable(ctx, page, signInURL, in, 45*time.Second)
+			nextReload = time.Now().Add(stuckReloadAfter)
+			continue
 		}
 		clickByText(page, `a,span,button`, `create an account`)
 		time.Sleep(300 * time.Millisecond)
@@ -685,11 +697,94 @@ func fillStep2(ctx context.Context, page *rod.Page, in Input) error {
 
 // errCaptchaPuzzle 表示 Adobe 弹出了 hCaptcha 图形验证（同一出口 IP 注册过多触发），
 // 刷新页面无法消除，直接失败并提示换 IP 比反复重试更省时间。
-var errCaptchaPuzzle = errors.New("触发 Adobe 图形验证（同 IP 注册过多），建议开启代理 proxy_enabled=1 或降低注册频率")
+var errCaptchaPuzzle = errors.New("触发 Adobe 图形验证（同 IP 注册过多），建议开启 2Captcha 打码、开启代理 proxy_enabled=1 或降低注册频率")
 
 // onCaptchaPuzzle 检测 hCaptcha 验证弹窗（"Please solve a few puzzles"）。
 func onCaptchaPuzzle(page *rod.Page) bool {
 	return hasSel(page, `iframe[src*="hcaptcha.com"]`)
+}
+
+// maxCaptchaSolves 单次提交里最多打码几次，避免反复失败白烧打码额度。
+const maxCaptchaSolves = 2
+
+// solveCaptcha 调打码服务解掉页面上的 hCaptcha，并把 token 回填进页面。
+func solveCaptcha(ctx context.Context, page *rod.Page, in Input) error {
+	sitekey, rqdata := hcaptchaInfo(page)
+	if sitekey == "" {
+		return fmt.Errorf("未取到 hCaptcha sitekey")
+	}
+	in.logf("检测到 hCaptcha（sitekey=%s），提交打码服务", trimText(sitekey, 40))
+	token, err := in.Captcha.SolveHCaptcha(ctx, sitekey, pageURL(page), rqdata, userAgent)
+	if err != nil {
+		return err
+	}
+	if err := injectHCaptchaToken(page, token); err != nil {
+		return fmt.Errorf("回填打码结果失败: %w", err)
+	}
+	in.logf("打码成功，已回填 token 并继续提交")
+	return nil
+}
+
+// hcaptchaInfo 从 hCaptcha iframe 的 URL（参数可能在 query 或 hash 里）取 sitekey 与
+// enterprise 版的 rqdata；取不到 iframe 时退回读 data-sitekey 属性。
+func hcaptchaInfo(page *rod.Page) (sitekey, rqdata string) {
+	res, err := page.Eval(`() => {
+		const pick = (raw) => {
+			const p = new URLSearchParams(raw.replace(/^[?#]/, ''));
+			return { sitekey: p.get('sitekey') || '', rqdata: p.get('rqdata') || '' };
+		};
+		for (const f of document.querySelectorAll('iframe[src*="hcaptcha.com"]')) {
+			try {
+				const u = new URL(f.src);
+				const a = pick(u.search), b = pick(u.hash);
+				const sk = a.sitekey || b.sitekey;
+				if (sk) return JSON.stringify({ sitekey: sk, rqdata: a.rqdata || b.rqdata });
+			} catch (e) {}
+		}
+		const el = document.querySelector('[data-sitekey]');
+		if (el) return JSON.stringify({ sitekey: el.getAttribute('data-sitekey'), rqdata: '' });
+		return '';
+	}`)
+	if err != nil || res == nil {
+		return "", ""
+	}
+	var info struct {
+		Sitekey string `json:"sitekey"`
+		Rqdata  string `json:"rqdata"`
+	}
+	if json.Unmarshal([]byte(res.Value.Str()), &info) != nil {
+		return "", ""
+	}
+	return info.Sitekey, info.Rqdata
+}
+
+// injectHCaptchaToken 把打码拿到的 token 写进 h-captcha-response 隐藏域并触发
+// 页面注册的 data-callback，让表单认为验证已通过。
+func injectHCaptchaToken(page *rod.Page, token string) error {
+	_, err := page.Eval(`(token) => {
+		const setVal = (el) => {
+			el.value = token;
+			el.dispatchEvent(new Event('input', { bubbles: true }));
+			el.dispatchEvent(new Event('change', { bubbles: true }));
+		};
+		const sel = 'textarea[name="h-captcha-response"],input[name="h-captcha-response"],textarea[name="g-recaptcha-response"]';
+		const fields = document.querySelectorAll(sel);
+		fields.forEach(setVal);
+		if (!fields.length) {
+			const ta = document.createElement('textarea');
+			ta.name = 'h-captcha-response';
+			ta.style.display = 'none';
+			(document.querySelector('form') || document.body).appendChild(ta);
+			setVal(ta);
+		}
+		const holder = document.querySelector('[data-callback]');
+		const cb = holder && holder.getAttribute('data-callback');
+		if (cb && typeof window[cb] === 'function') {
+			try { window[cb](token); } catch (e) {}
+		}
+		return fields.length;
+	}`, token)
+	return err
 }
 
 // submitAndAdvance 点击当前表单主 CTA（Continue / Create account）并确认页面
@@ -697,6 +792,7 @@ func onCaptchaPuzzle(page *rod.Page) bool {
 // 点击不生效，因此等按钮可点后点击，未推进则重试。
 func submitAndAdvance(ctx context.Context, page *rod.Page, in Input, advanced func() bool, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
+	solves := 0
 	for time.Now().Before(deadline) {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -713,7 +809,15 @@ func submitAndAdvance(ctx context.Context, page *rod.Page, in Input, advanced fu
 			time.Sleep(250 * time.Millisecond)
 		}
 		if onCaptchaPuzzle(page) {
-			return errCaptchaPuzzle
+			if in.Captcha == nil || solves >= maxCaptchaSolves {
+				return errCaptchaPuzzle
+			}
+			solves++
+			if err := solveCaptcha(ctx, page, in); err != nil {
+				in.logf("打码失败: %v", err)
+				return errCaptchaPuzzle
+			}
+			deadline = time.Now().Add(timeout) // 打码耗时不算进提交超时
 		}
 	}
 	if advanced() {

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"chatgpt-register/internal/adobereg"
+	"chatgpt-register/internal/captcha"
 	"chatgpt-register/internal/livecheck"
 	"chatgpt-register/internal/mailfetch"
 	"chatgpt-register/internal/models"
@@ -49,6 +50,9 @@ type Producer struct {
 	pxIdx   int
 	// topUpCancel 非空表示补任务循环在跑，StopAll 用它停掉补任务。
 	topUpCancel context.CancelFunc
+	runTarget   int    // 本次生产的目标数量
+	runTracked  []uint // 本次生产建过的任务 id
+
 }
 
 func New(db *gorm.DB, mail *mailfetch.Client) *Producer {
@@ -120,6 +124,7 @@ func (p *Producer) StartFromAccounts(count int) ([]models.AdobeRegistration, err
 		}
 		return nil, fmt.Errorf("账号管理和邮箱管理里都没有可用于 Adobe 注册的账号")
 	}
+	p.beginRun(count, started)
 	for _, reg := range started {
 		go p.run(reg.ID)
 	}
@@ -243,10 +248,7 @@ func (p *Producer) topUp(count int, started []models.AdobeRegistration) {
 	}
 	defer p.endTopUp()
 
-	tracked := make([]uint, 0, count)
-	for _, reg := range started {
-		tracked = append(tracked, reg.ID)
-	}
+	tracked := p.trackedIDs()
 	for {
 		if !sleepCtx(ctx, 5*time.Second) {
 			return
@@ -276,11 +278,38 @@ func (p *Producer) topUp(count int, started []models.AdobeRegistration) {
 			}
 			return
 		}
+		p.trackRun(regs)
+		tracked = p.trackedIDs()
 		for _, reg := range regs {
-			tracked = append(tracked, reg.ID)
 			go p.run(reg.ID)
 		}
 	}
+}
+
+// beginRun 记录本次生产的目标与首批任务，供进度里的「待生产」计算剩余数量。
+func (p *Producer) beginRun(count int, started []models.AdobeRegistration) {
+	p.mu.Lock()
+	p.runTarget = count
+	p.runTracked = make([]uint, 0, count)
+	for _, reg := range started {
+		p.runTracked = append(p.runTracked, reg.ID)
+	}
+	p.mu.Unlock()
+}
+
+// trackRun 把补出来的任务并入本次生产。
+func (p *Producer) trackRun(regs []models.AdobeRegistration) {
+	p.mu.Lock()
+	for _, reg := range regs {
+		p.runTracked = append(p.runTracked, reg.ID)
+	}
+	p.mu.Unlock()
+}
+
+func (p *Producer) trackedIDs() []uint {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]uint(nil), p.runTracked...)
 }
 
 // beginTopUp 保证同一时间只有一个补任务循环；返回的 ctx 在 StopAll 时取消。
@@ -297,6 +326,7 @@ func (p *Producer) beginTopUp() (context.Context, bool) {
 
 func (p *Producer) endTopUp() {
 	p.mu.Lock()
+	p.runTarget = 0
 	if p.topUpCancel != nil {
 		p.topUpCancel()
 		p.topUpCancel = nil
@@ -404,36 +434,27 @@ func (p *Producer) Snapshot() Progress {
 	}
 	return Progress{
 		Running:    runningNum > 0 || topUp,
-		Pending:    p.pendingCount(),
+		Pending:    p.pendingRemaining(runningNum),
 		RunningNum: runningNum,
 		Registered: count("registered"),
 		Failed:     count("register_failed"),
 	}
 }
 
-// pendingCount 还能取多少个号：账号管理 + 邮箱管理里尚未注册（或已过失败冷却）的
-// 邮箱数。这两个生产流程直接把记录置为 registering，不写 pending 状态，所以待生产
-// 不能按记录状态统计。
-func (p *Producer) pendingCount() int {
-	blocked := p.db.Model(&models.AdobeRegistration{}).
-		Select("email").
-		Where("status <> ? OR updated_at > ?", "register_failed", time.Now().Add(-p.retryCooldown()))
-
-	emails := map[string]struct{}{}
-	var accountEmails []string
-	p.db.Model(&models.Registration{}).
-		Where("status = ? AND mailbox_id <> 0 AND is_mother = ?", "registered", true).
-		Where("email NOT IN (?)", blocked).
-		Pluck("email", &accountEmails)
-	var mailboxEmails []string
-	p.db.Model(&models.Mailbox{}).
-		Where("status = ?", "verified").
-		Where("email NOT IN (?)", blocked).
-		Pluck("email", &mailboxEmails)
-	for _, e := range append(accountEmails, mailboxEmails...) {
-		emails[e] = struct{}{}
+// pendingRemaining 本次生产还差多少个：目标 − 已成功 − 在跑。没有在跑的生产时为 0。
+func (p *Producer) pendingRemaining(runningNum int) int {
+	p.mu.Lock()
+	target := p.runTarget
+	tracked := append([]uint(nil), p.runTracked...)
+	p.mu.Unlock()
+	if target <= 0 {
+		return 0
 	}
-	return len(emails)
+	remaining := target - p.countRegistered(tracked) - runningNum
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
 }
 
 func (p *Producer) run(id uint) {
@@ -473,6 +494,7 @@ func (p *Producer) run(id uint) {
 		Headless: p.getSetting("adobe_headless") == "1",
 		// 出口 IP 探测默认关闭以提速；需排障时置 adobe_egress_check=1。
 		EgressCheck: p.getSetting("adobe_egress_check") == "1",
+		Captcha:     p.captchaSolver(id),
 		Log: func(f string, a ...any) {
 			p.appendLog(id, fmt.Sprintf(f, a...))
 		},
@@ -800,6 +822,24 @@ func (p *Producer) releaseSlot() {
 		p.active--
 	}
 	p.mu.Unlock()
+}
+
+// captchaSolver 按设置页的 2Captcha 配置返回打码器；未启用或没填 key 时返回 nil，
+// 此时弹图形验证仍按失败处理。
+func (p *Producer) captchaSolver(id uint) adobereg.CaptchaSolver {
+	if strings.TrimSpace(p.getSetting("captcha_enabled")) != "1" {
+		return nil
+	}
+	key := strings.TrimSpace(p.getSetting("captcha_2captcha_key"))
+	if key == "" {
+		return nil
+	}
+	return &captcha.TwoCaptcha{
+		Key: key,
+		Log: func(f string, a ...any) {
+			p.appendLog(id, fmt.Sprintf(f, a...))
+		},
+	}
 }
 
 func (p *Producer) getSetting(key string) string {

@@ -29,6 +29,14 @@ type Input struct {
 	// ResetCodeBaseline 可选：把「只认此刻之后的新验证码」基线重置为当前时间，
 	// 用于过 ride 身份核验前，避免 WaitCode 误取注册阶段的旧验证码。为空则忽略。
 	ResetCodeBaseline func()
+
+	// Captcha 可选：注册中弹出 hCaptcha 图形验证时用它打码。为空则弹验证码直接判失败。
+	Captcha CaptchaSolver
+}
+
+// CaptchaSolver 解 hCaptcha 并返回 token（由打码服务实现，如 2Captcha）。
+type CaptchaSolver interface {
+	SolveHCaptcha(ctx context.Context, sitekey, pageURL, rqdata, userAgent string) (string, error)
 }
 
 type Result struct {

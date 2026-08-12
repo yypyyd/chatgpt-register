@@ -54,7 +54,7 @@ func validStatus(s string) bool {
 
 func (h *Handler) List(c *gin.Context) {
 	var regs []models.Registration
-	q := h.DB.Order("created_at desc, id desc")
+	q := h.DB.Order("updated_at desc, id desc")
 
 	if s := c.Query("status"); s != "" {
 		q = q.Where("status = ?", s)

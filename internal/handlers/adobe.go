@@ -29,7 +29,7 @@ type adobeCodeInput struct {
 
 func (h *Handler) AdobeList(c *gin.Context) {
 	var regs []models.AdobeRegistration
-	q := h.DB.Order("created_at desc, id desc")
+	q := h.DB.Order("updated_at desc, id desc")
 	if s := c.Query("status"); s != "" {
 		q = q.Where("status = ?", s)
 	}
