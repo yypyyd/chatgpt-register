@@ -3,6 +3,7 @@ package grokreg
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -18,6 +19,10 @@ import (
 	launcherflags "github.com/go-rod/rod/lib/launcher/flags"
 	"github.com/go-rod/rod/lib/proto"
 )
+
+// ErrEmailTaken 该邮箱已有 Grok 账号，属于永久失败：换出口/重试都没用，
+// 上层应标记终态而不是过冷却后再拿来重试。
+var ErrEmailTaken = errors.New("该邮箱已注册 Grok")
 
 func registerBrowser(ctx context.Context, in Input) (res *Result, err error) {
 	if in.Headless {
@@ -503,11 +508,20 @@ func waitForSelectorOrCF(ctx context.Context, page *rod.Page, in Input, trace *p
 		}
 		// surface page errors early (rate limit, invalid email, etc.)
 		if msg := pageBlockReason(pg); msg != "" {
-			return fmt.Errorf("%s", msg)
+			return blockReasonErr(msg)
 		}
 		time.Sleep(800 * time.Millisecond)
 	}
 	return fmt.Errorf("等待元素超时: %s diag=%s", selector, captchaDiag(page.Timeout(5*time.Second)))
+}
+
+// blockReasonErr 把页面阻断文案转成 error，邮箱已被注册的情形带上 ErrEmailTaken
+// 让上层能识别为终态。
+func blockReasonErr(msg string) error {
+	if msg == ErrEmailTaken.Error() {
+		return ErrEmailTaken
+	}
+	return fmt.Errorf("%s", msg)
 }
 
 // pageBlockReason returns a short Chinese error when the signup page is blocked.
@@ -856,7 +870,7 @@ func waitGrokReady(ctx context.Context, page *rod.Page, in Input) error {
 		}
 
 		if msg := pageBlockReason(pg); msg != "" {
-			return fmt.Errorf("%s", msg)
+			return blockReasonErr(msg)
 		}
 		if hasText(pg, "button", "Continue|继续|完成|确认") {
 			pg.MustElementR("button", "Continue|继续|完成|确认").MustEval(`() => this.click()`)

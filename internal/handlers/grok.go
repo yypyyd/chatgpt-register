@@ -36,7 +36,8 @@ type grokCodeInput struct {
 
 func validGrokStatus(s string) bool {
 	return s == "" || s == "pending" || s == "registering" ||
-		s == "waiting_code" || s == "registered" || s == "register_failed"
+		s == "waiting_code" || s == "registered" || s == "register_failed" ||
+		s == "already_registered"
 }
 
 func (h *Handler) GrokList(c *gin.Context) {

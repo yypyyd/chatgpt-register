@@ -45,6 +45,12 @@ func main() {
 	).Error; err != nil {
 		log.Printf("reset adobe registering on boot: %v", err)
 	}
+	if err := database.Exec(
+		"UPDATE leonardo_registrations SET status = 'register_failed', log = log || ? WHERE status IN ('registering', 'waiting_code')",
+		"\n"+time.Now().Format("2006-01-02 15:04:05")+" ✗ 程序重启，Leonardo 任务中断，判定为失败",
+	).Error; err != nil {
+		log.Printf("reset leonardo registering on boot: %v", err)
+	}
 
 	authSvc, err := auth.New(database)
 	if err != nil {
@@ -142,6 +148,23 @@ func main() {
 		api.POST("/adobe/registrations/livecheck", h.AdobeLiveCheckStart)
 		api.GET("/adobe/registrations/livecheck/status", h.AdobeLiveCheckStatus)
 		api.POST("/adobe/registrations/:id/livecheck", h.AdobeLiveCheckOne)
+
+		api.GET("/leonardo/registrations", h.LeonardoList)
+		api.DELETE("/leonardo/registrations", h.LeonardoDeleteAll)
+		api.POST("/leonardo/registrations", h.LeonardoStart)
+		api.POST("/leonardo/produce", h.LeonardoProduce)
+		api.GET("/leonardo/produce/status", h.LeonardoProduceStatus)
+		api.POST("/leonardo/produce/stop", h.LeonardoProduceStop)
+		api.POST("/leonardo/registrations/:id/code", h.LeonardoSubmitCode)
+		api.POST("/leonardo/registrations/:id/stop", h.LeonardoStop)
+		api.DELETE("/leonardo/registrations/:id", h.LeonardoDelete)
+		api.GET("/leonardo/registrations/:id/logs", h.LeonardoLog)
+		api.GET("/leonardo/registrations/:id/shot", h.LeonardoShot)
+		api.POST("/leonardo/download", h.LeonardoDownload)
+
+		api.POST("/leonardo/registrations/livecheck", h.LeonardoLiveCheckStart)
+		api.GET("/leonardo/registrations/livecheck/status", h.LeonardoLiveCheckStatus)
+		api.POST("/leonardo/registrations/:id/livecheck", h.LeonardoLiveCheckOne)
 	}
 
 	sub, err := fs.Sub(staticFS, "static")
@@ -150,7 +173,7 @@ func main() {
 	}
 	httpFS := http.FS(sub)
 	r.StaticFS("/static", httpFS)
-	for _, p := range []string{"login", "dashboard", "mailboxes", "accounts", "grok", "adobe", "settings"} {
+	for _, p := range []string{"login", "dashboard", "mailboxes", "accounts", "grok", "adobe", "leonardo", "settings"} {
 		p := p
 		r.GET("/"+p, func(c *gin.Context) { c.FileFromFS(p+".html", httpFS) })
 	}

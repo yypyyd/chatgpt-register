@@ -1,4 +1,4 @@
-package grokproducer
+package leonardoproducer
 
 import (
 	"context"
@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"chatgpt-register/internal/grokoauth"
-	"chatgpt-register/internal/grokreg"
+	"chatgpt-register/internal/leonardoreg"
+	"chatgpt-register/internal/livecheck"
 	"chatgpt-register/internal/mailfetch"
 	"chatgpt-register/internal/models"
 	"chatgpt-register/internal/proxyutil"
@@ -21,30 +21,23 @@ import (
 )
 
 const (
-	codeWaitTimeout  = 10 * time.Minute
-	codePollTimeout  = 4 * time.Minute
-	codePollInterval = 5 * time.Second
+	codeWaitTimeout = 10 * time.Minute
+	codePollTimeout = 4 * time.Minute
+	// 收码轮询间隔：验证码邮件通常几秒内到，间隔越大平均多等半个间隔。
+	codePollInterval = 2 * time.Second
 	maxLogBytes      = 64 * 1024
 
 	// defaultMaxConcurrency 未配置并发时的默认值：逐个开工。批量注册时多个
-	// 有头浏览器 + Turnstile 令牌池同时抢 CPU 会互相超时，串行最稳。
+	// 有头浏览器同时抢 CPU 会互相超时，串行最稳。
 	// 可用设置页「最大并发数」(max_concurrency) 调大。
 	defaultMaxConcurrency = 1
 
 	// defaultRetryCooldownMin 注册失败后重试同一邮箱前的等待分钟数，避免连续重试
 	// 撞风控。可在系统设置 retry_cooldown_min 覆盖，0 = 不冷却。
 	defaultRetryCooldownMin = 30
-
-	// defaultMailboxIntervalMin 同一个母邮箱两次注册之间的最小间隔分钟数：刚注册完
-	// 就接着开下一个裂变，两封验证码邮件容易互相干扰。
-	// 可在系统设置 mailbox_interval_min 覆盖，0 = 不限。
-	defaultMailboxIntervalMin = 5
 )
 
-var (
-	digitCodeRe = regexp.MustCompile(`\b(\d{6})\b`)
-	xaiCodeRe   = regexp.MustCompile(`(?i)\b([a-z0-9]{3})-([a-z0-9]{3})\b`)
-)
+var digitCodeRe = regexp.MustCompile(`\b(\d{6})\b`)
 
 type Producer struct {
 	db   *gorm.DB
@@ -53,7 +46,7 @@ type Producer struct {
 	mu      sync.Mutex
 	waiters map[uint]chan string
 	cancel  map[uint]context.CancelFunc
-	active  int // 当前真正在跑（已获得并发槽位）的任务数
+	active  int
 	pxIdx   int
 	// topUpCancel 非空表示补任务循环在跑，StopAll 用它停掉补任务。
 	topUpCancel context.CancelFunc
@@ -71,7 +64,7 @@ func New(db *gorm.DB, mail *mailfetch.Client) *Producer {
 	}
 }
 
-func (p *Producer) Start(email, note string) (*models.GrokRegistration, error) {
+func (p *Producer) Start(email, note string) (*models.LeonardoRegistration, error) {
 	email = strings.TrimSpace(email)
 	if email == "" {
 		return nil, fmt.Errorf("邮箱不能为空")
@@ -85,15 +78,15 @@ func (p *Producer) Start(email, note string) (*models.GrokRegistration, error) {
 		}
 	}
 
-	var existing models.GrokRegistration
+	var existing models.LeonardoRegistration
 	if err := p.db.Where("email = ?", email).First(&existing).Error; err == nil {
 		if existing.Status == "registering" || existing.Status == "waiting_code" {
-			return nil, fmt.Errorf("该邮箱的 Grok 注册正在进行中")
+			return nil, fmt.Errorf("该邮箱的 Leonardo 注册正在进行中")
 		}
 		existing.Status = "registering"
 		existing.Note = note
 		existing.MailboxID = mailboxID
-		existing.Password = grokreg.GenPassword(16)
+		existing.Password = leonardoreg.GenPassword(16)
 		existing.AuthData = ""
 		existing.Shot = nil
 		existing.Shipped = false
@@ -104,7 +97,7 @@ func (p *Producer) Start(email, note string) (*models.GrokRegistration, error) {
 		return &existing, nil
 	}
 
-	reg := models.GrokRegistration{Email: email, MailboxID: mailboxID, Password: grokreg.GenPassword(16), Status: "registering", Note: note}
+	reg := models.LeonardoRegistration{Email: email, MailboxID: mailboxID, Password: leonardoreg.GenPassword(16), Status: "registering", Note: note}
 	if err := p.db.Create(&reg).Error; err != nil {
 		return nil, err
 	}
@@ -115,7 +108,7 @@ func (p *Producer) Start(email, note string) (*models.GrokRegistration, error) {
 // StartFromAccounts 从账号管理 / 邮箱管理取号开工，并在后台补任务：注册失败的邮箱
 // 过了「失败重试冷却」(retry_cooldown_min，默认 30 分钟) 会被重新拿来重试，直到本次
 // 拿到 count 个已注册的账号，或者再也没有可用邮箱。
-func (p *Producer) StartFromAccounts(count int) ([]models.GrokRegistration, error) {
+func (p *Producer) StartFromAccounts(count int) ([]models.LeonardoRegistration, error) {
 	if count < 1 {
 		return nil, fmt.Errorf("数量必须 >= 1")
 	}
@@ -128,7 +121,7 @@ func (p *Producer) StartFromAccounts(count int) ([]models.GrokRegistration, erro
 		if cooling {
 			return nil, fmt.Errorf("可重试的邮箱都还在失败冷却中，请稍后再试")
 		}
-		return nil, fmt.Errorf("账号管理和邮箱管理里都没有可用于 Grok 注册的账号")
+		return nil, fmt.Errorf("账号管理和邮箱管理里都没有可用于 Leonardo 注册的账号")
 	}
 	p.beginRun(count, started)
 	for _, reg := range started {
@@ -139,92 +132,70 @@ func (p *Producer) StartFromAccounts(count int) ([]models.GrokRegistration, erro
 }
 
 // claimTargets 取最多 count 个可注册的邮箱并置为 registering。
-// cooling=true 表示暂时无号可领、但等一会儿会有（失败地址在冷却、或某邮箱刚跑过）。
-func (p *Producer) claimTargets(count int) ([]models.GrokRegistration, bool, error) {
+// cooling=true 表示还有失败邮箱可重试、只是没到冷却时间。
+func (p *Producer) claimTargets(count int) ([]models.LeonardoRegistration, bool, error) {
 	cutoff := time.Now().Add(-p.retryCooldown())
 	// 已注册/在跑的邮箱要排除；失败的邮箱过了冷却才允许重试。
-	blocked := p.db.Model(&models.GrokRegistration{}).
+	blocked := p.db.Model(&models.LeonardoRegistration{}).
 		Select("email").
 		Where("status <> ? OR updated_at > ?", "register_failed", cutoff)
-	// 同一个母邮箱同时只跑一个，且两次注册之间留出间隔：刚注册完就接着开下一个
-	// 裂变，两封验证码邮件挤在一起容易读错/读不到。
-	busyCutoff := time.Now().Add(-p.mailboxInterval())
-	busyMailboxes := p.db.Model(&models.GrokRegistration{}).
-		Select("mailbox_id").
-		Where("mailbox_id <> 0").
-		Where("status IN ? OR updated_at > ?", []string{"registering", "waiting_code"}, busyCutoff)
 
-	started := make([]models.GrokRegistration, 0, count)
-	// 同一批里也要按母邮箱去重：+001/+002 属于同一个邮箱，一起开会撞验证码。
-	claimed := map[uint]bool{}
+	started := make([]models.LeonardoRegistration, 0, count)
+	// 优先用已注册 ChatGPT 账号（其邮箱已在邮箱池且可读验证码）。
+	// 只取母号：裂变号是 +别名 邮箱，Leonardo 视作同一邮箱，不能用来注册。
 	var accounts []models.Registration
 	if err := p.db.
-		Where("status = ? AND mailbox_id <> 0", "registered").
+		Where("status = ? AND mailbox_id <> 0 AND is_mother = ?", "registered", true).
 		Where("email NOT IN (?)", blocked).
-		Where("mailbox_id NOT IN (?)", busyMailboxes).
 		Order("id asc").
-		Limit(count * 20).
+		Limit(count).
 		Find(&accounts).Error; err != nil {
 		return nil, false, err
 	}
 	for _, acc := range accounts {
-		if len(started) >= count {
-			break
-		}
-		if claimed[acc.MailboxID] {
-			continue
-		}
 		reg, err := p.claimOne(acc.Email, acc.MailboxID,
 			fmt.Sprintf("来源: ChatGPT账号 #%d，自动读取验证码", acc.ID))
 		if err != nil {
 			return started, false, err
 		}
-		claimed[acc.MailboxID] = true
 		started = append(started, *reg)
 	}
+	// 不足则从已验证邮箱池补齐。
 	if len(started) < count {
 		var mailboxes []models.Mailbox
 		if err := p.db.
 			Where("status = ?", "verified").
 			Where("email NOT IN (?)", blocked).
-			Where("id NOT IN (?)", busyMailboxes).
 			Order("id asc").
-			Limit(count * 20).
+			Limit(count - len(started)).
 			Find(&mailboxes).Error; err != nil {
 			return started, false, err
 		}
 		for _, mb := range mailboxes {
-			if len(started) >= count {
-				break
-			}
-			if claimed[mb.ID] {
-				continue
-			}
 			reg, err := p.claimOne(mb.Email, mb.ID,
 				fmt.Sprintf("来源: 邮箱管理 #%d，自动读取验证码", mb.ID))
 			if err != nil {
 				return started, false, err
 			}
-			claimed[mb.ID] = true
 			started = append(started, *reg)
 		}
 	}
 	if len(started) > 0 {
 		return started, false, nil
 	}
-	return started, p.hasCoolingFailure(cutoff) || p.hasBusyMailbox(busyCutoff), nil
+	return started, p.hasCoolingFailure(cutoff), nil
 }
 
 // claimOne 把一个邮箱置为 registering：已有记录就复用（重试同一条），否则新建。
-func (p *Producer) claimOne(email string, mailboxID uint, note string) (*models.GrokRegistration, error) {
-	reg := models.GrokRegistration{
+func (p *Producer) claimOne(email string, mailboxID uint, note string) (*models.LeonardoRegistration, error) {
+	reg := models.LeonardoRegistration{
 		Email:     email,
 		MailboxID: mailboxID,
-		Password:  grokreg.GenPassword(16),
+		Password:  leonardoreg.GenPassword(16),
 		Status:    "registering",
 		Note:      note,
 	}
-	var existing models.GrokRegistration
+	var existing models.LeonardoRegistration
 	if err := p.db.Where("email = ?", email).First(&existing).Error; err == nil {
 		existing.MailboxID = mailboxID
 		existing.Status = "registering"
@@ -247,48 +218,27 @@ func (p *Producer) claimOne(email string, mailboxID uint, note string) (*models.
 // hasCoolingFailure 是否还有失败邮箱只是没到冷却时间（此时值得等，而不是收工）。
 func (p *Producer) hasCoolingFailure(cutoff time.Time) bool {
 	var n int64
-	p.db.Model(&models.GrokRegistration{}).
+	p.db.Model(&models.LeonardoRegistration{}).
 		Where("status = ? AND updated_at > ?", "register_failed", cutoff).
 		Count(&n)
 	return n > 0
 }
 
-// hasBusyMailbox 是否有邮箱只是刚跑过、等间隔到了就能继续。
-func (p *Producer) hasBusyMailbox(cutoff time.Time) bool {
-	var n int64
-	p.db.Model(&models.GrokRegistration{}).
-		Where("mailbox_id <> 0 AND updated_at > ?", cutoff).
-		Count(&n)
-	return n > 0
-}
-
-// mailboxInterval 同一邮箱两次注册之间的最小间隔，跟设置页 mailbox_interval_min，
-// 0 = 不限。
-func (p *Producer) mailboxInterval() time.Duration {
-	return time.Duration(p.settingInt("mailbox_interval_min", defaultMailboxIntervalMin)) * time.Minute
-}
-
 // retryCooldown 失败地址的重试冷却，跟设置页 retry_cooldown_min，0 = 不冷却。
 func (p *Producer) retryCooldown() time.Duration {
-	return time.Duration(p.settingInt("retry_cooldown_min", defaultRetryCooldownMin)) * time.Minute
-}
-
-// settingInt 读一个非负整型设置，未设置或非法时用默认值。
-func (p *Producer) settingInt(key string, def int) int {
-	raw := strings.TrimSpace(p.getSetting(key))
-	if raw == "" {
-		return def
+	raw := strings.TrimSpace(p.getSetting("retry_cooldown_min"))
+	min := defaultRetryCooldownMin
+	if raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n >= 0 {
+			min = n
+		}
 	}
-	n, err := strconv.Atoi(raw)
-	if err != nil || n < 0 {
-		return def
-	}
-	return n
+	return time.Duration(min) * time.Minute
 }
 
 // topUp 边跑边补：始终让在跑任务数维持在并发上限，直到本次生产拿到 count 个已注册
 // 账号。失败的邮箱在冷却期内不会被重试，此时循环等待而不是提前收工。
-func (p *Producer) topUp(count int, started []models.GrokRegistration) {
+func (p *Producer) topUp(count int, started []models.LeonardoRegistration) {
 	ctx, ok := p.beginTopUp()
 	if !ok { // 已有补任务循环在跑，交给它继续
 		return
@@ -334,7 +284,7 @@ func (p *Producer) topUp(count int, started []models.GrokRegistration) {
 }
 
 // beginRun 记录本次生产的目标与首批任务，供进度里的「待生产」计算剩余数量。
-func (p *Producer) beginRun(count int, started []models.GrokRegistration) {
+func (p *Producer) beginRun(count int, started []models.LeonardoRegistration) {
 	p.mu.Lock()
 	p.runTarget = count
 	p.runTracked = make([]uint, 0, count)
@@ -345,7 +295,7 @@ func (p *Producer) beginRun(count int, started []models.GrokRegistration) {
 }
 
 // trackRun 把补出来的任务并入本次生产。
-func (p *Producer) trackRun(regs []models.GrokRegistration) {
+func (p *Producer) trackRun(regs []models.LeonardoRegistration) {
 	p.mu.Lock()
 	for _, reg := range regs {
 		p.runTracked = append(p.runTracked, reg.ID)
@@ -393,7 +343,7 @@ func (p *Producer) countRegistered(ids []uint) int {
 		return 0
 	}
 	var n int64
-	p.db.Model(&models.GrokRegistration{}).
+	p.db.Model(&models.LeonardoRegistration{}).
 		Where("id IN ? AND status = ?", ids, "registered").
 		Count(&n)
 	return int(n)
@@ -445,7 +395,7 @@ func (p *Producer) Stop(id uint) {
 	}
 }
 
-// StopAll 请求停止所有在跑的 Grok 注册任务，并停掉失败重试的补任务循环。
+// StopAll 请求停止所有在跑的 Leonardo 注册任务，并停掉失败重试的补任务循环。
 func (p *Producer) StopAll() {
 	p.endTopUp()
 	p.mu.Lock()
@@ -459,16 +409,15 @@ func (p *Producer) StopAll() {
 	}
 }
 
-// Progress 生产进度快照，供 /api/grok/produce/status 展示。
+// Progress 生产进度快照，供 /api/leonardo/produce/status 展示。
 type Progress struct {
 	Running    bool `json:"running"`
-	Pending    int  `json:"pending"`     // 待生产
-	RunningNum int  `json:"running_num"` // 在跑
-	Registered int  `json:"registered"`  // 已注册
-	Failed     int  `json:"failed"`      // 注册失败
+	Pending    int  `json:"pending"`
+	RunningNum int  `json:"running_num"`
+	Registered int  `json:"registered"`
+	Failed     int  `json:"failed"`
 }
 
-// Snapshot 返回 Grok 生产进度：在跑数取自当前运行的任务，其余按库中状态统计。
 func (p *Producer) Snapshot() Progress {
 	p.mu.Lock()
 	runningNum := len(p.cancel)
@@ -477,7 +426,7 @@ func (p *Producer) Snapshot() Progress {
 
 	count := func(statuses ...string) int {
 		var n int64
-		p.db.Model(&models.GrokRegistration{}).Where("status IN ?", statuses).Count(&n)
+		p.db.Model(&models.LeonardoRegistration{}).Where("status IN ?", statuses).Count(&n)
 		return int(n)
 	}
 	return Progress{
@@ -517,15 +466,14 @@ func (p *Producer) run(id uint) {
 		p.mu.Unlock()
 	}()
 
-	var reg models.GrokRegistration
+	var reg models.LeonardoRegistration
 	if err := p.db.First(&reg, id).Error; err != nil {
 		return
 	}
 
-	// 并发闸门：并发已满时排队等待，避免多个有头浏览器同时抢 CPU 互相超时。
 	if !p.acquireSlot(ctx, id) {
 		p.appendLog(id, "已取消（排队等待空闲注册槽位时被停止）")
-		p.db.Model(&models.GrokRegistration{}).Where("id = ?", id).Updates(map[string]any{
+		p.db.Model(&models.LeonardoRegistration{}).Where("id = ?", id).Updates(map[string]any{
 			"status": "register_failed",
 			"note":   "已取消",
 		})
@@ -533,25 +481,16 @@ func (p *Producer) run(id uint) {
 	}
 	defer p.releaseSlot()
 
-	p.appendLog(id, "开始 Grok 邮箱注册")
-	// since 在获得槽位后再取，避免排队期间旧验证码被误读。
+	p.appendLog(id, "开始 Leonardo 邮箱注册")
 	since := time.Now().Add(-30 * time.Second)
 
-	in := grokreg.Input{
+	in := leonardoreg.Input{
 		Email:    reg.Email,
 		Password: reg.Password,
 		Proxy:    p.nextProxy(),
-		// Match the reference project: Grok registration is headed by default.
-		// A dedicated opt-in setting can still enable headless for diagnostics.
-		Headless: p.getSetting("grok_headless") == "1",
-		// 协议注册为默认路径：只借浏览器签发 Turnstile 令牌，拿到后立即退出、
-		// 其余全走 HTTP/gRPC。设置 grok_engine=browser 可回退到旧的全程浏览器流程。
-		Engine:              p.getSetting("grok_engine"),
-		Impersonate:         p.getSetting("grok_impersonate"),
-		ImpersonateFallback: p.getSetting("grok_impersonate_fallback"),
-		FlareSolverrURL:     p.getSetting("grok_flaresolverr_url"),
-		ClearanceProxy:      p.getSetting("grok_clearance_proxy"),
-		ClearanceURLs:       p.getSetting("grok_clearance_urls"),
+		Headless: p.getSetting("leonardo_headless") == "1",
+		// 出口 IP 探测默认关闭以提速；需排障时置 leonardo_egress_check=1。
+		EgressCheck: p.getSetting("leonardo_egress_check") == "1",
 		Log: func(f string, a ...any) {
 			p.appendLog(id, fmt.Sprintf(f, a...))
 		},
@@ -562,54 +501,63 @@ func (p *Producer) run(id uint) {
 			return p.waitManualCode(ctx, id)
 		},
 		SaveShot: func(png []byte) {
-			p.db.Model(&models.GrokRegistration{}).Where("id = ?", id).Update("shot", png)
+			p.db.Model(&models.LeonardoRegistration{}).Where("id = ?", id).Update("shot", png)
 		},
 	}
 
-	res, err := grokreg.Register(ctx, in)
+	res, err := leonardoreg.Register(ctx, in)
 	if err != nil {
 		p.appendLog(id, "注册失败: "+err.Error())
 		status := "register_failed"
-		if errors.Is(err, grokreg.ErrEmailTaken) {
+		if errors.Is(err, leonardoreg.ErrEmailTaken) {
 			// 邮箱已被注册是终态，标成 already_registered 后不再进冷却重试。
 			status = "already_registered"
 		}
-		p.db.Model(&models.GrokRegistration{}).Where("id = ?", id).Updates(map[string]any{
+		p.db.Model(&models.LeonardoRegistration{}).Where("id = ?", id).Updates(map[string]any{
 			"status": status,
 			"note":   truncateStr(err.Error(), 500),
 		})
 		return
 	}
 
-	p.mintOAuth(ctx, id, in.Proxy, reg.Email, res.AuthJSON)
-
 	authBytes, _ := json.MarshalIndent(res.AuthJSON, "", "  ")
-	p.appendLog(id, "Grok 注册成功")
-	p.db.Model(&models.GrokRegistration{}).Where("id = ?", id).Updates(map[string]any{
+	p.appendLog(id, "Leonardo 注册成功")
+	p.db.Model(&models.LeonardoRegistration{}).Where("id = ?", id).Updates(map[string]any{
 		"status":    "registered",
 		"auth_data": string(authBytes),
 	})
+
+	// 注册成功后立即用采集到的 Cookie 自检一次会话：会话无效说明这个号导出后
+	// 不可用，自动标记为失效（不删号）。
+	p.selfCheckLeonardoAlive(id, string(authBytes))
 }
 
-// mintOAuth 注册成功后立刻用 sso 换一份 xAI Build OAuth 令牌，写进 auth JSON 的 oauth
-// 字段：Sub2API 与 CPA 都只认 OAuth 令牌，趁注册用的代理和出口还在换成功率最高，
-// 导出时也就不用再等。换不到只记日志，不影响注册结果（导出时还会补换）。
-func (p *Producer) mintOAuth(ctx context.Context, id uint, proxy, email string, auth map[string]any) {
-	if auth == nil {
+// selfCheckLeonardoAlive 用注册产出的 Cookie 探一次 Leonardo 会话，把结果写入
+// alive 字段：alive=会话有效、dead=会话被拒、unknown=网络/限流不判死。
+func (p *Producer) selfCheckLeonardoAlive(id uint, authData string) {
+	cookies := livecheck.LeonardoCookiesFromAuthJSON(authData)
+	if len(cookies) == 0 {
 		return
 	}
-	sso := grokoauth.SSOFromAuth(auth)
-	if sso == "" {
-		return
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	result := livecheck.CheckLeonardo(ctx, []livecheck.LeonardoItem{{ID: id, Cookies: cookies}}, nil)
+	alive := result[id]
+	if alive == "" {
+		alive = livecheck.StatusUnknown
 	}
-	p.appendLog(id, "正在换取 Grok OAuth 令牌（Sub2API / CPA 导出用）")
-	info, err := grokoauth.ConvertSSO(ctx, proxy, sso)
-	if err != nil {
-		p.appendLog(id, "换取 OAuth 令牌失败，导出时会重试: "+err.Error())
-		return
+	now := time.Now()
+	p.db.Model(&models.LeonardoRegistration{}).Where("id = ?", id).Updates(map[string]any{
+		"alive": alive, "alive_checked_at": now,
+	})
+	switch alive {
+	case livecheck.StatusDead:
+		p.appendLog(id, "自检：Leonardo 会话无效，已标记为失效")
+	case livecheck.StatusAlive:
+		p.appendLog(id, "自检：Leonardo 会话有效，账号可用")
+	default:
+		p.appendLog(id, "自检：Leonardo 会话检测结果未知（网络/限流等），未改判")
 	}
-	auth["oauth"] = grokoauth.Credentials(info, email)
-	p.appendLog(id, "已换取 Grok OAuth 令牌")
 }
 
 func (p *Producer) waitManualCode(ctx context.Context, id uint) (string, error) {
@@ -617,13 +565,13 @@ func (p *Producer) waitManualCode(ctx context.Context, id uint) (string, error) 
 	p.mu.Lock()
 	p.waiters[id] = ch
 	p.mu.Unlock()
-	p.db.Model(&models.GrokRegistration{}).Where("id = ?", id).Update("status", "waiting_code")
+	p.db.Model(&models.LeonardoRegistration{}).Where("id = ?", id).Update("status", "waiting_code")
 
 	timer := time.NewTimer(codeWaitTimeout)
 	defer timer.Stop()
 	select {
 	case code := <-ch:
-		p.db.Model(&models.GrokRegistration{}).Where("id = ?", id).Update("status", "registering")
+		p.db.Model(&models.LeonardoRegistration{}).Where("id = ?", id).Update("status", "registering")
 		return code, nil
 	case <-timer.C:
 		return "", fmt.Errorf("等待验证码超时")
@@ -639,7 +587,7 @@ func (p *Producer) fetchCode(ctx context.Context, id, mailboxID uint, since time
 	}
 	acc := mailfetch.Account{Email: mb.Email, ClientID: mb.ClientID, RefreshToken: mb.RefreshToken}
 	deadline := time.Now().Add(codePollTimeout)
-	p.appendLog(id, "开始自动读取 Grok 邮件验证码")
+	p.appendLog(id, "开始自动读取 Leonardo 邮件验证码")
 	for time.Now().Before(deadline) {
 		if ctx.Err() != nil {
 			return "", ctx.Err()
@@ -647,10 +595,10 @@ func (p *Producer) fetchCode(ctx context.Context, id, mailboxID uint, since time
 		msgs, err := p.mail.ListMessages(ctx, acc, 15)
 		if err == nil {
 			for _, m := range msgs {
-				if m.ReceivedAt.Before(since) || !looksLikeGrok(m) {
+				if m.ReceivedAt.Before(since) || !looksLikeLeonardo(m) {
 					continue
 				}
-				if code := extractGrokCode(m.Subject); code != "" {
+				if code := extractLeonardoCode(m.Subject); code != "" {
 					p.appendLog(id, "已从邮件标题读取验证码并自动提交")
 					return code, nil
 				}
@@ -658,7 +606,7 @@ func (p *Producer) fetchCode(ctx context.Context, id, mailboxID uint, since time
 				if gerr != nil {
 					continue
 				}
-				if code := extractGrokCode(full.Subject + " " + full.Text); code != "" {
+				if code := extractLeonardoCode(full.Subject + " " + full.Text); code != "" {
 					p.appendLog(id, "已从邮件正文读取验证码并自动提交")
 					return code, nil
 				}
@@ -672,31 +620,28 @@ func (p *Producer) fetchCode(ctx context.Context, id, mailboxID uint, since time
 		case <-time.After(codePollInterval):
 		}
 	}
-	return "", fmt.Errorf("超时未收到 Grok 验证码邮件")
+	return "", fmt.Errorf("超时未收到 Leonardo 验证码邮件")
 }
 
-func extractGrokCode(s string) string {
-	if code := xaiCodeRe.FindStringSubmatch(s); code != nil {
-		return strings.ToUpper(code[1] + code[2])
-	}
+func extractLeonardoCode(s string) string {
 	if code := digitCodeRe.FindStringSubmatch(s); code != nil {
 		return code[1]
 	}
 	return ""
 }
 
-func looksLikeGrok(m mailfetch.Message) bool {
+func looksLikeLeonardo(m mailfetch.Message) bool {
 	s := strings.ToLower(m.From + " " + m.FromName + " " + m.Subject)
-	return strings.Contains(s, "grok") ||
-		strings.Contains(s, "x.ai") ||
-		strings.Contains(s, "xai") ||
-		strings.Contains(s, "security code") ||
-		strings.Contains(s, "verification")
+	return strings.Contains(s, "leonardo") ||
+		strings.Contains(s, "verification code") ||
+		strings.Contains(s, "confirmation code") ||
+		strings.Contains(s, "verify your") ||
+		strings.Contains(s, "one-time")
 }
 
 func (p *Producer) appendLog(id uint, line string) {
 	stamp := time.Now().Format("2006-01-02 15:04:05")
-	var reg models.GrokRegistration
+	var reg models.LeonardoRegistration
 	if err := p.db.Select("log").First(&reg, id).Error; err != nil {
 		return
 	}
@@ -710,11 +655,10 @@ func (p *Producer) appendLog(id uint, line string) {
 	if len(log) > maxLogBytes {
 		log = log[len(log)-maxLogBytes:]
 	}
-	p.db.Model(&models.GrokRegistration{}).Where("id = ?", id).Update("log", log)
+	p.db.Model(&models.LeonardoRegistration{}).Where("id = ?", id).Update("log", log)
 }
 
-// maxConcurrency 读取并发上限：跟设置页「最大并发数」(max_concurrency)，
-// 未设置则默认 1，最小为 1。
+// maxConcurrency 跟设置页「最大并发数」(max_concurrency)，未设置则默认 1。
 func (p *Producer) maxConcurrency() int {
 	raw := strings.TrimSpace(p.getSetting("max_concurrency"))
 	n := defaultMaxConcurrency
@@ -729,8 +673,6 @@ func (p *Producer) maxConcurrency() int {
 	return n
 }
 
-// acquireSlot 阻塞直到并发未满（获得槽位返回 true）或 ctx 取消（返回 false）。
-// 限额从设置动态读取，改大后新任务无需重启即可生效。
 func (p *Producer) acquireSlot(ctx context.Context, id uint) bool {
 	logged := false
 	for {
@@ -757,7 +699,6 @@ func (p *Producer) acquireSlot(ctx context.Context, id uint) bool {
 	}
 }
 
-// releaseSlot 释放一个并发槽位。
 func (p *Producer) releaseSlot() {
 	p.mu.Lock()
 	if p.active > 0 {
@@ -774,8 +715,8 @@ func (p *Producer) getSetting(key string) string {
 	return s.Value
 }
 
+// nextProxy 跟设置页上的全局代理开关与代理列表，按任务轮换出口。
 func (p *Producer) nextProxy() string {
-	// Grok 跟随设置页上的全局代理开关与代理列表，不再有独立的 Grok 开关。
 	enabled := strings.TrimSpace(p.getSetting("proxy_enabled"))
 	raw := p.getSetting("proxy_list")
 	if enabled != "1" {

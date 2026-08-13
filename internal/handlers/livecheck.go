@@ -35,9 +35,10 @@ type liveRunner struct {
 
 func newLiveRunners() map[string]*liveRunner {
 	return map[string]*liveRunner{
-		"chatgpt": {},
-		"grok":    {},
-		"adobe":   {},
+		"chatgpt":  {},
+		"grok":     {},
+		"adobe":    {},
+		"leonardo": {},
 	}
 }
 
