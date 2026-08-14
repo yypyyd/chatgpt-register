@@ -1,12 +1,14 @@
 // Package oreatereg 完成 oreateai.com 的全协议注册：注册 → 邮件确认链接 →
-// 登录 → 校验自动到账的积分 → 用 Kling3.0 Omini 1k 生成一张图（再自动加赠积分），
+// 登录 → 校验自动到账的积分 → 用 Kling3.0 Omini 1k 生成一张图（再自动加赠 50 积分），
 // 并采集站点会话 Cookie 供 2api 导出。
-// 只有反爬 token jt 必须由浏览器现铸（一次性、与 OUID 绑定），其余全部走 HTTP。
+// 注册、确认、登录、积分走 HTTP；反爬 token jt 由浏览器现铸（一次性、与 OUID 绑定），
+// 生图请求还必须留在浏览器页面里发，否则一律被风控判成 spam user。
 package oreatereg
 
 import (
 	"context"
 	cryptorand "crypto/rand"
+	"errors"
 	"fmt"
 	"math/big"
 	"net/url"
@@ -27,6 +29,16 @@ const (
 
 	// pointsWaitTimeout 等注册赠分异步到账的最长时间。
 	pointsWaitTimeout = 60 * time.Second
+
+	// spamRetryDelay 生图被风控拦下后重试前的等待时间。
+	spamRetryDelay = 45 * time.Second
+
+	// imageWaitTimeout 等生图 SSE 流出图的最长时间（实测约 25s）。
+	imageWaitTimeout = 3 * time.Minute
+
+	// welcomePoints/dailyPoints 是新号注册后自动到账的两笔积分（欢迎 50、每日额度 30）。
+	welcomePoints = 50
+	dailyPoints   = 30
 )
 
 // confirmLinkRe 匹配注册确认邮件里的链接：/home/index?email=...&tokenID=...
@@ -75,19 +87,25 @@ func Register(ctx context.Context, in Input) (*Result, error) {
 		in.Password = GenPassword(16)
 	}
 
-	// 注册与生图各要一个一次性 jt，一次浏览器会话铸两个，省一次启动。
-	in.logf("正在用浏览器铸造反爬 token（注册与生图各一个）")
-	tk, err := mintTokens(ctx, in, 2)
+	// 浏览器会话要一直开到生图结束：注册的 jt 可以拿出来走 HTTP，
+	// 但生图请求必须留在这个页面里发。
+	in.logf("正在启动浏览器会话")
+	sess, err := openSession(ctx, in)
+	if err != nil {
+		return nil, err
+	}
+	defer sess.close()
+	signupJT, err := sess.mint(ctx, in)
 	if err != nil {
 		return nil, err
 	}
 
-	cli, err := newClient(in.Proxy, tk.UA)
+	cli, err := newClient(in.Proxy, sess.UA)
 	if err != nil {
 		return nil, err
 	}
 	// jt 与铸造它的设备绑定，HTTP 会话必须带同一个 OUID。
-	cli.setCookie("OUID", tk.OUID)
+	cli.setCookie("OUID", sess.OUID)
 
 	t, err := cli.ticket(ctx)
 	if err != nil {
@@ -97,7 +115,7 @@ func Register(ctx context.Context, in Input) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	signup, err := cli.signup(ctx, in.Email, encPassword, t.TicketID, tk.JTs[0])
+	signup, err := cli.signup(ctx, in.Email, encPassword, t.TicketID, signupJT)
 	if err != nil {
 		return nil, err
 	}
@@ -132,6 +150,14 @@ func Register(ctx context.Context, in Input) (*Result, error) {
 	}
 	in.logf("登录成功，已拿到站点会话")
 
+	// 生图要在浏览器里发，把会话票据注回页面让它变成已登录状态。
+	if err = sess.useSession(cookies["ouss"]); err != nil {
+		return nil, fmt.Errorf("向浏览器注入会话票据失败: %w", err)
+	}
+
+	// 每日额度（daily 30）要请求一次用户信息才会发到账，登录后先拉一次。
+	cli.touchUserInfo(ctx)
+
 	// 注册赠分是异步到账的，等它到账再生图，否则会因积分不足出图失败。
 	detail, total, err := waitPoints(ctx, cli)
 	if err != nil {
@@ -139,28 +165,31 @@ func Register(ctx context.Context, in Input) (*Result, error) {
 	}
 	in.logf("注册自动到账积分: %d（%s）", total, formatPoints(detail))
 
-	// 生图前把 OUID/UA 换回铸造 jt 的那套，否则会被判成 spam user。
-	cli.setCookie("OUID", tk.OUID)
-	cli.ua = tk.UA
-	imageURL, genErr := generate(ctx, cli, in, tk)
+	imageURL, genErr := generate(ctx, cli, in, sess)
 	if genErr != nil {
 		in.logf("生图失败: %v（账号已注册可用，积分加赠未完成）", genErr)
 	}
 
-	detail, total, err = cli.points(ctx)
+	if genErr == nil {
+		// 出图赠分也是异步到账的，等它到账再记录，否则导出的积分会少 50。
+		cli.touchUserInfo(ctx)
+		detail, total, err = waitPointsAbove(ctx, cli, total)
+	} else {
+		detail, total, err = cli.points(ctx)
+	}
 	if err != nil {
 		return nil, err
 	}
 	in.logf("生图后积分: %d（%s）", total, formatPoints(detail))
 
 	cookies = cli.cookies()
-	cookies["OUID"] = tk.OUID
+	cookies["OUID"] = sess.OUID
 	return &Result{
 		Email:       in.Email,
 		Password:    in.Password,
 		Cookies:     cookies,
-		OUID:        tk.OUID,
-		UserAgent:   tk.UA,
+		OUID:        sess.OUID,
+		UserAgent:   sess.UA,
 		PointDetail: detail,
 		Points:      total,
 		ImageURL:    imageURL,
@@ -169,18 +198,22 @@ func Register(ctx context.Context, in Input) (*Result, error) {
 	}, nil
 }
 
-// generate 建会话并出一张图，出图后站点自动加赠积分。
-func generate(ctx context.Context, cli *client, in Input, tk *tokens) (string, error) {
+// generate 建会话并在浏览器页面里出一张图，出图后站点自动加赠 50 积分。
+// 被风控判成 spam user 时重新加载页面、换一个新铸的 jt 再试一次。
+func generate(ctx context.Context, cli *client, in Input, sess *session) (string, error) {
 	chatID, err := cli.createChat(ctx)
 	if err != nil {
 		return "", err
 	}
 	in.logf("已创建生图会话，调用 %s %s（%s）", imageModel, imageResolution, imageRatio)
-	jt := tk.JTs[0]
-	if len(tk.JTs) > 1 {
-		jt = tk.JTs[1]
+	imageURL, err := sess.generateImage(ctx, chatID, defaultPrompt, in.Email)
+	if errors.Is(err, ErrSpamRejected) {
+		in.logf("生图被风控拦下，%s 后换新的反爬 token 重试一次", spamRetryDelay)
+		if !sleepCtx(ctx, spamRetryDelay) {
+			return imageURL, ctx.Err()
+		}
+		imageURL, err = sess.generateImage(ctx, chatID, defaultPrompt, in.Email)
 	}
-	imageURL, err := cli.generateImage(ctx, chatID, defaultPrompt, jt, tk.OUID, in.Email)
 	if err != nil {
 		return imageURL, err
 	}
@@ -196,7 +229,26 @@ func waitPoints(ctx context.Context, cli *client) (map[string]int, int, error) {
 		if err != nil {
 			return nil, 0, err
 		}
-		if total > 0 || time.Now().After(deadline) {
+		// 欢迎赠分 50 与每日额度 30 分两笔到账，等两笔都到再继续。
+		if total >= welcomePoints+dailyPoints || time.Now().After(deadline) {
+			return detail, total, nil
+		}
+		if !sleepCtx(ctx, 3*time.Second) {
+			return detail, total, ctx.Err()
+		}
+	}
+}
+
+// waitPointsAbove 轮询积分，等出图赠分到账（读到比 base 大的余额即返回）。
+// restPoint 有缓存，出图后立刻读会读到旧值。
+func waitPointsAbove(ctx context.Context, cli *client, base int) (map[string]int, int, error) {
+	deadline := time.Now().Add(pointsWaitTimeout)
+	for {
+		detail, total, err := cli.points(ctx)
+		if err != nil {
+			return nil, 0, err
+		}
+		if total > base || time.Now().After(deadline) {
 			return detail, total, nil
 		}
 		if !sleepCtx(ctx, 3*time.Second) {

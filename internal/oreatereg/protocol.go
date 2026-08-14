@@ -1,7 +1,6 @@
 package oreatereg
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -35,17 +34,19 @@ const (
 	pathConfirm = "/passport/api/emailregisterconfirm"
 	pathLogin   = "/passport/api/emaillogin"
 	pathPoints  = "/oreate/account/getpointdetail"
-	pathRest    = "/bizapi/point/getrestpoints"
-	pathChat    = "/oreate/create/chat"
-	pathStream  = "/oreate/sse/stream"
+	// pathUserInfo 拉一次用户信息，站点会顺带把当天的每日额度（30）发到账。
+	pathUserInfo = "/oreate/user/getuserinfo"
+	pathRest     = "/bizapi/point/getrestpoints"
+	pathChat     = "/oreate/create/chat"
+	pathStream   = "/oreate/sse/stream"
 )
 
 // imageMDRe 从 SSE 的 Markdown 图片片段 ![](url) 里取出出图地址：
 // 站点出图地址没有扩展名（形如 https://cdn.oreateai.com/aiimage/kling/<id>/<hash>）。
 var imageMDRe = regexp.MustCompile(`!\[[^\]]*\]\((https?://[^\s)]+)\)`)
 
-// client 是 Oreate 的协议客户端：除反爬 token jt 由浏览器铸造外，注册、确认、
-// 登录、积分、生图全部走 HTTP。
+// client 是 Oreate 的协议客户端：注册、确认、登录、积分全部走 HTTP；反爬 token jt
+// 由浏览器铸造，生图请求也必须留在浏览器页面里发（见 session.generateImage）。
 type client struct {
 	cli tls_client.HttpClient
 	ua  string
@@ -86,8 +87,8 @@ func newClient(proxy, ua string) (*client, error) {
 	return &client{cli: cli, ua: ua}, nil
 }
 
-// setCookie 覆盖站点 Cookie：生图前要把浏览器铸造 jt 时的 OUID 换回来，
-// 否则 jt 与设备不匹配会被判成 spam user。
+// setCookie 覆盖站点 Cookie：HTTP 会话必须带铸造 jt 时的那个 OUID，
+// 否则 jt 与设备不匹配会被站点判成参数非法。
 func (c *client) setCookie(name, value string) {
 	u, err := url.Parse(baseURL)
 	if err != nil {
@@ -141,8 +142,16 @@ func (c *client) request(ctx context.Context, method, path string, payload any, 
 }
 
 // callAPI 发一次 JSON 请求并校验 Oreate 的业务状态码（0 = 成功）。
+// 轮换代理的出口节点偶尔会直接重置连接，GET 是幂等的，遇到网络错误重试几次；
+// POST（注册/确认/登录）不重试，避免重复提交。
 func (c *client) callAPI(ctx context.Context, method, path string, payload any) (*apiResp, error) {
 	res, err := c.request(ctx, method, path, payload, nil)
+	for attempt := 1; err != nil && method == http.MethodGet && attempt < apiRetries; attempt++ {
+		if !sleepCtx(ctx, apiRetryDelay) {
+			return nil, err
+		}
+		res, err = c.request(ctx, method, path, payload, nil)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -210,11 +219,21 @@ var ErrEmailTaken = errors.New("该邮箱已注册 Oreate")
 // 实测是站点不收该邮箱域名（如 outlook.de），换域名的邮箱才能注册。
 var ErrSignupRejected = errors.New("站点不接受该邮箱域名")
 
+// ErrSpamRejected 生图被站点风控拦下（SSE 返回 212361 spam user）：实测机房 IP 必被拦，
+// 需要住宅代理，且生图请求必须从浏览器页面里发出。
+var ErrSpamRejected = errors.New("生图被站点风控拦下")
+
 const (
 	// codeWrongPassword 是站点密码错误的业务码。
 	codeWrongPassword = 600005
 	// codeInvalidParam 是站点参数非法的业务码。
 	codeInvalidParam = 100002
+	// codeSpamUser 是站点风控判定为垃圾用户的业务码。
+	codeSpamUser = 212361
+
+	// apiRetries/apiRetryDelay 是 GET 请求遇网络错误时的重试次数与间隔。
+	apiRetries    = 3
+	apiRetryDelay = 3 * time.Second
 )
 
 type signupData struct {
@@ -302,6 +321,12 @@ func (c *client) login(ctx context.Context, email, password string) error {
 	return nil
 }
 
+// touchUserInfo 拉一次用户信息：站点的每日额度（daily 30）是在首页请求用户信息时
+// 自动发放的，不请求它 daily 池就一直是空的。失败不影响注册，忽略错误。
+func (c *client) touchUserInfo(ctx context.Context) {
+	_, _ = c.callAPI(ctx, http.MethodGet, pathUserInfo, nil)
+}
+
 // points 返回积分总额（/bizapi/point/getrestpoints 的 restPoint，站点顶栏显示的就是它）
 // 与各积分池明细（daily 每日额度、bonus 赠送额度、pro 会员额度，都自动到账）。
 func (c *client) points(ctx context.Context) (map[string]int, int, error) {
@@ -316,6 +341,7 @@ func (c *client) points(ctx context.Context) (map[string]int, int, error) {
 		return nil, 0, err
 	}
 	detail := map[string]int{}
+	sum := 0
 	if dresp, derr := c.callAPI(ctx, http.MethodGet, pathPoints, nil); derr == nil {
 		var buckets map[string]*struct {
 			Amount int `json:"amount"`
@@ -327,8 +353,13 @@ func (c *client) points(ctx context.Context) (map[string]int, int, error) {
 					continue
 				}
 				detail[name] = b.Amount
+				sum += b.Amount
 			}
 		}
+	}
+	// restPoint 有缓存，赠分刚到账时会比明细里的池子小，取大的那个才是真实余额。
+	if sum > rest.RestPoint {
+		return detail, sum, nil
 	}
 	return detail, rest.RestPoint, nil
 }
@@ -350,90 +381,27 @@ func (c *client) createChat(ctx context.Context) (string, error) {
 	return d.ChatID, nil
 }
 
-// generateImage 用 Kling3.0 Omini / 1k / 1:1 生成一张图，从 SSE 流里取出图地址。
-// jt/ouid 必须来自同一次浏览器铸造，否则会被判成 spam user。
-func (c *client) generateImage(ctx context.Context, chatID, prompt, jt, ouid, email string) (string, error) {
-	body := map[string]any{
-		"jt":     jt,
-		"ua":     c.ua,
-		"js_env": "h5",
-		"extra": map[string]any{
-			"email":       email,
-			"vip":         "0",
-			"reg_ts":      time.Now().Unix(),
-			"deviceID":    ouid,
-			"bid":         "",
-			"doc_name":    "",
-			"module_name": "gpt4o",
-		},
-		"clientType": "pc",
-		"type":       "chat",
-		"chatType":   "aiImage",
-		"chatTitle":  "Unnamed Session",
-		"focusId":    chatID,
-		"chatId":     chatID,
-		"from":       "home",
-		"messages": []map[string]any{{
-			"role":        "user",
-			"content":     prompt,
-			"attachments": []any{},
-		}},
-		"imageConfig": map[string]any{
-			"modelName":  imageModel,
-			"ratio":      imageRatio,
-			"resolution": imageResolution,
-		},
-		"isFirst": true,
-	}
-	res, err := c.request(ctx, http.MethodPost, pathStream, body, map[string]string{
-		"accept":  "text/event-stream",
-		"referer": baseURL + "/home/chat/aiImage/" + chatID,
-	})
-	if err != nil {
-		return "", err
-	}
-	defer res.Body.Close()
-
-	reader := bufio.NewReader(res.Body)
+// parseImageStream 解析生图 SSE 流：取出图地址，识别风控与业务错误。
+func parseImageStream(stream string) (string, error) {
 	imageURL := ""
-	var tail strings.Builder
-	for {
-		if ctx.Err() != nil {
-			return imageURL, ctx.Err()
+	for _, line := range strings.Split(stream, "\n") {
+		if m := imageMDRe.FindStringSubmatch(line); len(m) == 2 {
+			imageURL = m[1]
 		}
-		line, rerr := reader.ReadString('\n')
-		if line != "" {
-			if tail.Len() < 4096 {
-				tail.WriteString(line)
+		if code, msg := streamError(line); msg != "" {
+			if code == codeSpamUser {
+				return imageURL, fmt.Errorf("%w: %s", ErrSpamRejected, msg)
 			}
-			if m := imageMDRe.FindStringSubmatch(line); len(m) == 2 {
-				imageURL = m[1]
-			}
-			if msg := streamError(line); msg != "" {
-				return imageURL, fmt.Errorf("生图被拒: %s", msg)
-			}
-			if imageURL != "" && strings.Contains(line, `"event":"end"`) {
-				return imageURL, nil
-			}
+			return imageURL, fmt.Errorf("生图被拒: %s", msg)
 		}
-		if rerr != nil {
-			if rerr == io.EOF {
-				break
-			}
-			return imageURL, rerr
-		}
-	}
-	if imageURL == "" {
-		return "", fmt.Errorf("生图流已结束但没有拿到出图地址(HTTP %d): %s",
-			res.StatusCode, trimText(tail.String(), 500))
 	}
 	return imageURL, nil
 }
 
-// streamError 识别 SSE 里的错误事件（如 code=212361 spam user）。
-func streamError(line string) string {
+// streamError 识别 SSE 里的错误事件（如 code=212361 spam user），返回业务码与描述。
+func streamError(line string) (int, string) {
 	if !strings.Contains(line, `"event":"error"`) && !strings.Contains(line, `"code":2123`) {
-		return ""
+		return 0, ""
 	}
 	var evt struct {
 		Event string `json:"event"`
@@ -444,9 +412,9 @@ func streamError(line string) string {
 	}
 	payload := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "data:"))
 	if json.Unmarshal([]byte(payload), &evt) == nil && evt.Data.Msg != "" {
-		return fmt.Sprintf("code=%d msg=%s", evt.Data.Code, evt.Data.Msg)
+		return evt.Data.Code, fmt.Sprintf("code=%d msg=%s", evt.Data.Code, evt.Data.Msg)
 	}
-	return trimText(line, 200)
+	return 0, trimText(line, 200)
 }
 
 func trimText(s string, n int) string {
