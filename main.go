@@ -52,6 +52,13 @@ func main() {
 		log.Printf("reset leonardo registering on boot: %v", err)
 	}
 
+	if err := database.Exec(
+		"UPDATE oreate_registrations SET status = 'register_failed', log = log || ? WHERE status = 'registering'",
+		"\n"+time.Now().Format("2006-01-02 15:04:05")+" ✗ 程序重启，Oreate 任务中断，判定为失败",
+	).Error; err != nil {
+		log.Printf("reset oreate registering on boot: %v", err)
+	}
+
 	authSvc, err := auth.New(database)
 	if err != nil {
 		log.Fatalf("init auth: %v", err)
@@ -165,6 +172,17 @@ func main() {
 		api.POST("/leonardo/registrations/livecheck", h.LeonardoLiveCheckStart)
 		api.GET("/leonardo/registrations/livecheck/status", h.LeonardoLiveCheckStatus)
 		api.POST("/leonardo/registrations/:id/livecheck", h.LeonardoLiveCheckOne)
+
+		api.GET("/oreate/registrations", h.OreateList)
+		api.DELETE("/oreate/registrations", h.OreateDeleteAll)
+		api.POST("/oreate/registrations", h.OreateStart)
+		api.POST("/oreate/produce", h.OreateProduce)
+		api.GET("/oreate/produce/status", h.OreateProduceStatus)
+		api.POST("/oreate/produce/stop", h.OreateProduceStop)
+		api.POST("/oreate/registrations/:id/stop", h.OreateStop)
+		api.DELETE("/oreate/registrations/:id", h.OreateDelete)
+		api.GET("/oreate/registrations/:id/logs", h.OreateLog)
+		api.POST("/oreate/download", h.OreateDownload)
 	}
 
 	sub, err := fs.Sub(staticFS, "static")
@@ -173,7 +191,7 @@ func main() {
 	}
 	httpFS := http.FS(sub)
 	r.StaticFS("/static", httpFS)
-	for _, p := range []string{"login", "dashboard", "mailboxes", "accounts", "grok", "adobe", "leonardo", "settings"} {
+	for _, p := range []string{"login", "dashboard", "mailboxes", "accounts", "grok", "adobe", "leonardo", "oreate", "settings"} {
 		p := p
 		r.GET("/"+p, func(c *gin.Context) { c.FileFromFS(p+".html", httpFS) })
 	}

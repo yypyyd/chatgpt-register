@@ -12,6 +12,7 @@ import (
 	"chatgpt-register/internal/mailfetch"
 	"chatgpt-register/internal/mailverify"
 	"chatgpt-register/internal/models"
+	"chatgpt-register/internal/oreateproducer"
 	"chatgpt-register/internal/producer"
 
 	"github.com/gin-gonic/gin"
@@ -26,6 +27,7 @@ type Handler struct {
 	GrokProducer     *grokproducer.Producer
 	AdobeProducer    *adobeproducer.Producer
 	LeonardoProducer *leonardoproducer.Producer
+	OreateProducer   *oreateproducer.Producer
 	Browser          *browserboot.Manager
 	MailboxVerifier  *mailverify.Service
 	// Live 保存各平台的批量测活进度（仅内存），键：chatgpt / grok / adobe / leonardo。
@@ -38,7 +40,7 @@ func New(db *gorm.DB, authSvc *auth.Service, browser *browserboot.Manager) (*Han
 	if err := verifier.Start(); err != nil {
 		return nil, err
 	}
-	return &Handler{DB: db, Mail: mail, Auth: authSvc, Producer: producer.New(db, mail), GrokProducer: grokproducer.New(db, mail), AdobeProducer: adobeproducer.New(db, mail), LeonardoProducer: leonardoproducer.New(db, mail), Browser: browser, MailboxVerifier: verifier, Live: newLiveRunners()}, nil
+	return &Handler{DB: db, Mail: mail, Auth: authSvc, Producer: producer.New(db, mail), GrokProducer: grokproducer.New(db, mail), AdobeProducer: adobeproducer.New(db, mail), LeonardoProducer: leonardoproducer.New(db, mail), OreateProducer: oreateproducer.New(db, mail), Browser: browser, MailboxVerifier: verifier, Live: newLiveRunners()}, nil
 }
 
 type registrationInput struct {
