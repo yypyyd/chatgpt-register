@@ -39,10 +39,6 @@ const (
 	defaultLaunchStaggerSec = 45
 )
 
-// errConfirmMailTimeout 等确认邮件超时。确认链接 10 分钟就过期，迟到的邮件没有用，
-// 这种任务标终态不再冷却重试同一邮箱，由补任务换新邮箱接着凑数。
-var errConfirmMailTimeout = errors.New("超时未收到 Oreate 确认邮件")
-
 type Producer struct {
 	db   *gorm.DB
 	mail *mailfetch.Client
@@ -460,8 +456,8 @@ func (p *Producer) run(id uint) {
 			// 这个邮箱的确认邮件配额用完了，换邮箱才有意义，别再冷却重试。
 			status = "email_rejected"
 		}
-		if errors.Is(err, errConfirmMailTimeout) {
-			// 邮件超时的邮箱确认链接已过期，重试同一邮箱只会再烧一次发信配额。
+		if errors.Is(err, oreatereg.ErrConfirmMailTimeout) {
+			// 重发几次仍超时的邮箱确认链接已过期，重试同一邮箱只会再烧发信配额。
 			status = "mail_timeout"
 		}
 		if errors.Is(err, oreatereg.ErrSignupRejected) {
@@ -567,13 +563,13 @@ func (p *Producer) fetchConfirmLink(ctx context.Context, id, mailboxID uint, sin
 	}
 	// 超时时把注册后收到的新邮件列出来，区分是邮件根本没送达还是发件人/主题没匹配上。
 	if len(recent) == 0 {
-		return "", fmt.Errorf("%w（注册后收件箱/垃圾箱没有任何新邮件）", errConfirmMailTimeout)
+		return "", fmt.Errorf("%w（注册后收件箱/垃圾箱没有任何新邮件）", oreatereg.ErrConfirmMailTimeout)
 	}
 	summary := make([]string, 0, len(recent))
 	for _, m := range recent {
 		summary = append(summary, m.From+" | "+m.Subject)
 	}
-	return "", fmt.Errorf("%w（注册后新邮件: %s）", errConfirmMailTimeout, strings.Join(summary, "; "))
+	return "", fmt.Errorf("%w（注册后新邮件: %s）", oreatereg.ErrConfirmMailTimeout, strings.Join(summary, "; "))
 }
 
 func looksLikeOreate(m mailfetch.Message) bool {
@@ -745,3 +741,4 @@ func mailDomain(email string) string {
 	}
 	return ""
 }
+

@@ -225,6 +225,10 @@ var ErrSignupRejected = errors.New("站点不接受该邮箱域名")
 // 站点不会再给它发链接，只能换邮箱。
 var ErrConfirmMailLimited = errors.New("确认邮件发送次数已用完")
 
+// ErrConfirmMailTimeout 等确认邮件超时，由上层 WaitConfirmLink 包着返回：
+// 确认链接 10 分钟就过期，迟到的邮件没有用，Register 收到后会重发新邮件接着等。
+var ErrConfirmMailTimeout = errors.New("超时未收到 Oreate 确认邮件")
+
 // ErrImageStreamBroken 生图 SSE 长连接被中途掐断（多为代理线路问题）：站点已受理并扣分，
 // 换新 jt 重试一次通常就能出图。
 var ErrImageStreamBroken = errors.New("生图流被中途断开")

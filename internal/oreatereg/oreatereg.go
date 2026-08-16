@@ -141,7 +141,7 @@ func Register(ctx context.Context, in Input) (*Result, error) {
 	}
 	in.logf("注册已提交，确认邮件已发出，等待邮箱里的确认链接")
 
-	link, err := in.WaitConfirmLink(ctx)
+	link, err := waitConfirmLinkWithResend(ctx, in, cli, sess)
 	if err != nil {
 		return nil, err
 	}
@@ -216,6 +216,49 @@ func Register(ctx context.Context, in Input) (*Result, error) {
 		ImageModel:  imageModel + " " + imageResolution,
 		CapturedAt:  time.Now().UTC().Format(time.RFC3339),
 	}, nil
+}
+
+// confirmResendLimit 首封确认邮件超时后最多再重发的次数。确认邮件偶发被 Outlook
+// 暂拒推迟 10 分钟以上，等到手链接也已过期；每封是否被暂拒相互独立，重发比干等有效。
+const confirmResendLimit = 2
+
+// waitConfirmLinkWithResend 等确认邮件；超时则用新铸的 jt 重新提交注册触发重发，
+// 换一封新邮件（新确认链接）接着等。
+func waitConfirmLinkWithResend(ctx context.Context, in Input, cli *client, sess *session) (string, error) {
+	for resent := 0; ; resent++ {
+		link, err := in.WaitConfirmLink(ctx)
+		if err == nil {
+			return link, nil
+		}
+		if resent >= confirmResendLimit || !errors.Is(err, ErrConfirmMailTimeout) || ctx.Err() != nil {
+			return "", err
+		}
+		in.logf("确认邮件超时未到，重发一封新确认邮件（第 %d/%d 次）", resent+1, confirmResendLimit)
+		jt, err := sess.mint(ctx, in)
+		if err != nil {
+			return "", fmt.Errorf("重发确认邮件时铸造反爬 token 失败: %w", err)
+		}
+		t, err := cli.ticket(ctx)
+		if err != nil {
+			return "", fmt.Errorf("重发确认邮件时取票据失败: %w", err)
+		}
+		encPassword, err := encryptPassword(t.PK, in.Password)
+		if err != nil {
+			return "", err
+		}
+		resend, err := cli.signup(ctx, in.Email, encPassword, t.TicketID, jt)
+		if err != nil {
+			return "", fmt.Errorf("重发确认邮件失败: %w", err)
+		}
+		switch {
+		case resend.ConfirmEmailStatus == confirmMailLimited:
+			return "", fmt.Errorf("%w（已发 %d/%d 封）", ErrConfirmMailLimited,
+				resend.SendEmailCount, resend.TotalCanSendEmailCount)
+		case resend.ConfirmEmailStatus != confirmMailSent:
+			return "", fmt.Errorf("重发确认邮件未受理（站点返回 %s）", resend.Raw)
+		}
+		in.logf("新确认邮件已发出，继续等待")
+	}
 }
 
 // generate 建会话并在浏览器页面里出一张图，出图后站点自动加赠 50 积分。
@@ -385,3 +428,4 @@ func GenPassword(n int) string {
 	}
 	return string(b)
 }
+
