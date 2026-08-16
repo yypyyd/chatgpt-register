@@ -24,10 +24,22 @@ func TestWithBestGoTaskSession(t *testing.T) {
 	}
 }
 
-func TestWithBestGoTaskSessionPreservesExplicitSession(t *testing.T) {
-	raw := "http://user-zone-custom-session-fixed:pass@us.rrp.bestgo.work:10000"
-	if got := WithBestGoTaskSession(raw); got != raw {
-		t.Fatalf("explicit session changed: %q", got)
+func TestWithBestGoTaskSessionReplacesFixedSession(t *testing.T) {
+	raw := "http://user-zone-custom-session-16814058-sessTime-5-sessAuto-1:pass@us.rrp.bestgo.work:10000"
+	got := WithBestGoTaskSession(raw)
+	u, err := url.Parse(got)
+	if err != nil {
+		t.Fatalf("parse result: %v", err)
+	}
+	user := u.User.Username()
+	if strings.Contains(user, "-session-16814058") {
+		t.Fatalf("fixed session kept: %q", user)
+	}
+	if !strings.Contains(user, "-sessTime-5-sessAuto-1") {
+		t.Fatalf("other session params lost: %q", user)
+	}
+	if got == WithBestGoTaskSession(raw) {
+		t.Fatalf("session not randomized per call: %q", got)
 	}
 }
 

@@ -4,14 +4,19 @@ import (
 	cryptorand "crypto/rand"
 	"encoding/hex"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 )
 
+// sessionParamRe 匹配 BestGo 用户名里的 -session-<值> 片段（值不含连字符）。
+var sessionParamRe = regexp.MustCompile(`(?i)(-session-)[^-]*`)
+
 // WithBestGoTaskSession gives a dynamic BestGo residential proxy a stable
 // task-level session. Without it, BestGo rotates the exit per request, which
 // makes one browser/protocol registration appear from multiple IP addresses.
-// An explicit user-provided session is preserved.
+// 用户串里写死的 session 会被换成本任务的随机值：固定 session 会让所有任务共用
+// 同一个出口 IP，站点很快就把这个 IP 判成 spam。
 func WithBestGoTaskSession(raw string) string {
 	raw = strings.TrimSpace(raw)
 	lower := strings.ToLower(raw)
@@ -24,11 +29,13 @@ func WithBestGoTaskSession(raw string) string {
 		return raw
 	}
 	user := u.User.Username()
-	if strings.Contains(strings.ToLower(user), "-session-") {
-		return raw
+	token := sessionToken(8)
+	if sessionParamRe.MatchString(user) {
+		user = sessionParamRe.ReplaceAllString(user, "${1}"+token)
+	} else {
+		user += "-session-" + token
 	}
 	pass, hasPass := u.User.Password()
-	user += "-session-" + sessionToken(8)
 	if hasPass {
 		u.User = url.UserPassword(user, pass)
 	} else {

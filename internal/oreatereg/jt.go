@@ -75,6 +75,21 @@ const genImageJS = `(args) => new Promise(resolve => {
   });
 })`
 
+const (
+	// navigateTimeout 是单次导航的最长等待时间。
+	navigateTimeout = 60 * time.Second
+
+	// antibotWaitTimeout 是等页面里反爬脚本注册好 ParisFactory 的最长时间。
+	antibotWaitTimeout = 45 * time.Second
+
+	// antibotSettle 是反爬脚本出现后再等一小会儿，让它内部初始化完。
+	antibotSettle = 5 * time.Second
+
+	// openAttempts/openRetryDelay 是打开页面失败后的重试次数与间隔。
+	openAttempts   = 3
+	openRetryDelay = 5 * time.Second
+)
+
 // session 是一次浏览器会话。反爬 token jt 是一次性的，且与铸造它的 OUID/UA 以及
 // 页面上下文绑定：注册用的 jt 可以拿出来走 HTTP，但生图请求必须留在这个页面里发，
 // 所以整个流程期间浏览器都不关。
@@ -198,17 +213,54 @@ func openSession(ctx context.Context, in Input) (result *session, err error) {
 }
 
 // open 打开一个站点页面并等反爬脚本注册好 ParisFactory（它是页面加载后异步拉起的）。
+// 站点页面会拉几十个 CDN 静态资源，等 load 事件经常被其中某个慢资源拖到超时，
+// 而流程只需要 ParisFactory 可用，所以导航超时也先看脚本在不在，实在不行再重试。
 func (s *session) open(ctx context.Context, pageURL string) error {
-	if err := s.page.Timeout(90 * time.Second).Navigate(pageURL); err != nil {
-		return err
+	var lastErr error
+	for attempt := 1; attempt <= openAttempts; attempt++ {
+		if attempt > 1 && !sleepCtx(ctx, openRetryDelay) {
+			return ctx.Err()
+		}
+		navErr := s.page.Timeout(navigateTimeout).Navigate(pageURL)
+		lastErr = s.waitAntibot(ctx)
+		if lastErr == nil {
+			return nil
+		}
+		if navErr != nil {
+			lastErr = navErr
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 	}
-	if err := s.page.Timeout(90 * time.Second).WaitLoad(); err != nil {
-		return err
+	return lastErr
+}
+
+// waitAntibot 轮询等页面里的反爬脚本 ParisFactory 就绪。
+func (s *session) waitAntibot(ctx context.Context) error {
+	deadline := time.Now().Add(antibotWaitTimeout)
+	for {
+		ready := false
+		obj, err := s.page.Timeout(15 * time.Second).Eval(`() => !!window.ParisFactory`)
+		if err == nil {
+			ready = obj.Value.Bool()
+		}
+		if ready {
+			if !sleepCtx(ctx, antibotSettle) {
+				return ctx.Err()
+			}
+			return nil
+		}
+		if time.Now().After(deadline) {
+			if err != nil {
+				return fmt.Errorf("等待反爬脚本就绪失败: %w", err)
+			}
+			return fmt.Errorf("页面加载后反爬脚本未就绪")
+		}
+		if !sleepCtx(ctx, time.Second) {
+			return ctx.Err()
+		}
 	}
-	if !sleepCtx(ctx, 8*time.Second) {
-		return ctx.Err()
-	}
-	return nil
 }
 
 func (s *session) close() {
@@ -304,8 +356,14 @@ func (s *session) generateImage(ctx context.Context, chatID, prompt, email strin
 		return imageURL, perr
 	}
 	if imageURL == "" {
-		return "", fmt.Errorf("生图流已结束但没有拿到出图地址(HTTP %d %s): %s",
-			out.Status, out.Err, trimText(out.Text, 500))
+		// 页面里的 fetch 报错、流里也没有出图地址：多是代理把这条几十秒的长连接掐了，
+		// 站点其实已受理并扣了分，单独标记出来让上层重试而不是直接判失败。
+		if out.Err != "" {
+			return "", fmt.Errorf("%w(HTTP %d %s): %s", ErrImageStreamBroken,
+				out.Status, out.Err, trimText(out.Text, 300))
+		}
+		return "", fmt.Errorf("生图流已结束但没有拿到出图地址(HTTP %d): %s",
+			out.Status, trimText(out.Text, 500))
 	}
 	return imageURL, nil
 }

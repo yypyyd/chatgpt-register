@@ -37,6 +37,8 @@ const (
 	// pathUserInfo 拉一次用户信息，站点会顺带把当天的每日额度（30）发到账。
 	pathUserInfo = "/oreate/user/getuserinfo"
 	pathRest     = "/bizapi/point/getrestpoints"
+	// pathFirstUse 是站点前端出图后触发首次使用赠分的接口。
+	pathFirstUse = "/oreate/account/getfirstusepoint"
 	pathChat     = "/oreate/create/chat"
 	pathStream   = "/oreate/sse/stream"
 )
@@ -219,6 +221,14 @@ var ErrEmailTaken = errors.New("该邮箱已注册 Oreate")
 // 实测是站点不收该邮箱域名（如 outlook.de），换域名的邮箱才能注册。
 var ErrSignupRejected = errors.New("站点不接受该邮箱域名")
 
+// ErrConfirmMailLimited 该邮箱的确认邮件发送次数已用完（confirmEmailStatus=2），
+// 站点不会再给它发链接，只能换邮箱。
+var ErrConfirmMailLimited = errors.New("确认邮件发送次数已用完")
+
+// ErrImageStreamBroken 生图 SSE 长连接被中途掐断（多为代理线路问题）：站点已受理并扣分，
+// 换新 jt 重试一次通常就能出图。
+var ErrImageStreamBroken = errors.New("生图流被中途断开")
+
 // ErrSpamRejected 生图被站点风控拦下（SSE 返回 212361 spam user）：实测机房 IP 必被拦，
 // 需要住宅代理，且生图请求必须从浏览器页面里发出。
 var ErrSpamRejected = errors.New("生图被站点风控拦下")
@@ -231,6 +241,13 @@ const (
 	// codeSpamUser 是站点风控判定为垃圾用户的业务码。
 	codeSpamUser = 212361
 
+	// confirmMailSent/confirmMailLimited 是站点前端的 confirmEmailStatus 枚举
+	// ny={isLimited:2,sendSuccess:0}：0 为确认邮件已发出，2 为发送次数用完。
+	confirmMailSent    = 0
+	confirmMailLimited = 2
+	// registerVerified 是站点前端的 registerStatus 枚举 _q={alreadyVerified:2}。
+	registerVerified = 2
+
 	// apiRetries/apiRetryDelay 是 GET 请求遇网络错误时的重试次数与间隔。
 	apiRetries    = 3
 	apiRetryDelay = 3 * time.Second
@@ -241,6 +258,12 @@ type signupData struct {
 	SendEmailCount         int  `json:"sendEmailCount"`
 	TotalCanSendEmailCount int  `json:"totalCanSendEmailCount"`
 	SignupStatus           int  `json:"signupStatus"`
+	SigninStatus           int  `json:"signinStatus"`
+	RegisterStatus         int  `json:"registerStatus"`
+	ConfirmEmailStatus     int  `json:"confirmEmailStatus"`
+
+	// Raw 保留站点返回的原始 data，注册未受理时带进日志便于定位。
+	Raw string `json:"-"`
 }
 
 // signup 提交注册，成功后站点会把确认链接发到邮箱。jt 必须是浏览器现铸的一次性 token。
@@ -271,6 +294,7 @@ func (c *client) signup(ctx context.Context, email, encPassword, ticketID, jt st
 	if err = json.Unmarshal(resp.Data, &d); err != nil {
 		return nil, err
 	}
+	d.Raw = trimText(string(resp.Data), 300)
 	return &d, nil
 }
 
@@ -325,6 +349,12 @@ func (c *client) login(ctx context.Context, email, password string) error {
 // 自动发放的，不请求它 daily 池就一直是空的。失败不影响注册，忽略错误。
 func (c *client) touchUserInfo(ctx context.Context) {
 	_, _ = c.callAPI(ctx, http.MethodGet, pathUserInfo, nil)
+}
+
+// firstUsePoint 拉一次首次使用赠分接口：站点前端在出图后就是靠它触发赠分发放的，
+// 不调用赠分会一直不到账。失败不影响注册，忽略错误。
+func (c *client) firstUsePoint(ctx context.Context) {
+	_, _ = c.callAPI(ctx, http.MethodGet, pathFirstUse, nil)
 }
 
 // points 返回积分总额（/bizapi/point/getrestpoints 的 restPoint，站点顶栏显示的就是它）

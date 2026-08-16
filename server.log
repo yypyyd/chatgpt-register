@@ -1,1 +1,5 @@
 2026/08/13 20:45:12 chatgpt-register listening on http://localhost:9000
+
+2026/08/15 03:16:45 [32me:/CODE/Register/chatgpt-register/internal/mailverify/service.go:155 [33mSLOW SQL >= 200ms
+[0m[31;1m[260.097ms] [33m[rows:0][35m SELECT * FROM `mailboxes` WHERE status = "unverified" ORDER BY id desc LIMIT 21[0m
+[GIN] 2026/08/15 - 06:46:36 | 401 |   3.41ms |       127.0.0.1 | GET      "/api/settings"

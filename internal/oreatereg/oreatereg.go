@@ -33,6 +33,15 @@ const (
 	// spamRetryDelay 生图被风控拦下后重试前的等待时间。
 	spamRetryDelay = 45 * time.Second
 
+	// streamRetryDelay/streamRetryLimit 是生图断流且确认没出图后重新提交的间隔与次数。
+	// 重新提交会再扣一次生图额度，所以断流后先轮询赠分确认站点是否已出图，确认不了才补交。
+	streamRetryDelay = 10 * time.Second
+	streamRetryLimit = 1
+
+	// imageConfirmWait 是断流后轮询出图赠分到账的最长时间：断流时站点大多已实际出图，
+	// 只是回传的 SSE 流被代理掐了，出图赠分（bonus 50→100）到账即可判定出图成功。
+	imageConfirmWait = 90 * time.Second
+
 	// imageWaitTimeout 等生图 SSE 流出图的最长时间（实测约 25s）。
 	imageWaitTimeout = 3 * time.Minute
 
@@ -119,8 +128,16 @@ func Register(ctx context.Context, in Input) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !signup.IsRegister {
-		return nil, fmt.Errorf("站点未受理注册（signupStatus=%d）", signup.SignupStatus)
+	// 站点前端只看这两个状态：registerStatus=2 表示邮箱已验证过，
+	// confirmEmailStatus=0 才表示确认邮件真的发出去了（2 是发送次数用完）。
+	switch {
+	case signup.RegisterStatus == registerVerified:
+		return nil, fmt.Errorf("%w（站点返回该邮箱已完成验证）", ErrEmailTaken)
+	case signup.ConfirmEmailStatus == confirmMailLimited:
+		return nil, fmt.Errorf("%w（已发 %d/%d 封）", ErrConfirmMailLimited,
+			signup.SendEmailCount, signup.TotalCanSendEmailCount)
+	case signup.ConfirmEmailStatus != confirmMailSent:
+		return nil, fmt.Errorf("站点未受理注册（站点返回 %s）", signup.Raw)
 	}
 	in.logf("注册已提交，确认邮件已发出，等待邮箱里的确认链接")
 
@@ -170,8 +187,11 @@ func Register(ctx context.Context, in Input) (*Result, error) {
 		in.logf("生图失败: %v（账号已注册可用，积分加赠未完成）", genErr)
 	}
 
-	if genErr == nil {
-		// 出图赠分也是异步到账的，等它到账再记录，否则导出的积分会少 50。
+	// 出图赠分要请求一次首用赠分接口才会发放（站点前端出图后就是这么做的）；
+	// 生图流被掐断时站点其实可能已经出图，也照样查一次。
+	cli.firstUsePoint(ctx)
+	if genErr == nil || errors.Is(genErr, ErrImageStreamBroken) {
+		// 出图赠分是异步到账的，等它到账再记录，否则导出的积分会少 50。
 		cli.touchUserInfo(ctx)
 		detail, total, err = waitPointsAbove(ctx, cli, total)
 	} else {
@@ -207,9 +227,27 @@ func generate(ctx context.Context, cli *client, in Input, sess *session) (string
 	}
 	in.logf("已创建生图会话，调用 %s %s（%s）", imageModel, imageResolution, imageRatio)
 	imageURL, err := sess.generateImage(ctx, chatID, defaultPrompt, in.Email)
-	if errors.Is(err, ErrSpamRejected) {
+	switch {
+	case errors.Is(err, ErrSpamRejected):
 		in.logf("生图被风控拦下，%s 后换新的反爬 token 重试一次", spamRetryDelay)
 		if !sleepCtx(ctx, spamRetryDelay) {
+			return imageURL, ctx.Err()
+		}
+		imageURL, err = sess.generateImage(ctx, chatID, defaultPrompt, in.Email)
+	}
+	for retry := 0; errors.Is(err, ErrImageStreamBroken); retry++ {
+		// 断流时站点大多已受理并出图，先轮询赠分确认，别急着重新提交烧生图额度。
+		in.logf("生图长连接被掐断（多为代理线路问题），轮询积分确认站点是否已出图")
+		if confirmImageByPoints(ctx, cli) {
+			in.logf("出图赠分已到账，站点侧已出图，不再重复提交")
+			return imageURL, nil
+		}
+		if retry >= streamRetryLimit {
+			break
+		}
+		in.logf("等 %s 未确认出图，%s 后重新提交（第 %d/%d 次）",
+			imageConfirmWait, streamRetryDelay, retry+1, streamRetryLimit)
+		if !sleepCtx(ctx, streamRetryDelay) {
 			return imageURL, ctx.Err()
 		}
 		imageURL, err = sess.generateImage(ctx, chatID, defaultPrompt, in.Email)
@@ -219,6 +257,21 @@ func generate(ctx context.Context, cli *client, in Input, sess *session) (string
 	}
 	in.logf("生图完成: %s", imageURL)
 	return imageURL, nil
+}
+
+// confirmImageByPoints 断流后轮询积分确认站点是否已出图：出图成功后站点会发放
+// 50 出图赠分（bonus 池 50→100），到账即说明图已生成、只是回传流被掐断。
+func confirmImageByPoints(ctx context.Context, cli *client) bool {
+	deadline := time.Now().Add(imageConfirmWait)
+	for {
+		cli.firstUsePoint(ctx)
+		if detail, _, err := cli.points(ctx); err == nil && detail["bonus"] > welcomePoints {
+			return true
+		}
+		if time.Now().After(deadline) || !sleepCtx(ctx, 5*time.Second) {
+			return false
+		}
+	}
 }
 
 // waitPoints 轮询积分，等注册赠分到账（最多等 pointsWaitTimeout）。

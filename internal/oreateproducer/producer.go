@@ -22,7 +22,7 @@ import (
 
 const (
 	// linkPollTimeout 等确认邮件的总时长，linkPollInterval 为轮询间隔。
-	linkPollTimeout  = 5 * time.Minute
+	linkPollTimeout  = 3 * time.Minute
 	linkPollInterval = 3 * time.Second
 	maxLogBytes      = 64 * 1024
 
@@ -32,7 +32,16 @@ const (
 	// badDomainLimit 同一邮箱域名被站点拒收几次后，本次生产不再取该域名的邮箱，
 	// 免得把整池同域名邮箱白白消耗掉。
 	badDomainLimit = 2
+
+	// defaultLaunchStaggerSec 相邻两个注册任务开始提交的默认最小间隔（秒）。
+	// 同一秒内并发提交多个注册时，站点会限流确认邮件（一批往往只有一封准时到，
+	// 其余延迟约 10 分钟直接超时），错峰提交可以避开限流。
+	defaultLaunchStaggerSec = 45
 )
+
+// errConfirmMailTimeout 等确认邮件超时。确认链接 10 分钟就过期，迟到的邮件没有用，
+// 这种任务标终态不再冷却重试同一邮箱，由补任务换新邮箱接着凑数。
+var errConfirmMailTimeout = errors.New("超时未收到 Oreate 确认邮件")
 
 type Producer struct {
 	db   *gorm.DB
@@ -48,6 +57,8 @@ type Producer struct {
 	runTracked  []uint
 	// badDomains 记录被站点拒收的邮箱域名及次数。
 	badDomains map[string]int
+	// nextLaunch 下一个注册任务最早可以开始提交的时间，用于错峰提交。
+	nextLaunch time.Time
 }
 
 func New(db *gorm.DB, mail *mailfetch.Client) *Producer {
@@ -411,6 +422,15 @@ func (p *Producer) run(id uint) {
 	}
 	defer p.releaseSlot()
 
+	if !p.waitLaunchTurn(ctx, id) {
+		p.appendLog(id, "已取消（错峰等待提交时被停止）")
+		p.db.Model(&models.OreateRegistration{}).Where("id = ?", id).Updates(map[string]any{
+			"status": "register_failed",
+			"note":   "已取消",
+		})
+		return
+	}
+
 	p.appendLog(id, "开始 Oreate 全协议注册")
 	since := time.Now().Add(-30 * time.Second)
 
@@ -436,6 +456,14 @@ func (p *Producer) run(id uint) {
 			// 邮箱已被注册是终态，标成 already_registered 后不再进冷却重试。
 			status = "already_registered"
 		}
+		if errors.Is(err, oreatereg.ErrConfirmMailLimited) {
+			// 这个邮箱的确认邮件配额用完了，换邮箱才有意义，别再冷却重试。
+			status = "email_rejected"
+		}
+		if errors.Is(err, errConfirmMailTimeout) {
+			// 邮件超时的邮箱确认链接已过期，重试同一邮箱只会再烧一次发信配额。
+			status = "mail_timeout"
+		}
 		if errors.Is(err, oreatereg.ErrSignupRejected) {
 			// 站点不收这个域名，重试也没用，同时记下域名不再取同域名邮箱。
 			status = "email_rejected"
@@ -458,6 +486,42 @@ func (p *Producer) run(id uint) {
 	})
 }
 
+// launchStagger 跟设置页「注册错峰间隔」(launch_stagger_sec)，未设置默认 45 秒，
+// 设 0 表示不错峰、完全并发提交。
+func (p *Producer) launchStagger() time.Duration {
+	raw := strings.TrimSpace(p.getSetting("launch_stagger_sec"))
+	sec := defaultLaunchStaggerSec
+	if raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n >= 0 {
+			sec = n
+		}
+	}
+	return time.Duration(sec) * time.Second
+}
+
+// waitLaunchTurn 错峰提交：把相邻两次注册提交至少隔开错峰间隔，
+// 避免同一秒内并发提交触发站点对确认邮件的限流。
+func (p *Producer) waitLaunchTurn(ctx context.Context, id uint) bool {
+	stagger := p.launchStagger()
+	if stagger <= 0 {
+		return true
+	}
+	p.mu.Lock()
+	now := time.Now()
+	next := p.nextLaunch
+	if next.Before(now) {
+		next = now
+	}
+	p.nextLaunch = next.Add(stagger)
+	p.mu.Unlock()
+	delay := next.Sub(now)
+	if delay <= 0 {
+		return true
+	}
+	p.appendLog(id, fmt.Sprintf("错峰提交：等 %s 再开始，避免确认邮件被站点限流", delay.Round(time.Second)))
+	return sleepCtx(ctx, delay)
+}
+
 // fetchConfirmLink 轮询邮箱，取出 Oreate 注册确认邮件里的链接。
 func (p *Producer) fetchConfirmLink(ctx context.Context, id, mailboxID uint, since time.Time) (string, error) {
 	var mb models.Mailbox
@@ -467,14 +531,20 @@ func (p *Producer) fetchConfirmLink(ctx context.Context, id, mailboxID uint, sin
 	acc := mailfetch.Account{Email: mb.Email, ClientID: mb.ClientID, RefreshToken: mb.RefreshToken}
 	deadline := time.Now().Add(linkPollTimeout)
 	p.appendLog(id, "开始自动读取 Oreate 确认邮件")
+	var recent []mailfetch.Message
 	for time.Now().Before(deadline) {
 		if ctx.Err() != nil {
 			return "", ctx.Err()
 		}
 		msgs, err := p.mail.ListMessages(ctx, acc, 15)
 		if err == nil {
+			recent = recent[:0]
 			for _, m := range msgs {
-				if m.ReceivedAt.Before(since) || !looksLikeOreate(m) {
+				if m.ReceivedAt.Before(since) {
+					continue
+				}
+				recent = append(recent, m)
+				if !looksLikeOreate(m) {
 					continue
 				}
 				full, gerr := p.mail.GetMessage(ctx, acc, m.ID)
@@ -495,7 +565,15 @@ func (p *Producer) fetchConfirmLink(ctx context.Context, id, mailboxID uint, sin
 		case <-time.After(linkPollInterval):
 		}
 	}
-	return "", fmt.Errorf("超时未收到 Oreate 确认邮件")
+	// 超时时把注册后收到的新邮件列出来，区分是邮件根本没送达还是发件人/主题没匹配上。
+	if len(recent) == 0 {
+		return "", fmt.Errorf("%w（注册后收件箱/垃圾箱没有任何新邮件）", errConfirmMailTimeout)
+	}
+	summary := make([]string, 0, len(recent))
+	for _, m := range recent {
+		summary = append(summary, m.From+" | "+m.Subject)
+	}
+	return "", fmt.Errorf("%w（注册后新邮件: %s）", errConfirmMailTimeout, strings.Join(summary, "; "))
 }
 
 func looksLikeOreate(m mailfetch.Message) bool {

@@ -5,6 +5,7 @@ const OREATE_STATUS = {
   register_failed: '注册失败',
   already_registered: '邮箱已注册',
   email_rejected: '域名不被支持',
+  mail_timeout: '确认邮件超时',
 };
 
 let page = 1;
