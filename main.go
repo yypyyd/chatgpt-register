@@ -76,6 +76,7 @@ func main() {
 		log.Fatalf("init mailbox verifier: %v", err)
 	}
 	defer h.MailboxVerifier.Stop()
+	defer h.OreateMinter.Close()
 
 	r.POST("/api/login", h.Login)
 
@@ -183,6 +184,7 @@ func main() {
 		api.DELETE("/oreate/registrations/:id", h.OreateDelete)
 		api.GET("/oreate/registrations/:id/logs", h.OreateLog)
 		api.POST("/oreate/download", h.OreateDownload)
+		api.POST("/oreate/jt", h.OreateMintJT)
 	}
 
 	sub, err := fs.Sub(staticFS, "static")

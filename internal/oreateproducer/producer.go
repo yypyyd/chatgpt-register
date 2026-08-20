@@ -653,6 +653,11 @@ func (p *Producer) getSetting(key string) string {
 	return s.Value
 }
 
+// NextProxy 按设置页的代理列表轮换取一个出口，供铸造反爬 token 等外部调用复用。
+func (p *Producer) NextProxy() string {
+	return p.nextProxy()
+}
+
 // nextProxy 跟设置页上的全局代理开关与代理列表，按任务轮换出口。
 func (p *Producer) nextProxy() string {
 	if strings.TrimSpace(p.getSetting("proxy_enabled")) != "1" {
@@ -741,4 +746,3 @@ func mailDomain(email string) string {
 	}
 	return ""
 }
-

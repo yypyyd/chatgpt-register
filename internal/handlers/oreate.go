@@ -5,11 +5,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
 	"chatgpt-register/internal/models"
+	"chatgpt-register/internal/oreatereg"
 
 	"github.com/gin-gonic/gin"
 )
@@ -91,6 +93,52 @@ func (h *Handler) OreateProduce(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusAccepted, gin.H{"ok": true, "started": len(regs), "data": regs})
+}
+
+// OreateMintJT 给 2api 现铸一个一次性反爬 token jt。
+// 站点生成接口 /oreate/sse/stream 必须带当场铸的 jt，且 jt 与 OUID/UA 绑定：
+// 调用方要用返回的 ouid/user_agent 发生成请求，出口 IP 不必和铸造时一致。
+// 请求体：{ "proxy": "" }，proxy 留空则按设置页的代理列表轮换取一个铸造出口。
+func (h *Handler) OreateMintJT(c *gin.Context) {
+	var in struct {
+		Proxy string `json:"proxy"`
+	}
+	// 允许空请求体。
+	_ = c.ShouldBindJSON(&in)
+	if h.Browser == nil || !h.Browser.Ready() {
+		c.JSON(http.StatusConflict, gin.H{"error": "缺少浏览器，无法铸造反爬 token：浏览器正在下载或下载失败"})
+		return
+	}
+	proxy := strings.TrimSpace(in.Proxy)
+	if proxy == "" {
+		proxy = h.OreateProducer.NextProxy()
+	}
+	tok, err := h.OreateMinter.Mint(proxy, oreatereg.Input{})
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"jt": tok.JT, "ouid": tok.OUID, "user_agent": tok.UserAgent, "bid": tok.BID,
+		"proxy_hint": proxyHint(proxy),
+	})
+}
+
+// proxyHint 只回铸造出口的 host:port，不带代理账号密码：出口 IP 不参与 jt 校验，
+// 这个值只是给调用方排查用。
+func proxyHint(proxy string) string {
+	proxy = strings.TrimSpace(proxy)
+	if proxy == "" {
+		return ""
+	}
+	if !strings.Contains(proxy, "://") {
+		proxy = "http://" + proxy
+	}
+	u, err := url.Parse(proxy)
+	if err != nil {
+		return ""
+	}
+	return u.Host
 }
 
 func (h *Handler) OreateProduceStatus(c *gin.Context) {

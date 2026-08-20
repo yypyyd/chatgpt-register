@@ -3,3 +3,11 @@
 2026/08/15 03:16:45 [32me:/CODE/Register/chatgpt-register/internal/mailverify/service.go:155 [33mSLOW SQL >= 200ms
 [0m[31;1m[260.097ms] [33m[rows:0][35m SELECT * FROM `mailboxes` WHERE status = "unverified" ORDER BY id desc LIMIT 21[0m
 [GIN] 2026/08/15 - 06:46:36 | 401 |   3.41ms |       127.0.0.1 | GET      "/api/settings"
+[GIN] 2026/08/18 - 21:46:59 | 404 |       0s |       127.0.0.1 | GET      "/api/ping"
+[GIN] 2026/08/18 - 21:46:59 | 200 |  67.86ms |       127.0.0.1 | GET      "/"
+[GIN] 2026/08/18 - 21:47:06 | 404 |       0s |       127.0.0.1 | GET      "/api/oreate/registrations"
+[GIN] 2026/08/18 - 23:14:59 | 404 |       0s |       127.0.0.1 | GET      "/api/oreate/registrations?pageSize=100"
+[GIN] 2026/08/18 - 23:45:06 | 404 |       0s |       127.0.0.1 | GET      "/oreate/registrations"
+[GIN] 2026/08/18 - 23:45:11 | 404 |       0s |       127.0.0.1 | GET      "/api/oreate/registrations"
+[GIN] 2026/08/18 - 23:45:37 | 404 |       0s |       127.0.0.1 | GET      "/api/oreate/registrations"
+[GIN] 2026/08/18 - 23:45:47 | 200 |       0s |       127.0.0.1 | GET      "/"

@@ -13,6 +13,7 @@ import (
 	"chatgpt-register/internal/mailverify"
 	"chatgpt-register/internal/models"
 	"chatgpt-register/internal/oreateproducer"
+	"chatgpt-register/internal/oreatereg"
 	"chatgpt-register/internal/producer"
 
 	"github.com/gin-gonic/gin"
@@ -28,8 +29,10 @@ type Handler struct {
 	AdobeProducer    *adobeproducer.Producer
 	LeonardoProducer *leonardoproducer.Producer
 	OreateProducer   *oreateproducer.Producer
-	Browser          *browserboot.Manager
-	MailboxVerifier  *mailverify.Service
+	// OreateMinter 常驻浏览器会话，按需给 2api 铸造 Oreate 的一次性反爬 token。
+	OreateMinter    *oreatereg.Minter
+	Browser         *browserboot.Manager
+	MailboxVerifier *mailverify.Service
 	// Live 保存各平台的批量测活进度（仅内存），键：chatgpt / grok / adobe / leonardo。
 	Live map[string]*liveRunner
 }
@@ -40,7 +43,7 @@ func New(db *gorm.DB, authSvc *auth.Service, browser *browserboot.Manager) (*Han
 	if err := verifier.Start(); err != nil {
 		return nil, err
 	}
-	return &Handler{DB: db, Mail: mail, Auth: authSvc, Producer: producer.New(db, mail), GrokProducer: grokproducer.New(db, mail), AdobeProducer: adobeproducer.New(db, mail), LeonardoProducer: leonardoproducer.New(db, mail), OreateProducer: oreateproducer.New(db, mail), Browser: browser, MailboxVerifier: verifier, Live: newLiveRunners()}, nil
+	return &Handler{DB: db, Mail: mail, Auth: authSvc, Producer: producer.New(db, mail), GrokProducer: grokproducer.New(db, mail), AdobeProducer: adobeproducer.New(db, mail), LeonardoProducer: leonardoproducer.New(db, mail), OreateProducer: oreateproducer.New(db, mail), OreateMinter: oreatereg.NewMinter(), Browser: browser, MailboxVerifier: verifier, Live: newLiveRunners()}, nil
 }
 
 type registrationInput struct {

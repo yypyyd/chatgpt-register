@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"io"
 	"net/url"
-	"regexp"
 	"strings"
 	"time"
 
@@ -37,18 +36,10 @@ const (
 	// pathUserInfo 拉一次用户信息，站点会顺带把当天的每日额度（30）发到账。
 	pathUserInfo = "/oreate/user/getuserinfo"
 	pathRest     = "/bizapi/point/getrestpoints"
-	// pathFirstUse 是站点前端出图后触发首次使用赠分的接口。
-	pathFirstUse = "/oreate/account/getfirstusepoint"
-	pathChat     = "/oreate/create/chat"
-	pathStream   = "/oreate/sse/stream"
 )
 
-// imageMDRe 从 SSE 的 Markdown 图片片段 ![](url) 里取出出图地址：
-// 站点出图地址没有扩展名（形如 https://cdn.oreateai.com/aiimage/kling/<id>/<hash>）。
-var imageMDRe = regexp.MustCompile(`!\[[^\]]*\]\((https?://[^\s)]+)\)`)
-
-// client 是 Oreate 的协议客户端：注册、确认、登录、积分全部走 HTTP；反爬 token jt
-// 由浏览器铸造，生图请求也必须留在浏览器页面里发（见 session.generateImage）。
+// client 是 Oreate 的协议客户端：注册、确认、登录、积分全部走 HTTP；
+// 反爬 token jt 由浏览器铸造。
 type client struct {
 	cli tls_client.HttpClient
 	ua  string
@@ -229,21 +220,11 @@ var ErrConfirmMailLimited = errors.New("确认邮件发送次数已用完")
 // 确认链接 10 分钟就过期，迟到的邮件没有用，Register 收到后会重发新邮件接着等。
 var ErrConfirmMailTimeout = errors.New("超时未收到 Oreate 确认邮件")
 
-// ErrImageStreamBroken 生图 SSE 长连接被中途掐断（多为代理线路问题）：站点已受理并扣分，
-// 换新 jt 重试一次通常就能出图。
-var ErrImageStreamBroken = errors.New("生图流被中途断开")
-
-// ErrSpamRejected 生图被站点风控拦下（SSE 返回 212361 spam user）：实测机房 IP 必被拦，
-// 需要住宅代理，且生图请求必须从浏览器页面里发出。
-var ErrSpamRejected = errors.New("生图被站点风控拦下")
-
 const (
 	// codeWrongPassword 是站点密码错误的业务码。
 	codeWrongPassword = 600005
 	// codeInvalidParam 是站点参数非法的业务码。
 	codeInvalidParam = 100002
-	// codeSpamUser 是站点风控判定为垃圾用户的业务码。
-	codeSpamUser = 212361
 
 	// confirmMailSent/confirmMailLimited 是站点前端的 confirmEmailStatus 枚举
 	// ny={isLimited:2,sendSuccess:0}：0 为确认邮件已发出，2 为发送次数用完。
@@ -355,12 +336,6 @@ func (c *client) touchUserInfo(ctx context.Context) {
 	_, _ = c.callAPI(ctx, http.MethodGet, pathUserInfo, nil)
 }
 
-// firstUsePoint 拉一次首次使用赠分接口：站点前端在出图后就是靠它触发赠分发放的，
-// 不调用赠分会一直不到账。失败不影响注册，忽略错误。
-func (c *client) firstUsePoint(ctx context.Context) {
-	_, _ = c.callAPI(ctx, http.MethodGet, pathFirstUse, nil)
-}
-
 // points 返回积分总额（/bizapi/point/getrestpoints 的 restPoint，站点顶栏显示的就是它）
 // 与各积分池明细（daily 每日额度、bonus 赠送额度、pro 会员额度，都自动到账）。
 func (c *client) points(ctx context.Context) (map[string]int, int, error) {
@@ -396,59 +371,6 @@ func (c *client) points(ctx context.Context) (map[string]int, int, error) {
 		return detail, sum, nil
 	}
 	return detail, rest.RestPoint, nil
-}
-
-func (c *client) createChat(ctx context.Context) (string, error) {
-	resp, err := c.callAPI(ctx, http.MethodPost, pathChat, map[string]any{"type": "aiImage", "docId": ""})
-	if err != nil {
-		return "", err
-	}
-	var d struct {
-		ChatID string `json:"chatId"`
-	}
-	if err = json.Unmarshal(resp.Data, &d); err != nil {
-		return "", err
-	}
-	if d.ChatID == "" {
-		return "", fmt.Errorf("创建会话失败：缺少 chatId")
-	}
-	return d.ChatID, nil
-}
-
-// parseImageStream 解析生图 SSE 流：取出图地址，识别风控与业务错误。
-func parseImageStream(stream string) (string, error) {
-	imageURL := ""
-	for _, line := range strings.Split(stream, "\n") {
-		if m := imageMDRe.FindStringSubmatch(line); len(m) == 2 {
-			imageURL = m[1]
-		}
-		if code, msg := streamError(line); msg != "" {
-			if code == codeSpamUser {
-				return imageURL, fmt.Errorf("%w: %s", ErrSpamRejected, msg)
-			}
-			return imageURL, fmt.Errorf("生图被拒: %s", msg)
-		}
-	}
-	return imageURL, nil
-}
-
-// streamError 识别 SSE 里的错误事件（如 code=212361 spam user），返回业务码与描述。
-func streamError(line string) (int, string) {
-	if !strings.Contains(line, `"event":"error"`) && !strings.Contains(line, `"code":2123`) {
-		return 0, ""
-	}
-	var evt struct {
-		Event string `json:"event"`
-		Data  struct {
-			Code int    `json:"code"`
-			Msg  string `json:"msg"`
-		} `json:"data"`
-	}
-	payload := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "data:"))
-	if json.Unmarshal([]byte(payload), &evt) == nil && evt.Data.Msg != "" {
-		return evt.Data.Code, fmt.Sprintf("code=%d msg=%s", evt.Data.Code, evt.Data.Msg)
-	}
-	return 0, trimText(line, 200)
 }
 
 func trimText(s string, n int) string {

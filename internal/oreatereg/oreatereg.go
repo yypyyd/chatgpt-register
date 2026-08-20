@@ -1,8 +1,7 @@
 // Package oreatereg 完成 oreateai.com 的全协议注册：注册 → 邮件确认链接 →
-// 登录 → 校验自动到账的积分 → 用 Kling3.0 Omini 1k 生成一张图（再自动加赠 50 积分），
-// 并采集站点会话 Cookie 供 2api 导出。
-// 注册、确认、登录、积分走 HTTP；反爬 token jt 由浏览器现铸（一次性、与 OUID 绑定），
-// 生图请求还必须留在浏览器页面里发，否则一律被风控判成 spam user。
+// 登录 → 校验自动到账的积分，并采集站点会话 Cookie 供 2api 导出。
+// 注册、确认、登录、积分走 HTTP；反爬 token jt 由浏览器现铸（一次性、与 OUID 绑定）。
+// 出图赠分（首次生图 +50）由 2api 在导入账号后自己生一张图领取，注册流程不生图。
 package oreatereg
 
 import (
@@ -20,30 +19,8 @@ import (
 const userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
 
 const (
-	// 图二里的模型档位：Kling3.0 Omini / 1k / 1:1，单次 6 积分。
-	imageModel      = "Kling3.0 Omini"
-	imageResolution = "1k"
-	imageRatio      = "1:1"
-
-	defaultPrompt = "a cute orange cat sitting on a wooden desk, soft light"
-
 	// pointsWaitTimeout 等注册赠分异步到账的最长时间。
 	pointsWaitTimeout = 60 * time.Second
-
-	// spamRetryDelay 生图被风控拦下后重试前的等待时间。
-	spamRetryDelay = 45 * time.Second
-
-	// streamRetryDelay/streamRetryLimit 是生图断流且确认没出图后重新提交的间隔与次数。
-	// 重新提交会再扣一次生图额度，所以断流后先轮询赠分确认站点是否已出图，确认不了才补交。
-	streamRetryDelay = 10 * time.Second
-	streamRetryLimit = 1
-
-	// imageConfirmWait 是断流后轮询出图赠分到账的最长时间：断流时站点大多已实际出图，
-	// 只是回传的 SSE 流被代理掐了，出图赠分（bonus 50→100）到账即可判定出图成功。
-	imageConfirmWait = 90 * time.Second
-
-	// imageWaitTimeout 等生图 SSE 流出图的最长时间（实测约 25s）。
-	imageWaitTimeout = 3 * time.Minute
 
 	// welcomePoints/dailyPoints 是新号注册后自动到账的两笔积分（欢迎 50、每日额度 30）。
 	welcomePoints = 50
@@ -64,7 +41,8 @@ type Input struct {
 	Log             func(format string, a ...any)
 }
 
-// Result 是注册产出：会话 Cookie（含 ouss 会话票据）、积分与出图地址。
+// Result 是注册产出：会话 Cookie（含 ouss 会话票据）与积分。
+// ImageURL/ImageModel 保留给历史记录：注册流程不再生图，新号一律为空。
 type Result struct {
 	Email       string            `json:"email"`
 	Password    string            `json:"password"`
@@ -96,8 +74,7 @@ func Register(ctx context.Context, in Input) (*Result, error) {
 		in.Password = GenPassword(16)
 	}
 
-	// 浏览器会话要一直开到生图结束：注册的 jt 可以拿出来走 HTTP，
-	// 但生图请求必须留在这个页面里发。
+	// 浏览器会话开到注册提交完为止：确认邮件超时重发还要再铸一次 jt。
 	in.logf("正在启动浏览器会话")
 	sess, err := openSession(ctx, in)
 	if err != nil {
@@ -167,42 +144,16 @@ func Register(ctx context.Context, in Input) (*Result, error) {
 	}
 	in.logf("登录成功，已拿到站点会话")
 
-	// 生图要在浏览器里发，把会话票据注回页面让它变成已登录状态。
-	if err = sess.useSession(cookies["ouss"]); err != nil {
-		return nil, fmt.Errorf("向浏览器注入会话票据失败: %w", err)
-	}
-
 	// 每日额度（daily 30）要请求一次用户信息才会发到账，登录后先拉一次。
 	cli.touchUserInfo(ctx)
 
-	// 注册赠分是异步到账的，等它到账再生图，否则会因积分不足出图失败。
+	// 注册赠分是异步到账的，等它到账再导出，否则导出的积分会偏小。
 	detail, total, err := waitPoints(ctx, cli)
 	if err != nil {
 		return nil, err
 	}
 	in.logf("注册自动到账积分: %d（%s）", total, formatPoints(detail))
 
-	imageURL, genErr := generate(ctx, cli, in, sess)
-	if genErr != nil {
-		in.logf("生图失败: %v（账号已注册可用，积分加赠未完成）", genErr)
-	}
-
-	// 出图赠分要请求一次首用赠分接口才会发放（站点前端出图后就是这么做的）；
-	// 生图流被掐断时站点其实可能已经出图，也照样查一次。
-	cli.firstUsePoint(ctx)
-	if genErr == nil || errors.Is(genErr, ErrImageStreamBroken) {
-		// 出图赠分是异步到账的，等它到账再记录，否则导出的积分会少 50。
-		cli.touchUserInfo(ctx)
-		detail, total, err = waitPointsAbove(ctx, cli, total)
-	} else {
-		detail, total, err = cli.points(ctx)
-	}
-	if err != nil {
-		return nil, err
-	}
-	in.logf("生图后积分: %d（%s）", total, formatPoints(detail))
-
-	cookies = cli.cookies()
 	cookies["OUID"] = sess.OUID
 	return &Result{
 		Email:       in.Email,
@@ -212,8 +163,6 @@ func Register(ctx context.Context, in Input) (*Result, error) {
 		UserAgent:   sess.UA,
 		PointDetail: detail,
 		Points:      total,
-		ImageURL:    imageURL,
-		ImageModel:  imageModel + " " + imageResolution,
 		CapturedAt:  time.Now().UTC().Format(time.RFC3339),
 	}, nil
 }
@@ -261,62 +210,6 @@ func waitConfirmLinkWithResend(ctx context.Context, in Input, cli *client, sess 
 	}
 }
 
-// generate 建会话并在浏览器页面里出一张图，出图后站点自动加赠 50 积分。
-// 被风控判成 spam user 时重新加载页面、换一个新铸的 jt 再试一次。
-func generate(ctx context.Context, cli *client, in Input, sess *session) (string, error) {
-	chatID, err := cli.createChat(ctx)
-	if err != nil {
-		return "", err
-	}
-	in.logf("已创建生图会话，调用 %s %s（%s）", imageModel, imageResolution, imageRatio)
-	imageURL, err := sess.generateImage(ctx, chatID, defaultPrompt, in.Email)
-	switch {
-	case errors.Is(err, ErrSpamRejected):
-		in.logf("生图被风控拦下，%s 后换新的反爬 token 重试一次", spamRetryDelay)
-		if !sleepCtx(ctx, spamRetryDelay) {
-			return imageURL, ctx.Err()
-		}
-		imageURL, err = sess.generateImage(ctx, chatID, defaultPrompt, in.Email)
-	}
-	for retry := 0; errors.Is(err, ErrImageStreamBroken); retry++ {
-		// 断流时站点大多已受理并出图，先轮询赠分确认，别急着重新提交烧生图额度。
-		in.logf("生图长连接被掐断（多为代理线路问题），轮询积分确认站点是否已出图")
-		if confirmImageByPoints(ctx, cli) {
-			in.logf("出图赠分已到账，站点侧已出图，不再重复提交")
-			return imageURL, nil
-		}
-		if retry >= streamRetryLimit {
-			break
-		}
-		in.logf("等 %s 未确认出图，%s 后重新提交（第 %d/%d 次）",
-			imageConfirmWait, streamRetryDelay, retry+1, streamRetryLimit)
-		if !sleepCtx(ctx, streamRetryDelay) {
-			return imageURL, ctx.Err()
-		}
-		imageURL, err = sess.generateImage(ctx, chatID, defaultPrompt, in.Email)
-	}
-	if err != nil {
-		return imageURL, err
-	}
-	in.logf("生图完成: %s", imageURL)
-	return imageURL, nil
-}
-
-// confirmImageByPoints 断流后轮询积分确认站点是否已出图：出图成功后站点会发放
-// 50 出图赠分（bonus 池 50→100），到账即说明图已生成、只是回传流被掐断。
-func confirmImageByPoints(ctx context.Context, cli *client) bool {
-	deadline := time.Now().Add(imageConfirmWait)
-	for {
-		cli.firstUsePoint(ctx)
-		if detail, _, err := cli.points(ctx); err == nil && detail["bonus"] > welcomePoints {
-			return true
-		}
-		if time.Now().After(deadline) || !sleepCtx(ctx, 5*time.Second) {
-			return false
-		}
-	}
-}
-
 // waitPoints 轮询积分，等注册赠分到账（最多等 pointsWaitTimeout）。
 func waitPoints(ctx context.Context, cli *client) (map[string]int, int, error) {
 	deadline := time.Now().Add(pointsWaitTimeout)
@@ -327,24 +220,6 @@ func waitPoints(ctx context.Context, cli *client) (map[string]int, int, error) {
 		}
 		// 欢迎赠分 50 与每日额度 30 分两笔到账，等两笔都到再继续。
 		if total >= welcomePoints+dailyPoints || time.Now().After(deadline) {
-			return detail, total, nil
-		}
-		if !sleepCtx(ctx, 3*time.Second) {
-			return detail, total, ctx.Err()
-		}
-	}
-}
-
-// waitPointsAbove 轮询积分，等出图赠分到账（读到比 base 大的余额即返回）。
-// restPoint 有缓存，出图后立刻读会读到旧值。
-func waitPointsAbove(ctx context.Context, cli *client, base int) (map[string]int, int, error) {
-	deadline := time.Now().Add(pointsWaitTimeout)
-	for {
-		detail, total, err := cli.points(ctx)
-		if err != nil {
-			return nil, 0, err
-		}
-		if total > base || time.Now().After(deadline) {
 			return detail, total, nil
 		}
 		if !sleepCtx(ctx, 3*time.Second) {
@@ -428,4 +303,3 @@ func GenPassword(n int) string {
 	}
 	return string(b)
 }
-
