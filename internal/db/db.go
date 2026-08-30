@@ -13,7 +13,7 @@ func Init(path string) (*gorm.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := db.AutoMigrate(&models.Registration{}, &models.GrokRegistration{}, &models.AdobeRegistration{}, &models.LeonardoRegistration{}, &models.OreateRegistration{}, &models.Mailbox{}, &models.Setting{}, &models.Admin{}); err != nil {
+	if err := db.AutoMigrate(&models.Registration{}, &models.GrokRegistration{}, &models.AdobeRegistration{}, &models.LeonardoRegistration{}, &models.OreateRegistration{}, &models.HiggsfieldRegistration{}, &models.Mailbox{}, &models.Setting{}, &models.Admin{}); err != nil {
 		return nil, err
 	}
 	normalizeLegacyStatuses(db)
@@ -22,6 +22,7 @@ func Init(path string) (*gorm.DB, error) {
 	reclaimOrphanAdobeRegistering(db)
 	reclaimOrphanLeonardoRegistering(db)
 	reclaimOrphanOreateRegistering(db)
+	reclaimOrphanHiggsfieldRegistering(db)
 	backfillRegistrationMailboxIDs(db)
 	return db, nil
 }
@@ -46,6 +47,11 @@ func reclaimOrphanAdobeRegistering(db *gorm.DB) {
 
 func reclaimOrphanLeonardoRegistering(db *gorm.DB) {
 	db.Model(&models.LeonardoRegistration{}).Where("status IN ?", []string{"registering", "waiting_code"}).
+		Updates(map[string]any{"status": "register_failed", "note": "程序重启中断，可重新注册"})
+}
+
+func reclaimOrphanHiggsfieldRegistering(db *gorm.DB) {
+	db.Model(&models.HiggsfieldRegistration{}).Where("status IN ?", []string{"registering", "waiting_code"}).
 		Updates(map[string]any{"status": "register_failed", "note": "程序重启中断，可重新注册"})
 }
 

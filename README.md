@@ -65,9 +65,9 @@
 
 ## 截图预览
 
-| 仪表盘 | 账户管理 |
+| 仪表盘 | GPT 注册 |
 |:---:|:---:|
-| ![仪表盘](./screenshots/dashboard.png) | ![账户管理](./screenshots/accounts.png) |
+| ![仪表盘](./screenshots/dashboard.png) | ![GPT 注册](./screenshots/accounts.png) |
 
 | 执行日志 | 邮箱管理 |
 |:---:|:---:|
@@ -109,7 +109,7 @@ chatgpt-register/
 │   └── producer/            # 批量注册调度器（并发控制 + 裂变策略）
 └── static/                  # 前端静态页面（嵌入二进制，无需 Web 服务器）
     ├── dashboard.html        # 仪表盘
-    ├── accounts.html/js      # 账户管理
+    ├── accounts.html/js      # GPT 注册
     ├── mailboxes.html/js     # 邮箱管理
     ├── settings.html         # 系统设置
     ├── adobe.html/js         # Adobe(Firefly) 注册管理
@@ -194,7 +194,7 @@ ADDR=8080 ./chatgpt-register.exe
 - 状态四态：`待验证 / 验证中 / 验证失败 / 已验证`
 - 导入后由服务端 10 并发后台认证；关闭页面或重启服务后会自动继续
 - 支持重新认证所选邮箱、仅认证失败邮箱或全部邮箱，无效凭据立即失败，临时网络错误自动重试
-- 邮箱管理、账户管理和仪表盘列表均提供带二次确认的“全部删除”操作
+- 邮箱管理、GPT 注册和仪表盘列表均提供带二次确认的“全部删除”操作
 - 「取件」弹窗：3 秒轮询实时收件，sandbox iframe 隔离展示邮件内容
 - 支持 Outlook（需填 `client_id` + `refresh_token`）：自动识别 OAuth 权限并选择 Microsoft Graph 或 Outlook IMAP XOAUTH2，兼容两类刷新令牌
 
@@ -262,7 +262,7 @@ http://ip:port
 
 ### 查看注册详情
 
-- 进入「账户管理」点击任意账号可查看**实时执行日志**（步骤级别，精确到秒）
+- 进入「GPT 注册」点击任意账号可查看**实时执行日志**（步骤级别，精确到秒）
 - 点击「截图」可查看注册过程中的**浏览器截图**，方便排查失败原因
 - 支持按状态筛选：待注册 / 注册中 / 已注册 / 注册失败
 - 支持直接导出 Sub2API 聚合 JSON，或导出 CLIProxyAPI（CPA）auth-dir 格式；CPA 批量导出为 ZIP，解压后每个账号对应一个 `codex-*.json`
@@ -281,7 +281,7 @@ http://ip:port
 > A：可以，留空即直连。但大量并发注册建议配置代理池，避免 IP 被限流。
 
 **Q：账号导出格式是什么？**
-> A：在「账户管理」勾选账号后，可直接选择“导出 Sub2API”或“导出 CPA”。Sub2API 使用单个聚合 JSON；CPA 单账号导出 JSON，多账号导出 ZIP，解压后放入 CLIProxyAPI 的 `auth-dir`。当前网页会话凭据没有 `refresh_token`，Token 到期后 CPA 无法自动续期。
+> A：在「GPT 注册」勾选账号后，可直接选择“导出 Sub2API”或“导出 CPA”。Sub2API 使用单个聚合 JSON；CPA 单账号导出 JSON，多账号导出 ZIP，解压后放入 CLIProxyAPI 的 `auth-dir`。当前网页会话凭据没有 `refresh_token`，Token 到期后 CPA 无法自动续期。
 
 ---
 

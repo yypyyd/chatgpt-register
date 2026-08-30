@@ -156,11 +156,11 @@ Adobe 注册与 ChatGPT、Grok 完全隔离：独立数据表 `adobe_registratio
 
 ### 2026-07-25 - 增加 CPA 凭据导出
 
-**变更内容**：账户管理增加 Sub2API 与 CPA 两个直接导出选项；后端生成 CPA 扁平认证 JSON，批量时按账号打包 ZIP，并从 JWT 提取准确过期时间。
+**变更内容**：GPT 注册增加 Sub2API 与 CPA 两个直接导出选项；后端生成 CPA 扁平认证 JSON，批量时按账号打包 ZIP，并从 JWT 提取准确过期时间。
 
 **变更理由**：让已注册账号无需手工转换即可放入 CLIProxyAPI 的 `auth-dir`，同时保持原有 Sub2API 导出接口兼容。
 
-**影响范围**：账户下载接口、CPA 文件打包与命名、账户管理交互、单元测试及使用文档。
+**影响范围**：账户下载接口、CPA 文件打包与命名、GPT 注册交互、单元测试及使用文档。
 
 **决策依据**：对照 CLIProxyAPI 当前 `CodexTokenStorage` 与文件加载器字段定义；空缺的 OAuth refresh/id token 保持为空，不伪造不可用凭据。
 
@@ -188,4 +188,4 @@ Adobe 注册与 ChatGPT、Grok 完全隔离：独立数据表 `adobe_registratio
 
 **变更理由**：页面刷新会导致原批量任务永久中断；逐条删除大量记录效率低且容易遗漏。
 
-**影响范围**：邮箱导入与状态流转、Microsoft OAuth 重试、Gin 路由、邮箱管理、账户管理、仪表盘、项目与模块文档。
+**影响范围**：邮箱导入与状态流转、Microsoft OAuth 重试、Gin 路由、邮箱管理、GPT 注册、仪表盘、项目与模块文档。

@@ -1,4 +1,4 @@
-// Package captcha 封装第三方打码服务，目前支持 2Captcha 解 hCaptcha。
+// Package captcha 封装第三方打码服务，目前支持 2Captcha 解 hCaptcha 与 Cloudflare Turnstile。
 package captcha
 
 import (

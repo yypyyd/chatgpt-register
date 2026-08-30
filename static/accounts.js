@@ -1,4 +1,4 @@
-/* ===== 账户管理（ChatGPT 账号生产） ===== */
+/* ===== GPT 注册（ChatGPT 账号生产） ===== */
 const ACC_STATUS = {
   pending: '待生产',
   registering: '注册中',
@@ -252,7 +252,7 @@ async function del(id) {
 
 async function deleteAllAccounts() {
   if (!confirm('确定删除全部账户？此操作不可恢复。')) return;
-  if (!confirm('再次确认：将永久删除账户管理中的全部记录。')) return;
+  if (!confirm('再次确认：将永久删除GPT 注册中的全部记录。')) return;
   const r = await api('/api/registrations', { method: 'DELETE' });
   const d = await r.json().catch(() => ({}));
   if (!r.ok) return toast('全部删除失败: ' + (d.error || r.status), true);

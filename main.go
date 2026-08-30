@@ -58,6 +58,12 @@ func main() {
 	).Error; err != nil {
 		log.Printf("reset oreate registering on boot: %v", err)
 	}
+	if err := database.Exec(
+		"UPDATE higgsfield_registrations SET status = 'register_failed', log = log || ? WHERE status IN ('registering', 'waiting_code')",
+		"\n"+time.Now().Format("2006-01-02 15:04:05")+" ✗ 程序重启，Higgsfield 任务中断，判定为失败",
+	).Error; err != nil {
+		log.Printf("reset higgsfield registering on boot: %v", err)
+	}
 
 	authSvc, err := auth.New(database)
 	if err != nil {
@@ -185,6 +191,19 @@ func main() {
 		api.GET("/oreate/registrations/:id/logs", h.OreateLog)
 		api.POST("/oreate/download", h.OreateDownload)
 		api.POST("/oreate/jt", h.OreateMintJT)
+
+		api.GET("/higgsfield/registrations", h.HiggsfieldList)
+		api.DELETE("/higgsfield/registrations", h.HiggsfieldDeleteAll)
+		api.POST("/higgsfield/registrations", h.HiggsfieldStart)
+		api.POST("/higgsfield/produce", h.HiggsfieldProduce)
+		api.GET("/higgsfield/produce/status", h.HiggsfieldProduceStatus)
+		api.POST("/higgsfield/produce/stop", h.HiggsfieldProduceStop)
+		api.POST("/higgsfield/registrations/:id/code", h.HiggsfieldSubmitCode)
+		api.POST("/higgsfield/registrations/:id/stop", h.HiggsfieldStop)
+		api.POST("/higgsfield/registrations/:id/trial", h.HiggsfieldTrial)
+		api.DELETE("/higgsfield/registrations/:id", h.HiggsfieldDelete)
+		api.GET("/higgsfield/registrations/:id/logs", h.HiggsfieldLog)
+		api.POST("/higgsfield/download", h.HiggsfieldDownload)
 	}
 
 	sub, err := fs.Sub(staticFS, "static")
@@ -193,7 +212,7 @@ func main() {
 	}
 	httpFS := http.FS(sub)
 	r.StaticFS("/static", httpFS)
-	for _, p := range []string{"login", "dashboard", "mailboxes", "accounts", "grok", "adobe", "leonardo", "oreate", "settings"} {
+	for _, p := range []string{"login", "dashboard", "mailboxes", "accounts", "grok", "adobe", "leonardo", "oreate", "higgsfield", "settings"} {
 		p := p
 		r.GET("/"+p, func(c *gin.Context) { c.FileFromFS(p+".html", httpFS) })
 	}

@@ -8,6 +8,7 @@ import (
 	"chatgpt-register/internal/auth"
 	"chatgpt-register/internal/browserboot"
 	"chatgpt-register/internal/grokproducer"
+	"chatgpt-register/internal/higgsfieldproducer"
 	"chatgpt-register/internal/leonardoproducer"
 	"chatgpt-register/internal/mailfetch"
 	"chatgpt-register/internal/mailverify"
@@ -29,6 +30,8 @@ type Handler struct {
 	AdobeProducer    *adobeproducer.Producer
 	LeonardoProducer *leonardoproducer.Producer
 	OreateProducer   *oreateproducer.Producer
+	// HiggsfieldProducer 走 Clerk 协议注册 higgsfield.ai，并按需跑 pricing 绑卡优惠。
+	HiggsfieldProducer *higgsfieldproducer.Producer
 	// OreateMinter 常驻浏览器会话，按需给 2api 铸造 Oreate 的一次性反爬 token。
 	OreateMinter    *oreatereg.Minter
 	Browser         *browserboot.Manager
@@ -43,7 +46,7 @@ func New(db *gorm.DB, authSvc *auth.Service, browser *browserboot.Manager) (*Han
 	if err := verifier.Start(); err != nil {
 		return nil, err
 	}
-	return &Handler{DB: db, Mail: mail, Auth: authSvc, Producer: producer.New(db, mail), GrokProducer: grokproducer.New(db, mail), AdobeProducer: adobeproducer.New(db, mail), LeonardoProducer: leonardoproducer.New(db, mail), OreateProducer: oreateproducer.New(db, mail), OreateMinter: oreatereg.NewMinter(), Browser: browser, MailboxVerifier: verifier, Live: newLiveRunners()}, nil
+	return &Handler{DB: db, Mail: mail, Auth: authSvc, Producer: producer.New(db, mail), GrokProducer: grokproducer.New(db, mail), AdobeProducer: adobeproducer.New(db, mail), LeonardoProducer: leonardoproducer.New(db, mail), OreateProducer: oreateproducer.New(db, mail), HiggsfieldProducer: higgsfieldproducer.New(db, mail), OreateMinter: oreatereg.NewMinter(), Browser: browser, MailboxVerifier: verifier, Live: newLiveRunners()}, nil
 }
 
 type registrationInput struct {

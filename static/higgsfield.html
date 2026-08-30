@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Higgsfield 注册 · ChatGPT 注册管理</title>
+<link rel="stylesheet" href="/static/style.css?v=17">
+</head>
+<body data-page="higgsfield">
+<div class="layout">
+  <main class="main">
+    <h1 class="page-title">Higgsfield 注册</h1>
+
+    <!-- 生产进度概览 -->
+    <div class="produce-bar" id="produce-bar">
+      <div class="produce-stat"><span class="produce-num" id="pd-pending">0</span><span class="produce-lbl">待生产</span></div>
+      <span class="produce-dot">·</span>
+      <div class="produce-stat"><span class="produce-num running" id="pd-running">0</span><span class="produce-lbl">在跑</span></div>
+      <span class="produce-dot">·</span>
+      <div class="produce-stat"><span class="produce-num ok" id="pd-registered">0</span><span class="produce-lbl">已注册</span></div>
+      <span class="produce-dot">·</span>
+      <div class="produce-stat"><span class="produce-num bad" id="pd-failed">0</span><span class="produce-lbl">生产失败</span></div>
+      <div class="produce-actions">
+        <button class="px-btn danger" id="pd-stop" style="display:none" onclick="stopProduce()">停止</button>
+      </div>
+    </div>
+
+    <div class="toolbar">
+      <input id="search" class="px-input search" placeholder="搜索 Higgsfield email / 备注 ...">
+      <select id="filter-status" class="px-input">
+        <option value="">全部状态</option>
+        <option value="registering">注册中</option>
+        <option value="waiting_code">等待验证码</option>
+        <option value="registered">已注册</option>
+        <option value="register_failed">注册失败</option>
+        <option value="already_registered">邮箱已注册</option>
+      </select>
+      <button class="px-btn primary" id="produce-btn" onclick="openProduceModal()">生产</button>
+      <div class="px-select" title="导出全部已注册未出库的账号">
+        <button type="button" class="px-select-btn" onclick="toggleExportUnshipped(event)">
+          <span class="px-select-label">导出未出库</span>
+          <svg class="px-select-arrow" viewBox="0 0 24 24"><path d="M7.41 8.59 12 13.17l4.59-4.58L18 10l-6 6-6-6z"/></svg>
+        </button>
+        <div class="px-select-menu">
+          <button type="button" class="px-select-opt" onclick="downloadUnshipped('string')">Cookie 字符串</button>
+          <button type="button" class="px-select-opt" onclick="downloadUnshipped('json')">Cookie JSON</button>
+          <button type="button" class="px-select-opt" onclick="downloadUnshipped('array')">Cookie 数组</button>
+        </div>
+      </div>
+      <button class="px-btn danger" onclick="deleteAllHiggsfield()">全部删除</button>
+    </div>
+
+    <div class="batch-bar" id="higgsfield-batch" style="display:none">
+      <span id="higgsfield-batch-count">已选 0 项</span>
+      <button class="px-btn" onclick="downloadSelected('string')">导出 Cookie 字符串</button>
+      <button class="px-btn" onclick="downloadSelected('json')">导出 Cookie JSON</button>
+      <button class="px-btn" onclick="downloadSelected('array')">导出 Cookie 数组</button>
+      <button class="px-btn danger" onclick="delSelected()">删除所选</button>
+      <button class="px-btn ghost" onclick="clearSelection()">取消</button>
+    </div>
+
+    <div class="table-wrap">
+      <table class="px-table">
+        <thead><tr>
+          <th class="col-check"><input type="checkbox" id="higgsfield-check-all" onclick="toggleSelectAll(this.checked)"></th>
+          <th>邮箱</th><th>创建时间</th><th>状态</th><th>绑卡优惠</th><th>出库状态</th><th>操作</th>
+        </tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+      <div class="pager" id="pager"></div>
+    </div>
+  </main>
+</div>
+
+<!-- 生产 modal -->
+<div class="modal-mask" id="produce-modal" style="display:none">
+  <div class="modal px-panel" style="width:420px">
+    <h2>生产 Higgsfield 账号</h2>
+    <div class="import-sub">填写要生产的账号数量，后台会从「账号管理 / 邮箱管理」取号，走 Clerk 协议注册 higgsfield.ai，邮箱验证码自动读取提交；人机校验需要 2Captcha key 或本机浏览器点选。</div>
+    <label class="produce-field">
+      <span>生产数量</span>
+      <input id="produce-count" class="px-input" type="number" min="1" value="10">
+    </label>
+    <div class="modal-actions">
+      <button class="px-btn" onclick="closeModal('produce-modal')">取消</button>
+      <button class="px-btn primary" onclick="startProduce()">开始生产</button>
+    </div>
+  </div>
+</div>
+
+<!-- 日志 modal -->
+<div class="modal-mask" id="log-modal" style="display:none">
+  <div class="modal px-panel" style="width:640px">
+    <h2 id="log-title">执行日志</h2>
+    <pre id="log-body" class="log-body"></pre>
+    <div class="modal-actions">
+      <button class="px-btn" onclick="closeLog()">关闭</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast" style="display:none"></div>
+<script src="/static/layout.js?v=4"></script>
+<script src="/static/higgsfield.js?v=1"></script>
+</body>
+</html>
