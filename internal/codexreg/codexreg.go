@@ -13,6 +13,7 @@ package codexreg
 import (
 	"context"
 	"fmt"
+	"time"
 )
 
 const userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
@@ -27,7 +28,8 @@ type Input struct {
 	Headless bool
 
 	// FetchCode 拉取 ChatGPT 发到邮箱的验证码。由 producer 用 mailfetch 实现。
-	FetchCode func(ctx context.Context) (string, error)
+	// after 非零时只接受该时刻之后收到的邮件，用于重发验证码后避免抓回旧码。
+	FetchCode func(ctx context.Context, after time.Time) (string, error)
 
 	// Log 输出进度（可为 nil）。
 	Log func(format string, a ...any)

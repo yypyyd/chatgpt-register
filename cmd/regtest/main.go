@@ -56,7 +56,11 @@ func main() {
 		Proxy:    c.Proxy,
 		Headless: c.Headless,
 		Log:      func(f string, a ...any) { fmt.Println("LOG:", fmt.Sprintf(f, a...)) },
-		FetchCode: func(ctx context.Context) (string, error) {
+		FetchCode: func(ctx context.Context, after time.Time) (string, error) {
+			from := since
+			if after.After(from) {
+				from = after
+			}
 			deadline := time.Now().Add(3 * time.Minute)
 			for time.Now().Before(deadline) {
 				if ctx.Err() != nil {
@@ -65,11 +69,11 @@ func main() {
 				msgs, err := mail.ListMessages(ctx, acc, 15)
 				if err == nil {
 					for _, m := range msgs {
-						if m.ReceivedAt.Before(since) {
+						if m.ReceivedAt.Before(from) {
 							continue
 						}
 						s := strings.ToLower(m.From + " " + m.FromName + " " + m.Subject)
-						if !strings.Contains(s, "openai") && !strings.Contains(s, "chatgpt") && !strings.Contains(s, "code") {
+						if !strings.Contains(s, "openai") && !strings.Contains(s, "chatgpt") {
 							continue
 						}
 						if code := codeRe.FindStringSubmatch(m.Subject); code != nil {

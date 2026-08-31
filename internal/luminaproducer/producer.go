@@ -34,11 +34,6 @@ const (
 	// defaultRetryCooldownMin 注册失败后重试同一邮箱前的等待分钟数，避免连续重试
 	// 撞风控。可在系统设置 retry_cooldown_min 覆盖，0 = 不冷却。
 	defaultRetryCooldownMin = 30
-
-	// defaultLaunchStaggerSec 相邻两个注册任务开始提交的默认最小间隔（秒）。
-	// BytePlus 的 RegisterAccountV2 按注册速率限流（换出口 IP 无效），
-	// 错峰提交可以避开。可用设置 lumina_launch_stagger_sec 覆盖，0 = 不错峰。
-	defaultLaunchStaggerSec = 60
 )
 
 var digitCodeRe = regexp.MustCompile(`\b(\d{6})\b`)
@@ -52,13 +47,10 @@ type Producer struct {
 	cancel  map[uint]context.CancelFunc
 	active  int
 	pxIdx   int
-	// nextLaunch 错峰提交：下一个任务最早可以开始的时间。
-	nextLaunch time.Time
 	// topUpCancel 非空表示补任务循环在跑，StopAll 用它停掉补任务。
 	topUpCancel context.CancelFunc
 	runTarget   int    // 本次生产的目标数量
 	runTracked  []uint // 本次生产建过的任务 id
-
 }
 
 func New(db *gorm.DB, mail *mailfetch.Client) *Producer {
@@ -500,15 +492,6 @@ func (p *Producer) run(id uint) {
 	}
 	defer p.releaseSlot()
 
-	if !p.waitLaunchTurn(ctx, id) {
-		p.appendLog(id, "已取消（错峰等待中被停止）")
-		p.db.Model(&models.LuminaRegistration{}).Where("id = ?", id).Updates(map[string]any{
-			"status": "register_failed",
-			"note":   "已取消",
-		})
-		return
-	}
-
 	p.appendLog(id, "开始 Lumina 邮箱注册")
 
 	// 与 GPT 生产一致：bestgo 住宅代理（带 -session-）可换出口 IP，被限流或
@@ -529,9 +512,6 @@ func (p *Producer) run(id uint) {
 			Email:    reg.Email,
 			Password: reg.Password,
 			Proxy:    proxy,
-			Headless: p.getSetting("lumina_headless") == "1",
-			// 出口 IP 探测默认关闭以提速；需排障时置 lumina_egress_check=1。
-			EgressCheck: p.getSetting("lumina_egress_check") == "1",
 			Log: func(f string, a ...any) {
 				p.appendLog(id, fmt.Sprintf(f, a...))
 			},
@@ -540,9 +520,6 @@ func (p *Producer) run(id uint) {
 					return p.fetchCode(ctx, id, reg.MailboxID, since)
 				}
 				return p.waitManualCode(ctx, id)
-			},
-			SaveShot: func(png []byte) {
-				p.db.Model(&models.LuminaRegistration{}).Where("id = ?", id).Update("shot", png)
 			},
 		}
 
@@ -657,6 +634,10 @@ func extractCode(s string) string {
 
 func looksLikeBytePlus(m mailfetch.Message) bool {
 	s := strings.ToLower(m.From + " " + m.FromName + " " + m.Subject)
+	// 同一邮箱可能同时收到其它平台的验证码邮件，先排除已知的非 BytePlus 来源。
+	if strings.Contains(s, "openai") || strings.Contains(s, "chatgpt") {
+		return false
+	}
 	return strings.Contains(s, "byteplus") ||
 		strings.Contains(s, "volcengine") ||
 		strings.Contains(s, "verification code") ||
@@ -697,42 +678,6 @@ func (p *Producer) maxConcurrency() int {
 		n = 1
 	}
 	return n
-}
-
-// launchStagger 跟设置 lumina_launch_stagger_sec，未设置默认 defaultLaunchStaggerSec 秒，
-// 设 0 表示不错峰、完全并发提交。
-func (p *Producer) launchStagger() time.Duration {
-	raw := strings.TrimSpace(p.getSetting("lumina_launch_stagger_sec"))
-	sec := defaultLaunchStaggerSec
-	if raw != "" {
-		if n, err := strconv.Atoi(raw); err == nil && n >= 0 {
-			sec = n
-		}
-	}
-	return time.Duration(sec) * time.Second
-}
-
-// waitLaunchTurn 错峰提交：把相邻两次注册提交至少隔开错峰间隔，
-// 避免同时提交触发 RegisterAccountV2 的速率限流。
-func (p *Producer) waitLaunchTurn(ctx context.Context, id uint) bool {
-	stagger := p.launchStagger()
-	if stagger <= 0 {
-		return true
-	}
-	p.mu.Lock()
-	now := time.Now()
-	next := p.nextLaunch
-	if next.Before(now) {
-		next = now
-	}
-	p.nextLaunch = next.Add(stagger)
-	p.mu.Unlock()
-	delay := next.Sub(now)
-	if delay <= 0 {
-		return true
-	}
-	p.appendLog(id, fmt.Sprintf("错峰提交：等 %s 再开始，避免注册接口限流", delay.Round(time.Second)))
-	return sleepCtx(ctx, delay)
 }
 
 func (p *Producer) acquireSlot(ctx context.Context, id uint) bool {

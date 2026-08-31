@@ -39,9 +39,9 @@ const (
 	// 两封验证码邮件挤在一起容易读错/读不到。可在系统设置 mailbox_interval_min
 	// 覆盖，0 = 不限。
 	defaultMailboxIntervalMin = 5
-	codePollTimeout       = 3 * time.Minute
-	codePollInterval      = 5 * time.Second
-	maxLogLines           = 300
+	codePollTimeout           = 3 * time.Minute
+	codePollInterval          = 5 * time.Second
+	maxLogLines               = 300
 )
 
 // openAI 验证码：6 位数字。
@@ -338,6 +338,10 @@ func (p *Producer) produceOne(ctx context.Context, cfg Config, mb models.Mailbox
 		attempts = maxTermsAttempts
 	}
 
+	// 代理隧道瞬断（ERR_TUNNEL_CONNECTION_FAILED 等）换出口重试通常可恢复，
+	// 独立于 Terms 重试计数，最多 maxNetRetries 次。
+	const maxNetRetries = 2
+	netRetry := 0
 	var res *codexreg.Result
 	var err error
 	for attempt := 1; attempt <= attempts; attempt++ {
@@ -359,7 +363,10 @@ func (p *Producer) produceOne(ctx context.Context, cfg Config, mb models.Mailbox
 				appendLog(msg)
 				p.logf("%s", "  "+mask(email)+" "+msg)
 			},
-			FetchCode: func(ctx context.Context) (string, error) {
+			FetchCode: func(ctx context.Context, after time.Time) (string, error) {
+				if after.After(since) {
+					return p.fetchCode(ctx, mb, after)
+				}
 				return p.fetchCode(ctx, mb, since)
 			},
 			SaveShot: func(png []byte) {
@@ -372,6 +379,12 @@ func (p *Producer) produceOne(ctx context.Context, cfg Config, mb models.Mailbox
 		}
 		if errors.Is(err, codexreg.ErrTermsRejected) && canRotate && attempt < attempts {
 			continue // 换 IP 再来一次
+		}
+		if isTransientNetErr(err) && netRetry < maxNetRetries && ctx.Err() == nil {
+			netRetry++
+			appendLog(fmt.Sprintf("♻ 网络/代理瞬断（%v），更换出口后第 %d/%d 次重试", err, netRetry, maxNetRetries))
+			attempt-- // 不占用 Terms 重试次数
+			continue
 		}
 		break
 	}
@@ -407,16 +420,43 @@ func (p *Producer) produceOne(ctx context.Context, cfg Config, mb models.Mailbox
 	return nil
 }
 
+// isTransientNetErr 网络/代理隧道瞬断类错误，换出口重试通常可恢复。
+func isTransientNetErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	for _, kw := range []string{
+		"ERR_TUNNEL_CONNECTION_FAILED",
+		"ERR_PROXY_CONNECTION_FAILED",
+		"ERR_SOCKS_CONNECTION_FAILED",
+		"ERR_CONNECTION_RESET",
+		"ERR_CONNECTION_CLOSED",
+		"ERR_CONNECTION_TIMED_OUT",
+		"ERR_TIMED_OUT",
+		"ERR_EMPTY_RESPONSE",
+		"ERR_NAME_NOT_RESOLVED",
+	} {
+		if strings.Contains(s, kw) {
+			return true
+		}
+	}
+	return false
+}
+
 // fetchCode 轮询邮箱，从 OpenAI/ChatGPT 验证邮件里提取 6 位验证码。
 func (p *Producer) fetchCode(ctx context.Context, mb models.Mailbox, since time.Time) (string, error) {
 	acc := mailfetch.Account{Email: mb.Email, ClientID: mb.ClientID, RefreshToken: mb.RefreshToken}
 	deadline := time.Now().Add(codePollTimeout)
+	var lastErr error
 	for time.Now().Before(deadline) {
 		if ctx.Err() != nil {
 			return "", ctx.Err()
 		}
 		msgs, err := p.mail.ListMessages(ctx, acc, 15)
-		if err == nil {
+		if err != nil {
+			lastErr = err
+		} else {
 			// 取"最新"一封 OpenAI 验证邮件里的码：重发后新码到达时能覆盖旧码，
 			// 避免重发场景下抓回已失效的旧验证码。
 			var bestCode string
@@ -447,12 +487,15 @@ func (p *Producer) fetchCode(ctx context.Context, mb models.Mailbox, since time.
 		case <-time.After(codePollInterval):
 		}
 	}
+	if lastErr != nil {
+		return "", fmt.Errorf("超时未收到验证码邮件（读取邮箱最近一次出错: %v）", lastErr)
+	}
 	return "", fmt.Errorf("超时未收到验证码邮件")
 }
 
 func looksLikeOpenAI(m mailfetch.Message) bool {
 	s := strings.ToLower(m.From + " " + m.FromName + " " + m.Subject)
-	return strings.Contains(s, "openai") || strings.Contains(s, "chatgpt") || strings.Contains(s, "code")
+	return strings.Contains(s, "openai") || strings.Contains(s, "chatgpt")
 }
 
 // ---- inflight / 计数 ----

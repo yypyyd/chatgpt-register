@@ -102,7 +102,8 @@ func fetchImage(rawURL, proxy string) (image.Image, error) {
 // solveOffset 在背景图里定位缺口，返回滑块需要横移的原图像素数与匹配得分。
 // 缺口是按拼图块形状压暗并带亮描边的区域，所以按形状取「外圈平均亮度 - 内部平均亮度」
 // 打分：真缺口处内部明显更暗、描边更亮，得分远高于普通图像内容。
-// holeY 是滑块图画布顶边相对背景图顶边的纵向偏移（原始尺寸像素），由 DOM 位置换算而来。
+// holeY 是滑块图画布顶边相对背景图顶边的纵向偏移（原始尺寸像素），由 DOM 位置换算而来；
+// 传负值表示纵坐标未知（协议流程拿到的是独立小图），此时全图扫行。
 func solveOffset(bg, piece image.Image, holeY float64) (int, float64, error) {
 	bgG := toGray(bg)
 	pcG := toGray(piece)
@@ -129,7 +130,7 @@ func solveOffset(bg, piece image.Image, holeY float64) (int, float64, error) {
 	if yTo > bgG.h-th {
 		yTo = bgG.h - th
 	}
-	if yFrom > yTo {
+	if yFrom > yTo || holeY < 0 {
 		yFrom, yTo = 0, bgG.h-th
 	}
 	xFrom := x0 + pieceSkipLeft

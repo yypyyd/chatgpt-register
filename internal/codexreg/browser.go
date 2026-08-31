@@ -129,7 +129,7 @@ func registerBrowser(ctx context.Context, in Input) (token string, err error) {
 	// 3. 打开 ChatGPT 注册页
 	in.logf("🌐 正在打开 ChatGPT 注册页...")
 	page.MustNavigate("https://chatgpt.com/auth/login")
-	page.MustWaitLoad() 
+	page.MustWaitLoad()
 	page.MustElement("#email").MustWaitVisible()
 	in.logf("✅ 注册页已加载")
 
@@ -176,7 +176,7 @@ func registerBrowser(ctx context.Context, in Input) (token string, err error) {
 	in.logf("📨 验证码输入框已出现，正在从邮箱读取验证码...")
 
 	// 5. 自动读取验证码（由 producer 通过邮箱轮询提供）
-	code, err := in.FetchCode(ctx)
+	code, err := in.FetchCode(ctx, time.Time{})
 	if err != nil {
 		return "", fmt.Errorf("获取邮箱验证码失败: %w", err)
 	}
@@ -200,7 +200,8 @@ func registerBrowser(ctx context.Context, in Input) (token string, err error) {
 	ready := false
 	codeResent := false
 	profileSubmitted := false
-	for attempt := 0; attempt < 8 && !ready; attempt++ {
+	stillCode := 0
+	for attempt := 0; attempt < 12 && !ready; attempt++ {
 		pg := page.CancelTimeout().Timeout(60 * time.Second)
 		state := ""
 		pg.Race().
@@ -255,13 +256,22 @@ func registerBrowser(ctx context.Context, in Input) (token string, err error) {
 			if codeResent {
 				return "", fmt.Errorf("验证码提交后仍停在验证码页（重发后仍未通过）")
 			}
+			// 提交后验证码页可能短暂停留（服务端校验中/下一页未渲染），先多等几轮再当作验证码无效。
+			if stillCode < 5 {
+				stillCode++
+				time.Sleep(3 * time.Second)
+				continue
+			}
 			in.logf("📨 仍停在验证码页，点击重发并重新读取验证码")
 			// Resend 可能是按钮/链接；找不到就直接重新抓码重填（可能只是上次码解析有误）。
-			if el, e := pg.ElementR("button, a, [role='button']", "Resend|重新发送"); e == nil && el != nil {
+			var resentAt time.Time
+			if el, e := pg.Timeout(10*time.Second).ElementR("button, a, [role='button']", "Resend|重新发送"); e == nil && el != nil {
+				resentAt = time.Now()
 				el.MustEval(`() => this.click()`)
 				time.Sleep(8 * time.Second)
 			}
-			newCode, ferr := in.FetchCode(ctx)
+			// 点过重发就只等新邮件，否则会把刚被拒绝的旧码再提交一遍。
+			newCode, ferr := in.FetchCode(ctx, resentAt)
 			if ferr != nil {
 				return "", fmt.Errorf("重发后获取验证码失败: %w", ferr)
 			}
