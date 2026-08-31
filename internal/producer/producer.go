@@ -41,7 +41,9 @@ const (
 	defaultMailboxIntervalMin = 5
 	codePollTimeout           = 3 * time.Minute
 	codePollInterval          = 5 * time.Second
-	maxLogLines               = 300
+	// 邮箱服务（Graph）连续 503 等临时错误达到该时长即放弃并自动停用该邮箱。
+	mailTempErrGiveUp = 30 * time.Second
+	maxLogLines       = 300
 )
 
 // openAI 验证码：6 位数字。
@@ -449,6 +451,7 @@ func (p *Producer) fetchCode(ctx context.Context, mb models.Mailbox, since time.
 	acc := mailfetch.Account{Email: mb.Email, ClientID: mb.ClientID, RefreshToken: mb.RefreshToken}
 	deadline := time.Now().Add(codePollTimeout)
 	var lastErr error
+	var tempErrSince time.Time // 邮箱服务连续 503/不可用的起始时间
 	for time.Now().Before(deadline) {
 		if ctx.Err() != nil {
 			return "", ctx.Err()
@@ -456,7 +459,19 @@ func (p *Producer) fetchCode(ctx context.Context, mb models.Mailbox, since time.
 		msgs, err := p.mail.ListMessages(ctx, acc, 15)
 		if err != nil {
 			lastErr = err
+			if errors.Is(err, mailfetch.ErrAuthTemporary) {
+				if tempErrSince.IsZero() {
+					tempErrSince = time.Now()
+				} else if time.Since(tempErrSince) >= mailTempErrGiveUp {
+					// 连续 503 多半是邮箱被微软风控，继续等也没用：自动停用该邮箱并跳过
+					p.db.Model(&models.Mailbox{}).Where("id = ?", mb.ID).Update("status", "disabled")
+					return "", fmt.Errorf("邮箱服务连续不可用超过 %v，已自动停用该邮箱并跳过: %v", mailTempErrGiveUp, err)
+				}
+			} else {
+				tempErrSince = time.Time{}
+			}
 		} else {
+			tempErrSince = time.Time{}
 			// 取"最新"一封 OpenAI 验证邮件里的码：重发后新码到达时能覆盖旧码，
 			// 避免重发场景下抓回已失效的旧验证码。
 			var bestCode string

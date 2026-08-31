@@ -34,6 +34,10 @@ const (
 	// defaultRetryCooldownMin 注册失败后重试同一邮箱前的等待分钟数，避免连续重试
 	// 撞风控。可在系统设置 retry_cooldown_min 覆盖，0 = 不冷却。
 	defaultRetryCooldownMin = 30
+
+	// rateLimitPause 撞到注册接口限流后整个生产暂停的时长。BytePlus 的限流按
+	// 注册频率算（换出口 IP 也拦），继续硬跑只会把邮箱一个个烧进冷却。
+	rateLimitPause = 3 * time.Minute
 )
 
 var digitCodeRe = regexp.MustCompile(`\b(\d{6})\b`)
@@ -49,8 +53,9 @@ type Producer struct {
 	pxIdx   int
 	// topUpCancel 非空表示补任务循环在跑，StopAll 用它停掉补任务。
 	topUpCancel context.CancelFunc
-	runTarget   int    // 本次生产的目标数量
-	runTracked  []uint // 本次生产建过的任务 id
+	runTarget   int       // 本次生产的目标数量
+	runTracked  []uint    // 本次生产建过的任务 id
+	rlUntil     time.Time // 注册接口限流的全局退避截止时间
 }
 
 func New(db *gorm.DB, mail *mailfetch.Client) *Producer {
@@ -273,6 +278,10 @@ func (p *Producer) topUp(count int, started []models.LuminaRegistration) {
 		if slots <= 0 {
 			continue
 		}
+		// 限流退避期内不取新号：占着邮箱干等没意义，退避结束后再继续。
+		if p.rateLimitWait() > 0 {
+			continue
+		}
 		regs, cooling, err := p.claimTargets(minInt(remaining, slots))
 		if err != nil {
 			return
@@ -365,6 +374,25 @@ func minInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// pauseForRateLimit 记录一次注册接口限流，让后续注册统一退避。
+func (p *Producer) pauseForRateLimit() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if until := time.Now().Add(rateLimitPause); until.After(p.rlUntil) {
+		p.rlUntil = until
+	}
+}
+
+// rateLimitWait 返回当前还需退避多久，没在退避期返回 0。
+func (p *Producer) rateLimitWait() time.Duration {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if d := time.Until(p.rlUntil); d > 0 {
+		return d
+	}
+	return 0
 }
 
 // sleepCtx 等一段时间；被取消时返回 false。
@@ -528,9 +556,10 @@ func (p *Producer) run(id uint) {
 			break
 		}
 		if errors.Is(err, luminareg.ErrRateLimited) {
-			// 限流不按出口 IP 算，原地重试白占并发槽：直接失败进冷却，
-			// 让补任务先换下一个邮箱跑，冷却到了再回来重试这个号。
-			p.appendLog(id, "注册未通过: "+err.Error()+"，先换下一个邮箱，本邮箱进冷却后再重试")
+			// 实测换 IP 也拦：限流按注册频率算。让整个生产退避一段时间，
+			// 避免后续邮箱接着撞限流被一个个烧进冷却。
+			p.pauseForRateLimit()
+			p.appendLog(id, "注册未通过: "+err.Error()+fmt.Sprintf("，全局退避 %v 后再继续，本邮箱进冷却", rateLimitPause))
 			break
 		}
 		if canRotate && attempt < maxRotateAttempts &&
@@ -590,12 +619,16 @@ func (p *Producer) fetchCode(ctx context.Context, id, mailboxID uint, since time
 	acc := mailfetch.Account{Email: mb.Email, ClientID: mb.ClientID, RefreshToken: mb.RefreshToken}
 	deadline := time.Now().Add(codePollTimeout)
 	p.appendLog(id, "开始自动读取 BytePlus 邮件验证码")
+	// 邮箱服务（Graph）连续 503 等临时错误达到该时长即放弃并自动停用该邮箱。
+	const mailTempErrGiveUp = 30 * time.Second
+	var tempErrSince time.Time
 	for time.Now().Before(deadline) {
 		if ctx.Err() != nil {
 			return "", ctx.Err()
 		}
 		msgs, err := p.mail.ListMessages(ctx, acc, 15)
 		if err == nil {
+			tempErrSince = time.Time{}
 			for _, m := range msgs {
 				if m.ReceivedAt.Before(since) || !looksLikeBytePlus(m) {
 					continue
@@ -614,6 +647,17 @@ func (p *Producer) fetchCode(ctx context.Context, id, mailboxID uint, since time
 				}
 			}
 		} else {
+			if errors.Is(err, mailfetch.ErrAuthTemporary) {
+				if tempErrSince.IsZero() {
+					tempErrSince = time.Now()
+				} else if time.Since(tempErrSince) >= mailTempErrGiveUp {
+					// 连续 503 多半是邮箱被微软风控，继续等也没用：自动停用该邮箱并跳过
+					p.db.Model(&models.Mailbox{}).Where("id = ?", mb.ID).Update("status", "disabled")
+					return "", fmt.Errorf("邮箱服务连续不可用超过 %v，已自动停用该邮箱并跳过: %v", mailTempErrGiveUp, err)
+				}
+			} else {
+				tempErrSince = time.Time{}
+			}
 			p.appendLog(id, "读取邮件暂时失败，继续重试: "+err.Error())
 		}
 		select {

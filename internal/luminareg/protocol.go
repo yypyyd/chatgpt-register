@@ -122,7 +122,22 @@ func registerProtocol(ctx context.Context, in Input) (*Result, error) {
 			in.logf("注册接口已通过")
 			// 注册接口签发的会话在 Lumina 侧仍是 guest，而同一会话重登会报
 			// InvalidState，所以用干净的会话账密登录一次，拿到的才是可用会话。
-			lc, lerr := c.loginFresh(ctx)
+			// 账号此时已建好，代理瞬断（如 502）导致的登录失败重试几次即可，
+			// 别把成功的注册记成失败。
+			var lc *protoClient
+			var lerr error
+			for try := 1; try <= 3; try++ {
+				lc, lerr = c.loginFresh(ctx)
+				if lerr == nil {
+					break
+				}
+				if try < 3 {
+					in.logf("登录换取会话失败（第 %d/3 次）: %v，稍后重试", try, lerr)
+					if !sleepCtxProto(ctx, 5*time.Second) {
+						return nil, ctx.Err()
+					}
+				}
+			}
 			if lerr != nil {
 				return nil, fmt.Errorf("注册成功但登录换取会话失败: %w", lerr)
 			}

@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -79,6 +80,16 @@ func main() {
 	// 启动时后台确保 rod 所需浏览器已就绪，未就绪则自动下载。
 	browser := browserboot.New()
 	browser.EnsureAsync()
+
+	// /tmp 为 tmpfs（占内存），异常退出会残留 rod 浏览器 Profile 目录，
+	// 堆积会耗尽内存导致并发注册失败：每 10 分钟清理超过 30 分钟没动过的残留
+	//（单次注册只有几分钟，不会误删正在跑的）。
+	go func() {
+		for {
+			cleanStaleRodProfiles(30 * time.Minute)
+			time.Sleep(10 * time.Minute)
+		}
+	}()
 
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.Default()
@@ -247,5 +258,28 @@ func main() {
 	log.Printf("chatgpt-register listening on http://localhost%s", addr)
 	if err := r.Run(addr); err != nil {
 		log.Fatal(err)
+	}
+}
+
+// cleanStaleRodProfiles 删除 rod 残留的临时浏览器 Profile 目录（超过 maxAge 未修改的）。
+func cleanStaleRodProfiles(maxAge time.Duration) {
+	dir := filepath.Join(os.TempDir(), "rod", "user-data")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-maxAge)
+	removed := 0
+	for _, e := range entries {
+		info, err := e.Info()
+		if err != nil || info.ModTime().After(cutoff) {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(dir, e.Name())); err == nil {
+			removed++
+		}
+	}
+	if removed > 0 {
+		log.Printf("已清理 %d 个残留的浏览器临时 Profile 目录", removed)
 	}
 }

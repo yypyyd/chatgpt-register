@@ -130,12 +130,18 @@ func registerBrowser(ctx context.Context, in Input) (token string, err error) {
 	in.logf("🌐 正在打开 ChatGPT 注册页...")
 	page.MustNavigate("https://chatgpt.com/auth/login")
 	page.MustWaitLoad()
-	page.MustElement("#email").MustWaitVisible()
+	// 登录页有 A/B 多套布局，邮箱输入框不一定是 #email，按多个候选选择器匹配。
+	const emailSel = `#email, input[type="email"], input[name="email"], input[autocomplete="email"]`
+	page.MustElement(emailSel).MustWaitVisible()
 	in.logf("✅ 注册页已加载")
 
 	// 4. 输入邮箱并提交（用 JS 点击，避免元素被遮挡/未进入可点击态时 MustClick 失败）
-	page.MustElement("#email").MustInput(in.Email)
-	page.MustElement("button[type='submit']").MustEval(`() => this.click()`)
+	page.MustElement(emailSel).MustInput(in.Email)
+	if el, e := page.Timeout(10 * time.Second).Element("button[type='submit']"); e == nil && el != nil {
+		el.MustEval(`() => this.click()`)
+	} else {
+		page.MustElementR("button", "Continue|继续").MustEval(`() => this.click()`)
+	}
 	in.logf("📧 已提交邮箱，等待下一步...")
 
 	// 4.1 提交邮箱后可能出现"Create a password"创建密码页（在验证码之前）。
