@@ -64,6 +64,12 @@ func main() {
 	).Error; err != nil {
 		log.Printf("reset higgsfield registering on boot: %v", err)
 	}
+	if err := database.Exec(
+		"UPDATE lumina_registrations SET status = 'register_failed', log = log || ? WHERE status IN ('registering', 'waiting_code')",
+		"\n"+time.Now().Format("2006-01-02 15:04:05")+" ✗ 程序重启，Lumina 任务中断，判定为失败",
+	).Error; err != nil {
+		log.Printf("reset lumina registering on boot: %v", err)
+	}
 
 	authSvc, err := auth.New(database)
 	if err != nil {
@@ -204,6 +210,19 @@ func main() {
 		api.DELETE("/higgsfield/registrations/:id", h.HiggsfieldDelete)
 		api.GET("/higgsfield/registrations/:id/logs", h.HiggsfieldLog)
 		api.POST("/higgsfield/download", h.HiggsfieldDownload)
+
+		api.GET("/lumina/registrations", h.LuminaList)
+		api.DELETE("/lumina/registrations", h.LuminaDeleteAll)
+		api.POST("/lumina/registrations", h.LuminaStart)
+		api.POST("/lumina/produce", h.LuminaProduce)
+		api.GET("/lumina/produce/status", h.LuminaProduceStatus)
+		api.POST("/lumina/produce/stop", h.LuminaProduceStop)
+		api.POST("/lumina/registrations/:id/code", h.LuminaSubmitCode)
+		api.POST("/lumina/registrations/:id/stop", h.LuminaStop)
+		api.DELETE("/lumina/registrations/:id", h.LuminaDelete)
+		api.GET("/lumina/registrations/:id/logs", h.LuminaLog)
+		api.GET("/lumina/registrations/:id/shot", h.LuminaShot)
+		api.POST("/lumina/download", h.LuminaDownload)
 	}
 
 	sub, err := fs.Sub(staticFS, "static")
@@ -212,7 +231,7 @@ func main() {
 	}
 	httpFS := http.FS(sub)
 	r.StaticFS("/static", httpFS)
-	for _, p := range []string{"login", "dashboard", "mailboxes", "accounts", "grok", "adobe", "leonardo", "oreate", "higgsfield", "settings"} {
+	for _, p := range []string{"login", "dashboard", "mailboxes", "accounts", "grok", "adobe", "leonardo", "oreate", "higgsfield", "lumina", "settings"} {
 		p := p
 		r.GET("/"+p, func(c *gin.Context) { c.FileFromFS(p+".html", httpFS) })
 	}
