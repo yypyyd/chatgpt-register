@@ -35,9 +35,12 @@ const (
 	// 撞风控。可在系统设置 retry_cooldown_min 覆盖，0 = 不冷却。
 	defaultRetryCooldownMin = 30
 
-	// rateLimitPause 撞到注册接口限流后整个生产暂停的时长。BytePlus 的限流按
-	// 注册频率算（换出口 IP 也拦），继续硬跑只会把邮箱一个个烧进冷却。
-	rateLimitPause = 3 * time.Minute
+	// rateLimitCooldown 被限流的邮箱的重试冷却：限流不是这个邮箱的问题，别按失败
+	// 罚它 30 分钟，短暂避让后放回池子继续用。
+	rateLimitCooldown = 5 * time.Minute
+
+	// rateLimitNote 限流失败记录的备注前缀，取号时据此走短冷却。
+	rateLimitNote = "[限流]"
 )
 
 var digitCodeRe = regexp.MustCompile(`\b(\d{6})\b`)
@@ -53,9 +56,8 @@ type Producer struct {
 	pxIdx   int
 	// topUpCancel 非空表示补任务循环在跑，StopAll 用它停掉补任务。
 	topUpCancel context.CancelFunc
-	runTarget   int       // 本次生产的目标数量
-	runTracked  []uint    // 本次生产建过的任务 id
-	rlUntil     time.Time // 注册接口限流的全局退避截止时间
+	runTarget   int    // 本次生产的目标数量
+	runTracked  []uint // 本次生产建过的任务 id
 }
 
 func New(db *gorm.DB, mail *mailfetch.Client) *Producer {
@@ -134,14 +136,25 @@ func (p *Producer) StartFromAccounts(count int) ([]models.LuminaRegistration, er
 	return started, nil
 }
 
+// preferredDomainCond 圈出风控宽松的邮箱域：BytePlus 对 outlook.com / outlook.de
+// 的注册接口风控明显更严（直接回 ErrorRateLimit），hotmail / live 同为微软邮箱却能
+// 正常进滑块，所以先把它们用完，再回落到 outlook。
+const preferredDomainCond = "email LIKE '%@hotmail.com' OR email LIKE '%@hotmail.co%' " +
+	"OR email LIKE '%@live.com' OR email LIKE '%@live.co%'"
+
 // claimTargets 取最多 count 个可注册的邮箱并置为 registering。
 // cooling=true 表示还有失败邮箱可重试、只是没到冷却时间。
 func (p *Producer) claimTargets(count int) ([]models.LuminaRegistration, bool, error) {
 	cutoff := time.Now().Add(-p.retryCooldown())
-	// 已注册/在跑的邮箱要排除；失败的邮箱过了冷却才允许重试。
+	rlCutoff := time.Now().Add(-rateLimitCooldown)
+	if rlCutoff.Before(cutoff) {
+		rlCutoff = cutoff
+	}
+	// 已注册/在跑的邮箱要排除；失败的邮箱过了冷却才允许重试，其中被限流的走短冷却。
 	blocked := p.db.Model(&models.LuminaRegistration{}).
 		Select("email").
-		Where("status <> ? OR updated_at > ?", "register_failed", cutoff)
+		Where("status <> ? OR updated_at > (CASE WHEN note LIKE ? THEN ? ELSE ? END)",
+			"register_failed", rateLimitNote+"%", rlCutoff, cutoff)
 
 	// 失败过的邮箱（如被限流）优先级放到最后：第一轮只取从没失败过的新邮箱，
 	// 新邮箱用完了，第二轮才用过了冷却的失败邮箱补齐。
@@ -150,10 +163,8 @@ func (p *Producer) claimTargets(count int) ([]models.LuminaRegistration, bool, e
 		Where("status = ?", "register_failed")
 
 	started := make([]models.LuminaRegistration, 0, count)
-	for _, skipFailed := range []bool{true, false} {
-		if len(started) >= count {
-			break
-		}
+	// preferredOnly 那一轮只取 hotmail / live，用完才允许取 outlook。
+	claim := func(skipFailed, preferredOnly bool) error {
 		// 优先用已注册 ChatGPT 账号（其邮箱已在邮箱池且可读验证码）。
 		// 只取母号：裂变号是 +别名 邮箱，BytePlus 视作同一邮箱，不能用来注册。
 		accQ := p.db.
@@ -162,37 +173,55 @@ func (p *Producer) claimTargets(count int) ([]models.LuminaRegistration, bool, e
 		if skipFailed {
 			accQ = accQ.Where("email NOT IN (?)", everFailed)
 		}
+		if preferredOnly {
+			accQ = accQ.Where(preferredDomainCond)
+		}
 		var accounts []models.Registration
 		if err := accQ.Order("id asc").Limit(count - len(started)).Find(&accounts).Error; err != nil {
-			return nil, false, err
+			return err
 		}
 		for _, acc := range accounts {
 			reg, err := p.claimOne(acc.Email, acc.MailboxID,
 				fmt.Sprintf("来源: ChatGPT账号 #%d，自动读取验证码", acc.ID))
 			if err != nil {
-				return started, false, err
+				return err
 			}
 			started = append(started, *reg)
 		}
 		// 不足则从已验证邮箱池补齐。
-		if len(started) < count {
-			mbQ := p.db.
-				Where("status = ?", "verified").
-				Where("email NOT IN (?)", blocked)
-			if skipFailed {
-				mbQ = mbQ.Where("email NOT IN (?)", everFailed)
+		if len(started) >= count {
+			return nil
+		}
+		mbQ := p.db.
+			Where("status = ?", "verified").
+			Where("email NOT IN (?)", blocked)
+		if skipFailed {
+			mbQ = mbQ.Where("email NOT IN (?)", everFailed)
+		}
+		if preferredOnly {
+			mbQ = mbQ.Where(preferredDomainCond)
+		}
+		var mailboxes []models.Mailbox
+		if err := mbQ.Order("id asc").Limit(count - len(started)).Find(&mailboxes).Error; err != nil {
+			return err
+		}
+		for _, mb := range mailboxes {
+			reg, err := p.claimOne(mb.Email, mb.ID,
+				fmt.Sprintf("来源: 邮箱管理 #%d，自动读取验证码", mb.ID))
+			if err != nil {
+				return err
 			}
-			var mailboxes []models.Mailbox
-			if err := mbQ.Order("id asc").Limit(count - len(started)).Find(&mailboxes).Error; err != nil {
+			started = append(started, *reg)
+		}
+		return nil
+	}
+	for _, skipFailed := range []bool{true, false} {
+		for _, preferredOnly := range []bool{true, false} {
+			if len(started) >= count {
+				break
+			}
+			if err := claim(skipFailed, preferredOnly); err != nil {
 				return started, false, err
-			}
-			for _, mb := range mailboxes {
-				reg, err := p.claimOne(mb.Email, mb.ID,
-					fmt.Sprintf("来源: 邮箱管理 #%d，自动读取验证码", mb.ID))
-				if err != nil {
-					return started, false, err
-				}
-				started = append(started, *reg)
 			}
 		}
 	}
@@ -276,10 +305,6 @@ func (p *Producer) topUp(count int, started []models.LuminaRegistration) {
 		}
 		slots := p.maxConcurrency() - running
 		if slots <= 0 {
-			continue
-		}
-		// 限流退避期内不取新号：占着邮箱干等没意义，退避结束后再继续。
-		if p.rateLimitWait() > 0 {
 			continue
 		}
 		regs, cooling, err := p.claimTargets(minInt(remaining, slots))
@@ -374,25 +399,6 @@ func minInt(a, b int) int {
 		return a
 	}
 	return b
-}
-
-// pauseForRateLimit 记录一次注册接口限流，让后续注册统一退避。
-func (p *Producer) pauseForRateLimit() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if until := time.Now().Add(rateLimitPause); until.After(p.rlUntil) {
-		p.rlUntil = until
-	}
-}
-
-// rateLimitWait 返回当前还需退避多久，没在退避期返回 0。
-func (p *Producer) rateLimitWait() time.Duration {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if d := time.Until(p.rlUntil); d > 0 {
-		return d
-	}
-	return 0
 }
 
 // sleepCtx 等一段时间；被取消时返回 false。
@@ -556,10 +562,9 @@ func (p *Producer) run(id uint) {
 			break
 		}
 		if errors.Is(err, luminareg.ErrRateLimited) {
-			// 实测换 IP 也拦：限流按注册频率算。让整个生产退避一段时间，
-			// 避免后续邮箱接着撞限流被一个个烧进冷却。
-			p.pauseForRateLimit()
-			p.appendLog(id, "注册未通过: "+err.Error()+fmt.Sprintf("，全局退避 %v 后再继续，本邮箱进冷却", rateLimitPause))
+			// 实测换出口 IP、换浏览器特征都拦：限流按注册数量算，原地重试白占并发槽。
+			// 限流不是这个邮箱的问题，短冷却后放回池子继续用，不当成烧掉。
+			p.appendLog(id, "注册未通过: "+err.Error()+"，先换下一个邮箱，本邮箱短暂避让后放回池子")
 			break
 		}
 		if canRotate && attempt < maxRotateAttempts &&
@@ -572,13 +577,17 @@ func (p *Producer) run(id uint) {
 	if err != nil {
 		p.appendLog(id, "注册失败: "+err.Error())
 		status := "register_failed"
+		note := err.Error()
 		if errors.Is(err, luminareg.ErrEmailTaken) {
 			// 邮箱已被注册是终态，标成 already_registered 后不再进冷却重试。
 			status = "already_registered"
 		}
+		if errors.Is(err, luminareg.ErrRateLimited) {
+			note = rateLimitNote + note
+		}
 		p.db.Model(&models.LuminaRegistration{}).Where("id = ?", id).Updates(map[string]any{
 			"status": status,
-			"note":   truncateStr(err.Error(), 500),
+			"note":   truncateStr(note, 500),
 		})
 		return
 	}

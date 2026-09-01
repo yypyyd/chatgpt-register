@@ -64,7 +64,7 @@ func toGray(img image.Image) *grayImage {
 }
 
 // fetchImage 下载验证码图片；带上与浏览器一致的 UA/Referer，并跟随任务代理出口。
-func fetchImage(rawURL, proxy string) (image.Image, error) {
+func fetchImage(rawURL, proxy, ua string) (image.Image, error) {
 	tr := &http.Transport{}
 	if proxy != "" {
 		pu, err := url.Parse(normalizeProxy(proxy))
@@ -78,7 +78,10 @@ func fetchImage(rawURL, proxy string) (image.Image, error) {
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", userAgent)
+	if ua == "" {
+		ua = userAgent
+	}
+	req.Header.Set("User-Agent", ua)
 	req.Header.Set("Referer", luminaURL)
 	resp, err := client.Do(req)
 	if err != nil {

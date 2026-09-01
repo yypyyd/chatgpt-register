@@ -19,7 +19,6 @@ import (
 
 	http "github.com/bogdanfinn/fhttp"
 	tls_client "github.com/bogdanfinn/tls-client"
-	"github.com/bogdanfinn/tls-client/profiles"
 )
 
 // 纯协议注册：BytePlus passport 的注册链路（会话初始化 → 邮箱查重 → 发验证码 →
@@ -43,6 +42,7 @@ const (
 type protoClient struct {
 	cli tls_client.HttpClient
 	in  Input
+	fp  browserProfile
 }
 
 // passportResp 是 passport 接口的统一返回：出错时 ResponseMetadata.Error 非空。
@@ -66,7 +66,7 @@ func (r *passportResp) errCode() string {
 
 // registerProtocol 走纯协议注册，成功后返回与浏览器流程同构的会话数据。
 func registerProtocol(ctx context.Context, in Input) (*Result, error) {
-	c, err := newProtoClient(in)
+	c, err := newProtoClient(in, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -74,7 +74,6 @@ func registerProtocol(ctx context.Context, in Input) (*Result, error) {
 		return nil, fmt.Errorf("初始化 passport 会话失败: %v", err)
 	}
 	in.logf("协议会话已建立")
-
 	uniq, err := c.passport(ctx, http.MethodPost, "/account/checkEmailUniqueV2", map[string]any{"Email": in.Email}, nil)
 	if err != nil {
 		return nil, fmt.Errorf("邮箱查重失败: %v", err)
@@ -167,10 +166,16 @@ func registerProtocol(ctx context.Context, in Input) (*Result, error) {
 	}
 }
 
-func newProtoClient(in Input) (*protoClient, error) {
+// newProtoClient 建一个协议客户端。fp 为空时随机取一套浏览器特征，
+// 同一个账号的后续请求要沿用同一套，避免中途换指纹。
+func newProtoClient(in Input, fp *browserProfile) (*protoClient, error) {
+	if fp == nil {
+		p := randomBrowserProfile()
+		fp = &p
+	}
 	opts := []tls_client.HttpClientOption{
 		tls_client.WithTimeoutSeconds(60),
-		tls_client.WithClientProfile(profiles.Chrome_131),
+		tls_client.WithClientProfile(fp.clientProfile),
 		tls_client.WithCookieJar(tls_client.NewCookieJar()),
 	}
 	if pu := proxyutil.Normalize(in.Proxy); pu != "" {
@@ -181,7 +186,7 @@ func newProtoClient(in Input) (*protoClient, error) {
 		return nil, fmt.Errorf("创建协议客户端失败: %w", err)
 	}
 	cli.SetFollowRedirect(true)
-	return &protoClient{cli: cli, in: in}, nil
+	return &protoClient{cli: cli, in: in, fp: *fp}, nil
 }
 
 // syncLuminaCookies 把 console 域的会话 Cookie 复制到 lumi-api 上。
@@ -206,7 +211,7 @@ func (c *protoClient) syncLuminaCookies() {
 
 // loginFresh 用全新的 cookie jar 走一次账密登录，返回拿到正式会话的客户端。
 func (c *protoClient) loginFresh(ctx context.Context) (*protoClient, error) {
-	lc, err := newProtoClient(c.in)
+	lc, err := newProtoClient(c.in, &c.fp)
 	if err != nil {
 		return nil, err
 	}
@@ -252,12 +257,18 @@ func (c *protoClient) do(ctx context.Context, method, rawURL string, payload any
 	}
 	req = req.WithContext(ctx)
 	req.Header = http.Header{
-		"accept":          {"application/json, text/plain, */*"},
-		"accept-language": {"en"},
-		"content-type":    {"application/json"},
-		"origin":          {"https://ai.byteplus.com"},
-		"referer":         {"https://ai.byteplus.com/"},
-		"user-agent":      {userAgent},
+		"accept":             {"application/json, text/plain, */*"},
+		"accept-language":    {c.fp.lang},
+		"content-type":       {"application/json"},
+		"origin":             {"https://ai.byteplus.com"},
+		"referer":            {"https://ai.byteplus.com/"},
+		"sec-ch-ua":          {c.fp.chUA},
+		"sec-ch-ua-mobile":   {"?0"},
+		"sec-ch-ua-platform": {c.fp.platform},
+		"sec-fetch-dest":     {"empty"},
+		"sec-fetch-mode":     {"cors"},
+		"sec-fetch-site":     {"cross-site"},
+		"user-agent":         {c.fp.ua},
 	}
 	for k, v := range extra {
 		req.Header.Set(k, v)
@@ -373,11 +384,11 @@ func (c *protoClient) solveCaptchaProto(ctx context.Context, verifyData string) 
 		return fmt.Errorf("领取滑块失败(%d): %s", status, trimText(string(raw), 200))
 	}
 
-	bg, err := fetchImage(got.Data.Question.URL1, c.in.Proxy)
+	bg, err := fetchImage(got.Data.Question.URL1, c.in.Proxy, c.fp.ua)
 	if err != nil {
 		return err
 	}
-	piece, err := fetchImage(got.Data.Question.URL2, c.in.Proxy)
+	piece, err := fetchImage(got.Data.Question.URL2, c.in.Proxy, c.fp.ua)
 	if err != nil {
 		return err
 	}

@@ -1,6 +1,10 @@
 package db
 
 import (
+	"net/url"
+	"strings"
+	"time"
+
 	"chatgpt-register/internal/emailalias"
 	"chatgpt-register/internal/models"
 
@@ -9,10 +13,20 @@ import (
 )
 
 func Init(path string) (*gorm.DB, error) {
-	db, err := gorm.Open(sqlite.Open(path), &gorm.Config{})
+	db, err := gorm.Open(sqlite.Open(dsn(path)), &gorm.Config{})
 	if err != nil {
 		return nil, err
 	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		return nil, err
+	}
+	// 写操作串行化：SQLite 同一时刻只允许一个写事务，连接开多了只会互相
+	// 撞 SQLITE_BUSY（面板接口和注册任务一起卡几秒）。WAL 下读不阻塞写，
+	// 单连接足够，且顺带避免连接被中断事务污染。
+	sqlDB.SetMaxOpenConns(1)
+	sqlDB.SetMaxIdleConns(1)
+	sqlDB.SetConnMaxLifetime(time.Hour)
 	if err := db.AutoMigrate(&models.Registration{}, &models.GrokRegistration{}, &models.AdobeRegistration{}, &models.LeonardoRegistration{}, &models.OreateRegistration{}, &models.HiggsfieldRegistration{}, &models.LuminaRegistration{}, &models.Mailbox{}, &models.Setting{}, &models.Admin{}); err != nil {
 		return nil, err
 	}
@@ -26,6 +40,20 @@ func Init(path string) (*gorm.DB, error) {
 	reclaimOrphanLuminaRegistering(db)
 	backfillRegistrationMailboxIDs(db)
 	return db, nil
+}
+
+// dsn 给数据库路径补上 WAL / busy_timeout 等 pragma：
+// WAL 让读写互不阻塞，busy_timeout 让并发写排队等待而不是立刻报
+// "database is locked"。已带查询参数的路径保持原样。
+func dsn(path string) string {
+	if strings.Contains(path, "?") {
+		return path
+	}
+	q := url.Values{}
+	q.Add("_pragma", "journal_mode(WAL)")
+	q.Add("_pragma", "busy_timeout(30000)")
+	q.Add("_pragma", "synchronous(NORMAL)")
+	return "file:" + path + "?" + q.Encode()
 }
 
 // reclaimOrphanRegistering 启动时把残留的 registering 记录标为 register_failed。
