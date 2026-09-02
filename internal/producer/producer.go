@@ -39,8 +39,11 @@ const (
 	// 两封验证码邮件挤在一起容易读错/读不到。可在系统设置 mailbox_interval_min
 	// 覆盖，0 = 不限。
 	defaultMailboxIntervalMin = 5
-	codePollTimeout           = 3 * time.Minute
-	codePollInterval          = 5 * time.Second
+	// registerAttemptTimeout 单次浏览器注册的墙钟上限：不加上限时任务卡死就一直处于 registering，
+	// “停止”也要等它跑完才能结束。
+	registerAttemptTimeout = 12 * time.Minute
+	codePollTimeout        = 3 * time.Minute
+	codePollInterval       = 5 * time.Second
 	// 邮箱服务（Graph）连续 503 等临时错误达到该时长即放弃并自动停用该邮箱。
 	mailTempErrGiveUp = 30 * time.Second
 	maxLogLines       = 300
@@ -375,7 +378,9 @@ func (p *Producer) produceOne(ctx context.Context, cfg Config, mb models.Mailbox
 				p.db.Model(&models.Registration{}).Where("email = ?", email).Update("shot", png)
 			},
 		}
-		res, err = codexreg.Register(ctx, in)
+		attemptCtx, cancelAttempt := context.WithTimeout(ctx, registerAttemptTimeout)
+		res, err = codexreg.Register(attemptCtx, in)
+		cancelAttempt()
 		if err == nil {
 			break
 		}

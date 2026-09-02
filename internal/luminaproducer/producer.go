@@ -35,9 +35,18 @@ const (
 	// 撞风控。可在系统设置 retry_cooldown_min 覆盖，0 = 不冷却。
 	defaultRetryCooldownMin = 30
 
+	// defaultRegisterSpacingSec 相邻两单注册的最小启动间隔秒数。实测 BytePlus 按注册
+	// 数量给配额：猛冲能连过 50~70 单，之后封 20~30 分钟，平均约每分钟 2 单；把节奏
+	// 压到这个间隔内基本不会再撞限流。可在系统设置 register_spacing_sec 覆盖，0 = 不错峰。
+	defaultRegisterSpacingSec = 25
+
 	// rateLimitCooldown 被限流的邮箱的重试冷却：限流不是这个邮箱的问题，别按失败
 	// 罚它 30 分钟，短暂避让后放回池子继续用。
 	rateLimitCooldown = 5 * time.Minute
+
+	// maxRegisterSpacingSec 自适应错峰的间隔上限：BytePlus 配额吃紧时逐步拉长到
+	// 这个值为止，避免无限变慢。
+	maxRegisterSpacingSec = 180
 
 	// rateLimitNote 限流失败记录的备注前缀，取号时据此走短冷却。
 	rateLimitNote = "[限流]"
@@ -58,6 +67,11 @@ type Producer struct {
 	topUpCancel context.CancelFunc
 	runTarget   int    // 本次生产的目标数量
 	runTracked  []uint // 本次生产建过的任务 id
+	// lastStart 上一单注册的开工时间，用于相邻两单错峰。
+	lastStart time.Time
+	// dynSpacing 自适应错峰的当前间隔：撞限流加倍拉长，注册成功逐步收窄，
+	// 始终不低于 registerSpacing 的基础值。零值表示尚未调整过。
+	dynSpacing time.Duration
 }
 
 func New(db *gorm.DB, mail *mailfetch.Client) *Producer {
@@ -279,6 +293,96 @@ func (p *Producer) retryCooldown() time.Duration {
 		}
 	}
 	return time.Duration(min) * time.Minute
+}
+
+// registerSpacing 相邻两单注册的最小启动间隔，跟设置页 register_spacing_sec，0 = 不错峰。
+func (p *Producer) registerSpacing() time.Duration {
+	raw := strings.TrimSpace(p.getSetting("register_spacing_sec"))
+	sec := defaultRegisterSpacingSec
+	if raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n >= 0 {
+			sec = n
+		}
+	}
+	return time.Duration(sec) * time.Second
+}
+
+// effectiveSpacing 当前生效的错峰间隔：取自适应间隔与基础间隔的较大者。
+func (p *Producer) effectiveSpacing() time.Duration {
+	base := p.registerSpacing()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.dynSpacing > base {
+		return p.dynSpacing
+	}
+	return base
+}
+
+// bumpSpacing 撞限流后把错峰间隔加倍（不超过上限），让节奏自动降到配额线下。
+func (p *Producer) bumpSpacing(id uint) {
+	base := p.registerSpacing()
+	if base <= 0 {
+		return // 用户显式关掉了错峰，不自作主张
+	}
+	p.mu.Lock()
+	cur := p.dynSpacing
+	if cur < base {
+		cur = base
+	}
+	next := cur * 2
+	if max := maxRegisterSpacingSec * time.Second; next > max {
+		next = max
+	}
+	p.dynSpacing = next
+	p.mu.Unlock()
+	if next != cur {
+		p.appendLog(id, fmt.Sprintf("检测到限流，错峰间隔调整为 %d 秒", int(next.Seconds()+0.5)))
+	}
+}
+
+// easeSpacing 注册成功后逐步收窄错峰间隔（每次减 5 秒），直到回到基础值。
+func (p *Producer) easeSpacing() {
+	base := p.registerSpacing()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.dynSpacing <= base {
+		p.dynSpacing = 0
+		return
+	}
+	p.dynSpacing -= 5 * time.Second
+	if p.dynSpacing < base {
+		p.dynSpacing = base
+	}
+}
+
+// waitSpacing 错峰：与上一单开工时间至少隔 effectiveSpacing，把平均注册频率压在
+// BytePlus 的配额线下。返回 false 表示等待期间被停止。
+func (p *Producer) waitSpacing(ctx context.Context, id uint) bool {
+	gap := p.effectiveSpacing()
+	if gap <= 0 {
+		return true
+	}
+	logged := false
+	for {
+		p.mu.Lock()
+		wait := time.Until(p.lastStart.Add(gap))
+		if wait <= 0 {
+			p.lastStart = time.Now()
+			p.mu.Unlock()
+			return true
+		}
+		p.mu.Unlock()
+		if !logged {
+			p.appendLog(id, fmt.Sprintf("错峰等待 %d 秒后开工（避免撞 BytePlus 注册配额）", int(wait.Seconds()+0.5)))
+			logged = true
+		}
+		if wait > time.Second {
+			wait = time.Second
+		}
+		if !sleepCtx(ctx, wait) {
+			return false
+		}
+	}
 }
 
 // topUp 边跑边补：始终让在跑任务数维持在并发上限，直到本次生产拿到 count 个已注册
@@ -526,6 +630,15 @@ func (p *Producer) run(id uint) {
 	}
 	defer p.releaseSlot()
 
+	if !p.waitSpacing(ctx, id) {
+		p.appendLog(id, "已取消（错峰等待时被停止）")
+		p.db.Model(&models.LuminaRegistration{}).Where("id = ?", id).Updates(map[string]any{
+			"status": "register_failed",
+			"note":   "已取消",
+		})
+		return
+	}
+
 	p.appendLog(id, "开始 Lumina 邮箱注册")
 
 	// 与 GPT 生产一致：bestgo 住宅代理（带 -session-）可换出口 IP，被限流或
@@ -564,6 +677,7 @@ func (p *Producer) run(id uint) {
 		if errors.Is(err, luminareg.ErrRateLimited) {
 			// 实测换出口 IP、换浏览器特征都拦：限流按注册数量算，原地重试白占并发槽。
 			// 限流不是这个邮箱的问题，短冷却后放回池子继续用，不当成烧掉。
+			p.bumpSpacing(id)
 			p.appendLog(id, "注册未通过: "+err.Error()+"，先换下一个邮箱，本邮箱短暂避让后放回池子")
 			break
 		}
@@ -592,6 +706,7 @@ func (p *Producer) run(id uint) {
 		return
 	}
 
+	p.easeSpacing()
 	authBytes, _ := json.MarshalIndent(res.AuthJSON, "", "  ")
 	p.appendLog(id, "Lumina 注册成功")
 	p.db.Model(&models.LuminaRegistration{}).Where("id = ?", id).Updates(map[string]any{

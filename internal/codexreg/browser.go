@@ -51,15 +51,24 @@ func registerBrowser(ctx context.Context, in Input) (token string, err error) {
 
 	controlURL, err := l.Launch()
 	if err != nil {
+		l.Kill()
+		l.Cleanup()
 		return "", fmt.Errorf("启动 Chrome 失败: %w", err)
 	}
-	browser := rod.New().ControlURL(controlURL)
+	// 绑定 ctx：上层「停止」或超时取消时，CDP 调用立刻返回错误，任务不会一直挂着。
+	browser := rod.New().Context(ctx).ControlURL(controlURL)
 	if err := browser.Connect(); err != nil {
+		l.Kill()
+		l.Cleanup()
 		return "", fmt.Errorf("连接 Chrome 失败: %w", err)
 	}
 	defer func() {
 		// 关浏览器后清理 launcher 临时用户数据目录，避免残留 Profile 堆积
-		_ = rod.Try(browser.MustClose)
+		// ctx 已取消时用干净 ctx 关浏览器，否则 Chrome 进程会残留
+		if rod.Try(browser.Context(context.Background()).MustClose) != nil {
+			// CDP 卡死时关不掉，直接杀掉 Chrome 进程兜底
+			l.Kill()
+		}
 		l.Cleanup()
 	}()
 
