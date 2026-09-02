@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -15,7 +14,7 @@ import (
 	"chatgpt-register/internal/mailfetch"
 	"chatgpt-register/internal/models"
 	"chatgpt-register/internal/oreatereg"
-	"chatgpt-register/internal/proxyutil"
+	"chatgpt-register/internal/prodcore"
 
 	"gorm.io/gorm"
 )
@@ -26,7 +25,6 @@ const (
 	linkPollInterval = 3 * time.Second
 	maxLogBytes      = 64 * 1024
 
-	defaultMaxConcurrency   = 1
 	defaultRetryCooldownMin = 30
 
 	// badDomainLimit 同一邮箱域名被站点拒收几次后，本次生产不再取该域名的邮箱，
@@ -40,13 +38,13 @@ const (
 )
 
 type Producer struct {
+	*prodcore.Core
+
 	db   *gorm.DB
 	mail *mailfetch.Client
 
 	mu     sync.Mutex
 	cancel map[uint]context.CancelFunc
-	active int
-	pxIdx  int
 	// topUpCancel 非空表示补任务循环在跑，StopAll 用它停掉补任务。
 	topUpCancel context.CancelFunc
 	runTarget   int
@@ -58,8 +56,8 @@ type Producer struct {
 }
 
 func New(db *gorm.DB, mail *mailfetch.Client) *Producer {
-	return &Producer{db: db, mail: mail, cancel: map[uint]context.CancelFunc{},
-		badDomains: map[string]int{}}
+	return &Producer{Core: prodcore.New(db), db: db, mail: mail,
+		cancel: map[uint]context.CancelFunc{}, badDomains: map[string]int{}}
 }
 
 func (p *Producer) Start(email, note string) (*models.OreateRegistration, error) {
@@ -92,7 +90,7 @@ func (p *Producer) StartFromAccounts(count int) ([]models.OreateRegistration, er
 	if count < 1 {
 		return nil, fmt.Errorf("数量必须 >= 1")
 	}
-	started, cooling, err := p.claimTargets(minInt(count, p.maxConcurrency()))
+	started, cooling, err := p.claimTargets(min(count, p.MaxConcurrency()))
 	if err != nil {
 		return nil, err
 	}
@@ -208,14 +206,7 @@ func (p *Producer) hasCoolingFailure(cutoff time.Time) bool {
 }
 
 func (p *Producer) retryCooldown() time.Duration {
-	raw := strings.TrimSpace(p.getSetting("retry_cooldown_min"))
-	min := defaultRetryCooldownMin
-	if raw != "" {
-		if n, err := strconv.Atoi(raw); err == nil && n >= 0 {
-			min = n
-		}
-	}
-	return time.Duration(min) * time.Minute
+	return p.SettingMinutes("retry_cooldown_min", defaultRetryCooldownMin)
 }
 
 // topUp 边跑边补：始终让在跑任务数维持在并发上限，直到本次生产拿到 count 个已注册账号。
@@ -228,7 +219,7 @@ func (p *Producer) topUp(count int) {
 
 	tracked := p.trackedIDs()
 	for {
-		if !sleepCtx(ctx, 5*time.Second) {
+		if !prodcore.Sleep(ctx, 5*time.Second) {
 			return
 		}
 		running := p.runningNum()
@@ -239,11 +230,11 @@ func (p *Producer) topUp(count int) {
 			}
 			return
 		}
-		slots := p.maxConcurrency() - running
+		slots := p.MaxConcurrency() - running
 		if slots <= 0 {
 			continue
 		}
-		regs, cooling, err := p.claimTargets(minInt(remaining, slots))
+		regs, cooling, err := p.claimTargets(min(remaining, slots))
 		if err != nil {
 			return
 		}
@@ -251,7 +242,7 @@ func (p *Producer) topUp(count int) {
 			if running > 0 {
 				continue
 			}
-			if cooling && sleepCtx(ctx, 60*time.Second) {
+			if cooling && prodcore.Sleep(ctx, 60*time.Second) {
 				continue
 			}
 			return
@@ -416,7 +407,7 @@ func (p *Producer) run(id uint) {
 		})
 		return
 	}
-	defer p.releaseSlot()
+	defer p.ReleaseSlot()
 
 	if !p.waitLaunchTurn(ctx, id) {
 		p.appendLog(id, "已取消（错峰等待提交时被停止）")
@@ -433,7 +424,7 @@ func (p *Producer) run(id uint) {
 	in := oreatereg.Input{
 		Email:    reg.Email,
 		Password: reg.Password,
-		Proxy:    p.nextProxy(),
+		Proxy:    p.NextProxy(),
 		// 站点反爬会识别无头浏览器，铸造 jt 只能有头跑，这里保持有头。
 		Headless: false,
 		Log: func(f string, a ...any) {
@@ -467,7 +458,7 @@ func (p *Producer) run(id uint) {
 		}
 		p.db.Model(&models.OreateRegistration{}).Where("id = ?", id).Updates(map[string]any{
 			"status": status,
-			"note":   truncateStr(err.Error(), 500),
+			"note":   prodcore.Truncate(err.Error(), 500),
 		})
 		return
 	}
@@ -485,14 +476,7 @@ func (p *Producer) run(id uint) {
 // launchStagger 跟设置页「注册错峰间隔」(launch_stagger_sec)，未设置默认 45 秒，
 // 设 0 表示不错峰、完全并发提交。
 func (p *Producer) launchStagger() time.Duration {
-	raw := strings.TrimSpace(p.getSetting("launch_stagger_sec"))
-	sec := defaultLaunchStaggerSec
-	if raw != "" {
-		if n, err := strconv.Atoi(raw); err == nil && n >= 0 {
-			sec = n
-		}
-	}
-	return time.Duration(sec) * time.Second
+	return time.Duration(p.SettingInt("launch_stagger_sec", defaultLaunchStaggerSec)) * time.Second
 }
 
 // waitLaunchTurn 错峰提交：把相邻两次注册提交至少隔开错峰间隔，
@@ -515,7 +499,7 @@ func (p *Producer) waitLaunchTurn(ctx context.Context, id uint) bool {
 		return true
 	}
 	p.appendLog(id, fmt.Sprintf("错峰提交：等 %s 再开始，避免确认邮件被站点限流", delay.Round(time.Second)))
-	return sleepCtx(ctx, delay)
+	return prodcore.Sleep(ctx, delay)
 }
 
 // fetchConfirmLink 轮询邮箱，取出 Oreate 注册确认邮件里的链接。
@@ -578,134 +562,19 @@ func looksLikeOreate(m mailfetch.Message) bool {
 }
 
 func (p *Producer) appendLog(id uint, line string) {
-	stamp := time.Now().Format("2006-01-02 15:04:05")
 	var reg models.OreateRegistration
 	if err := p.db.Select("log").First(&reg, id).Error; err != nil {
 		return
 	}
-	log := reg.Log
-	if strings.TrimSpace(log) == "" {
-		log = ""
-	} else if !strings.HasSuffix(log, "\n") {
-		log += "\n"
-	}
-	log += stamp + " " + line + "\n"
-	if len(log) > maxLogBytes {
-		log = log[len(log)-maxLogBytes:]
-	}
-	p.db.Model(&models.OreateRegistration{}).Where("id = ?", id).Update("log", log)
+	p.db.Model(&models.OreateRegistration{}).Where("id = ?", id).
+		Update("log", prodcore.AppendLogLine(reg.Log, line, maxLogBytes))
 }
 
-// maxConcurrency 跟设置页「最大并发数」(max_concurrency)，未设置则默认 1。
-func (p *Producer) maxConcurrency() int {
-	raw := strings.TrimSpace(p.getSetting("max_concurrency"))
-	n := defaultMaxConcurrency
-	if raw != "" {
-		if parsed, err := strconv.Atoi(raw); err == nil {
-			n = parsed
-		}
-	}
-	if n < 1 {
-		n = 1
-	}
-	return n
-}
-
+// acquireSlot 阻塞直到拿到并发槽位；ctx 取消时返回 false。
 func (p *Producer) acquireSlot(ctx context.Context, id uint) bool {
-	logged := false
-	for {
-		if ctx.Err() != nil {
-			return false
-		}
-		limit := p.maxConcurrency()
-		p.mu.Lock()
-		if p.active < limit {
-			p.active++
-			p.mu.Unlock()
-			return true
-		}
-		p.mu.Unlock()
-		if !logged {
-			p.appendLog(id, "并发已满，排队等待空闲注册槽位")
-			logged = true
-		}
-		select {
-		case <-ctx.Done():
-			return false
-		case <-time.After(1 * time.Second):
-		}
-	}
-}
-
-func (p *Producer) releaseSlot() {
-	p.mu.Lock()
-	if p.active > 0 {
-		p.active--
-	}
-	p.mu.Unlock()
-}
-
-func (p *Producer) getSetting(key string) string {
-	var s models.Setting
-	if err := p.db.Where("key = ?", key).First(&s).Error; err != nil {
-		return ""
-	}
-	return s.Value
-}
-
-// NextProxy 按设置页的代理列表轮换取一个出口，供铸造反爬 token 等外部调用复用。
-func (p *Producer) NextProxy() string {
-	return p.nextProxy()
-}
-
-// nextProxy 跟设置页上的全局代理开关与代理列表，按任务轮换出口。
-func (p *Producer) nextProxy() string {
-	if strings.TrimSpace(p.getSetting("proxy_enabled")) != "1" {
-		return ""
-	}
-	proxies := proxyList(p.getSetting("proxy_list"))
-	if len(proxies) == 0 {
-		return ""
-	}
-	p.mu.Lock()
-	proxy := proxies[p.pxIdx%len(proxies)]
-	p.pxIdx++
-	p.mu.Unlock()
-	return proxyutil.WithBestGoTaskSession(proxy)
-}
-
-func proxyList(raw string) []string {
-	raw = strings.ReplaceAll(raw, ",", "\n")
-	var out []string
-	for _, line := range strings.Split(raw, "\n") {
-		if s := strings.TrimSpace(line); s != "" {
-			out = append(out, s)
-		}
-	}
-	return out
-}
-
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func sleepCtx(ctx context.Context, d time.Duration) bool {
-	select {
-	case <-ctx.Done():
-		return false
-	case <-time.After(d):
-		return true
-	}
-}
-
-func truncateStr(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n]
+	return p.AcquireSlot(ctx, func() {
+		p.appendLog(id, "并发已满，排队等待空闲注册槽位")
+	})
 }
 
 // markBadDomain 记一次域名被拒。

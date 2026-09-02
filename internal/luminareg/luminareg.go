@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
-	"net/url"
 	"strings"
 	"time"
 )
@@ -24,8 +23,11 @@ var ErrRegionBlocked = errors.New("BytePlus Lumina 在当前出口地区不可�
 // ErrCaptchaFailed 滑块人机校验没过。BytePlus 会在多次失败后临时限流。
 var ErrCaptchaFailed = errors.New("BytePlus 滑块人机校验未通过")
 
-// ErrRateLimited 注册接口被 BytePlus 限流（同一出口 IP 注册过密）。
-var ErrRateLimited = errors.New("BytePlus 注册接口限流")
+// ErrRateLimited 注册接口被 BytePlus 限流。线上对照实验确认限流键是「邮箱域名」，
+// 与出口 IP、与这个邮箱之前是否尝试过都无关：同一时刻、同一 IP、同样被限流过的两个
+// 邮箱，outlook.com 的能注册、hotmail.com 的被拒。表现像按域名的滑动窗口限速：
+// 冲得快就开始零星拒绝，继续撞则整域名封数小时到一天不等。只能换域名。
+var ErrRateLimited = errors.New("BytePlus 注册接口限流（该邮箱域名的注册配额暂时用尽）")
 
 type Input struct {
 	Email    string
@@ -149,25 +151,6 @@ func parseAccountInfo(rawJSON []byte, in Input) map[string]any {
 	}
 	in.logf("已采集账号元信息: 邮箱=%s 套餐=%v", cur.Email, info["combo_name"])
 	return info
-}
-
-func normalizeProxy(raw string) string {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return ""
-	}
-	if strings.Contains(raw, "://") {
-		return raw
-	}
-	parts := strings.Split(raw, ":")
-	switch len(parts) {
-	case 2:
-		return "http://" + parts[0] + ":" + parts[1]
-	case 4:
-		return "http://" + url.QueryEscape(parts[2]) + ":" + url.QueryEscape(parts[3]) + "@" + parts[0] + ":" + parts[1]
-	default:
-		return "http://" + raw
-	}
 }
 
 func trimText(s string, n int) string {

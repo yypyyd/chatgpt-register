@@ -22,54 +22,10 @@ import (
 var staticFS embed.FS
 
 func main() {
+	// db.Init 内部会把重启前残留的"注册中"记录统一判定为失败（reclaimOrphanRegistering）。
 	database, err := db.Init("adskull.db")
 	if err != nil {
 		log.Fatalf("init db: %v", err)
-	}
-
-	// 重启后仍停留在"注册中"的记录已无存活任务，统一判定为失败。
-	if err := database.Exec(
-		"UPDATE registrations SET status = 'register_failed', log = log || ? WHERE status = 'registering'",
-		"\n"+time.Now().Format("2006-01-02 15:04:05")+" ✗ 程序重启，任务中断，判定为失败",
-	).Error; err != nil {
-		log.Printf("reset registering on boot: %v", err)
-	}
-	if err := database.Exec(
-		"UPDATE grok_registrations SET status = 'register_failed', log = log || ? WHERE status IN ('registering', 'waiting_code')",
-		"\n"+time.Now().Format("2006-01-02 15:04:05")+" ✗ 程序重启，Grok 任务中断，判定为失败",
-	).Error; err != nil {
-		log.Printf("reset grok registering on boot: %v", err)
-	}
-	if err := database.Exec(
-		"UPDATE adobe_registrations SET status = 'register_failed', log = log || ? WHERE status IN ('registering', 'waiting_code')",
-		"\n"+time.Now().Format("2006-01-02 15:04:05")+" ✗ 程序重启，Adobe 任务中断，判定为失败",
-	).Error; err != nil {
-		log.Printf("reset adobe registering on boot: %v", err)
-	}
-	if err := database.Exec(
-		"UPDATE leonardo_registrations SET status = 'register_failed', log = log || ? WHERE status IN ('registering', 'waiting_code')",
-		"\n"+time.Now().Format("2006-01-02 15:04:05")+" ✗ 程序重启，Leonardo 任务中断，判定为失败",
-	).Error; err != nil {
-		log.Printf("reset leonardo registering on boot: %v", err)
-	}
-
-	if err := database.Exec(
-		"UPDATE oreate_registrations SET status = 'register_failed', log = log || ? WHERE status = 'registering'",
-		"\n"+time.Now().Format("2006-01-02 15:04:05")+" ✗ 程序重启，Oreate 任务中断，判定为失败",
-	).Error; err != nil {
-		log.Printf("reset oreate registering on boot: %v", err)
-	}
-	if err := database.Exec(
-		"UPDATE higgsfield_registrations SET status = 'register_failed', log = log || ? WHERE status IN ('registering', 'waiting_code')",
-		"\n"+time.Now().Format("2006-01-02 15:04:05")+" ✗ 程序重启，Higgsfield 任务中断，判定为失败",
-	).Error; err != nil {
-		log.Printf("reset higgsfield registering on boot: %v", err)
-	}
-	if err := database.Exec(
-		"UPDATE lumina_registrations SET status = 'register_failed', log = log || ? WHERE status IN ('registering', 'waiting_code')",
-		"\n"+time.Now().Format("2006-01-02 15:04:05")+" ✗ 程序重启，Lumina 任务中断，判定为失败",
-	).Error; err != nil {
-		log.Printf("reset lumina registering on boot: %v", err)
 	}
 
 	authSvc, err := auth.New(database)
@@ -255,7 +211,11 @@ func main() {
 	if !strings.Contains(addr, ":") {
 		addr = ":" + addr
 	}
-	log.Printf("chatgpt-register listening on http://localhost%s", addr)
+	displayAddr := addr
+	if strings.HasPrefix(displayAddr, ":") {
+		displayAddr = "localhost" + displayAddr
+	}
+	log.Printf("chatgpt-register listening on http://%s", displayAddr)
 	if err := r.Run(addr); err != nil {
 		log.Fatal(err)
 	}

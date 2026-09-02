@@ -25,6 +25,8 @@ import (
 	"chatgpt-register/internal/emailalias"
 	"chatgpt-register/internal/mailfetch"
 	"chatgpt-register/internal/models"
+	"chatgpt-register/internal/prodcore"
+	"chatgpt-register/internal/proxyutil"
 
 	"gorm.io/gorm"
 )
@@ -686,7 +688,7 @@ func (p *Producer) loadConfig() Config {
 	cfg.MailboxInterval = time.Duration(intervalMin) * time.Minute
 	// 代理默认开：未设置(空)视为开，仅显式 "0" 才关闭(直连)。可在设置页开关/编辑。
 	if p.getSetting("proxy_enabled") != "0" {
-		cfg.Proxies = proxyList(p.getSetting("proxy_list"))
+		cfg.Proxies = proxyutil.List(p.getSetting("proxy_list"))
 	}
 	return cfg
 }
@@ -730,7 +732,7 @@ func (p *Producer) setRegistrationFailed(email, note, log string) {
 }
 
 func (p *Producer) setRegistrationStatus(email, status, note, log string) {
-	upd := map[string]any{"status": status, "note": truncateStr(note, 500)}
+	upd := map[string]any{"status": status, "note": prodcore.Truncate(note, 500)}
 	if log != "" { // 为空时保留已实时写入的账号日志，不覆盖
 		upd["log"] = log
 	}

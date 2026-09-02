@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -18,7 +17,7 @@ import (
 	"chatgpt-register/internal/leonardoreg"
 	"chatgpt-register/internal/mailfetch"
 	"chatgpt-register/internal/models"
-	"chatgpt-register/internal/proxyutil"
+	"chatgpt-register/internal/prodcore"
 
 	"gorm.io/gorm"
 )
@@ -29,10 +28,6 @@ const (
 	codePollInterval = 2 * time.Second
 	maxLogBytes      = 64 * 1024
 
-	// defaultMaxConcurrency 未配置并发时的默认值：铸 Turnstile token 要开有头
-	// 浏览器，多个一起抢 CPU 反而互相超时，串行最稳（设置页 max_concurrency 可调）。
-	defaultMaxConcurrency = 1
-
 	// defaultRetryCooldownMin 注册失败后重试同一邮箱前的等待分钟数。
 	defaultRetryCooldownMin = 30
 )
@@ -40,14 +35,14 @@ const (
 var digitCodeRe = regexp.MustCompile(`\b(\d{6})\b`)
 
 type Producer struct {
+	*prodcore.Core
+
 	db   *gorm.DB
 	mail *mailfetch.Client
 
 	mu      sync.Mutex
 	waiters map[uint]chan string
 	cancel  map[uint]context.CancelFunc
-	active  int
-	pxIdx   int
 	// topUpCancel 非空表示补任务循环在跑，StopAll 用它停掉补任务。
 	topUpCancel context.CancelFunc
 	runTarget   int
@@ -56,6 +51,7 @@ type Producer struct {
 
 func New(db *gorm.DB, mail *mailfetch.Client) *Producer {
 	return &Producer{
+		Core:    prodcore.New(db),
 		db:      db,
 		mail:    mail,
 		waiters: map[uint]chan string{},
@@ -117,7 +113,7 @@ func (p *Producer) StartFromAccounts(count int) ([]models.HiggsfieldRegistration
 	if count < 1 {
 		return nil, fmt.Errorf("数量必须 >= 1")
 	}
-	started, cooling, err := p.claimTargets(minInt(count, p.maxConcurrency()))
+	started, cooling, err := p.claimTargets(min(count, p.MaxConcurrency()))
 	if err != nil {
 		return nil, err
 	}
@@ -224,14 +220,7 @@ func (p *Producer) hasCoolingFailure(cutoff time.Time) bool {
 }
 
 func (p *Producer) retryCooldown() time.Duration {
-	raw := strings.TrimSpace(p.getSetting("retry_cooldown_min"))
-	min := defaultRetryCooldownMin
-	if raw != "" {
-		if n, err := strconv.Atoi(raw); err == nil && n >= 0 {
-			min = n
-		}
-	}
-	return time.Duration(min) * time.Minute
+	return p.SettingMinutes("retry_cooldown_min", defaultRetryCooldownMin)
 }
 
 // topUp 边跑边补：维持在跑任务数在并发上限，直到拿到 count 个已注册账号。
@@ -244,7 +233,7 @@ func (p *Producer) topUp(count int, started []models.HiggsfieldRegistration) {
 
 	tracked := p.trackedIDs()
 	for {
-		if !sleepCtx(ctx, 5*time.Second) {
+		if !prodcore.Sleep(ctx, 5*time.Second) {
 			return
 		}
 		running := p.runningNum()
@@ -255,11 +244,11 @@ func (p *Producer) topUp(count int, started []models.HiggsfieldRegistration) {
 			}
 			return
 		}
-		slots := p.maxConcurrency() - running
+		slots := p.MaxConcurrency() - running
 		if slots <= 0 {
 			continue
 		}
-		regs, cooling, err := p.claimTargets(minInt(remaining, slots))
+		regs, cooling, err := p.claimTargets(min(remaining, slots))
 		if err != nil {
 			return
 		}
@@ -267,7 +256,7 @@ func (p *Producer) topUp(count int, started []models.HiggsfieldRegistration) {
 			if running > 0 {
 				continue
 			}
-			if cooling && sleepCtx(ctx, 60*time.Second) {
+			if cooling && prodcore.Sleep(ctx, 60*time.Second) {
 				continue
 			}
 			return
@@ -340,22 +329,6 @@ func (p *Producer) countRegistered(ids []uint) int {
 		Where("id IN ? AND status = ?", ids, "registered").
 		Count(&n)
 	return int(n)
-}
-
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func sleepCtx(ctx context.Context, d time.Duration) bool {
-	select {
-	case <-ctx.Done():
-		return false
-	case <-time.After(d):
-		return true
-	}
 }
 
 func (p *Producer) SubmitCode(id uint, code string) error {
@@ -470,11 +443,11 @@ func (p *Producer) run(id uint) {
 		})
 		return
 	}
-	defer p.releaseSlot()
+	defer p.ReleaseSlot()
 
 	p.appendLog(id, "开始 Higgsfield 邮箱注册（Clerk 协议）")
 	since := time.Now().Add(-30 * time.Second)
-	proxy := p.nextProxy()
+	proxy := p.NextProxy()
 
 	in := higgsfieldreg.Input{
 		Email:    reg.Email,
@@ -503,7 +476,7 @@ func (p *Producer) run(id uint) {
 		}
 		p.db.Model(&models.HiggsfieldRegistration{}).Where("id = ?", id).Updates(map[string]any{
 			"status": status,
-			"note":   truncateStr(err.Error(), 500),
+			"note":   prodcore.Truncate(err.Error(), 500),
 		})
 		return
 	}
@@ -517,7 +490,7 @@ func (p *Producer) run(id uint) {
 
 	// 绑卡优惠默认不自动跑（要真实银行卡）；设置页 higgsfield_trial_auto=1 时
 	// 注册完顺手把收银台开出来，停在填卡那一步。
-	if p.getSetting("higgsfield_trial_auto") == "1" {
+	if p.SettingOn("higgsfield_trial_auto") {
 		if _, terr := p.runTrial(ctx, id, res.SessionToken, proxy); terr != nil {
 			p.appendLog(id, "绑卡优惠流程未完成: "+terr.Error())
 		}
@@ -527,8 +500,8 @@ func (p *Producer) run(id uint) {
 // mintToken 产出一枚 Turnstile token：配了打码平台 key 就走打码（机房出口也能过），
 // 否则用本机浏览器真实点选。
 func (p *Producer) mintToken(ctx context.Context, id uint, sitekey, proxy string) (string, error) {
-	if key := strings.TrimSpace(p.getSetting("captcha_2captcha_key")); key != "" &&
-		p.getSetting("higgsfield_captcha") != "browser" {
+	if key := strings.TrimSpace(p.Setting("captcha_2captcha_key")); key != "" &&
+		p.Setting("higgsfield_captcha") != "browser" {
 		p.appendLog(id, "用 2Captcha 解 Turnstile")
 		solver := &captcha.TwoCaptcha{Key: key, Log: func(f string, a ...any) {
 			p.appendLog(id, fmt.Sprintf(f, a...))
@@ -540,7 +513,7 @@ func (p *Producer) mintToken(ctx context.Context, id uint, sitekey, proxy string
 		PageURL:  higgsfieldreg.SignUpPageURL,
 		Sitekey:  sitekey,
 		Proxy:    proxy,
-		Headless: p.getSetting("higgsfield_headless") == "1",
+		Headless: p.SettingOn("higgsfield_headless"),
 		Log: func(f string, a ...any) {
 			p.appendLog(id, fmt.Sprintf(f, a...))
 		},
@@ -564,7 +537,7 @@ func (p *Producer) RunTrial(id uint) (*higgsfieldreg.TrialResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	return p.runTrial(ctx, id, token, p.nextProxy())
+	return p.runTrial(ctx, id, token, p.NextProxy())
 }
 
 // freshToken 取一枚可用的会话 JWT：Clerk 的 JWT 只有 60 秒，先用 __client 刷新。
@@ -583,7 +556,7 @@ func (p *Producer) freshToken(ctx context.Context, reg models.HiggsfieldRegistra
 		if ck.Name != "__client" || ck.Value == "" {
 			continue
 		}
-		token, err := higgsfieldreg.RefreshSession(ctx, p.nextProxy(), ck.Value)
+		token, err := higgsfieldreg.RefreshSession(ctx, p.NextProxy(), ck.Value)
 		if err == nil {
 			return token, nil
 		}
@@ -707,111 +680,17 @@ func looksLikeHiggsfield(m mailfetch.Message) bool {
 }
 
 func (p *Producer) appendLog(id uint, line string) {
-	stamp := time.Now().Format("2006-01-02 15:04:05")
 	var reg models.HiggsfieldRegistration
 	if err := p.db.Select("log").First(&reg, id).Error; err != nil {
 		return
 	}
-	log := reg.Log
-	if strings.TrimSpace(log) == "" {
-		log = ""
-	} else if !strings.HasSuffix(log, "\n") {
-		log += "\n"
-	}
-	log += stamp + " " + line + "\n"
-	if len(log) > maxLogBytes {
-		log = log[len(log)-maxLogBytes:]
-	}
-	p.db.Model(&models.HiggsfieldRegistration{}).Where("id = ?", id).Update("log", log)
+	p.db.Model(&models.HiggsfieldRegistration{}).Where("id = ?", id).
+		Update("log", prodcore.AppendLogLine(reg.Log, line, maxLogBytes))
 }
 
-// maxConcurrency 跟设置页「最大并发数」(max_concurrency)，未设置则默认 1。
-func (p *Producer) maxConcurrency() int {
-	raw := strings.TrimSpace(p.getSetting("max_concurrency"))
-	n := defaultMaxConcurrency
-	if raw != "" {
-		if parsed, err := strconv.Atoi(raw); err == nil {
-			n = parsed
-		}
-	}
-	if n < 1 {
-		n = 1
-	}
-	return n
-}
-
+// acquireSlot 阻塞直到拿到并发槽位；ctx 取消时返回 false。
 func (p *Producer) acquireSlot(ctx context.Context, id uint) bool {
-	logged := false
-	for {
-		if ctx.Err() != nil {
-			return false
-		}
-		limit := p.maxConcurrency()
-		p.mu.Lock()
-		if p.active < limit {
-			p.active++
-			p.mu.Unlock()
-			return true
-		}
-		p.mu.Unlock()
-		if !logged {
-			p.appendLog(id, "并发已满，排队等待空闲注册槽位")
-			logged = true
-		}
-		select {
-		case <-ctx.Done():
-			return false
-		case <-time.After(1 * time.Second):
-		}
-	}
-}
-
-func (p *Producer) releaseSlot() {
-	p.mu.Lock()
-	if p.active > 0 {
-		p.active--
-	}
-	p.mu.Unlock()
-}
-
-func (p *Producer) getSetting(key string) string {
-	var s models.Setting
-	if err := p.db.Where("key = ?", key).First(&s).Error; err != nil {
-		return ""
-	}
-	return s.Value
-}
-
-// nextProxy 跟设置页上的全局代理开关与代理列表，按任务轮换出口。
-func (p *Producer) nextProxy() string {
-	if strings.TrimSpace(p.getSetting("proxy_enabled")) != "1" {
-		return ""
-	}
-	proxies := proxyList(p.getSetting("proxy_list"))
-	if len(proxies) == 0 {
-		return ""
-	}
-	p.mu.Lock()
-	proxy := proxies[p.pxIdx%len(proxies)]
-	p.pxIdx++
-	p.mu.Unlock()
-	return proxyutil.WithBestGoTaskSession(proxy)
-}
-
-func proxyList(raw string) []string {
-	raw = strings.ReplaceAll(raw, ",", "\n")
-	var out []string
-	for _, line := range strings.Split(raw, "\n") {
-		if s := strings.TrimSpace(line); s != "" {
-			out = append(out, s)
-		}
-	}
-	return out
-}
-
-func truncateStr(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n]
+	return p.AcquireSlot(ctx, func() {
+		p.appendLog(id, "并发已满，排队等待空闲注册槽位")
+	})
 }

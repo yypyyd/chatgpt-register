@@ -15,18 +15,6 @@ func atoiDefault(s string, def int) int {
 	return def
 }
 
-// proxyList 把多行/逗号分隔的代理串拆成切片，去空行。
-func proxyList(raw string) []string {
-	raw = strings.ReplaceAll(raw, ",", "\n")
-	var out []string
-	for _, line := range strings.Split(raw, "\n") {
-		if s := strings.TrimSpace(line); s != "" {
-			out = append(out, s)
-		}
-	}
-	return out
-}
-
 // isRotatable 判断代理是否为可换出口 IP 的 bestgo 住宅代理
 // （用户名带 zone-custom / -session- 特征，或 host 含 bestgo）。
 // 只有可轮换代理，Terms 拒绝时才值得换 IP 重试。
@@ -72,13 +60,6 @@ func randToken(n int) string {
 		return "sess" + strconv.Itoa(n)
 	}
 	return hex.EncodeToString(b)
-}
-
-func truncateStr(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n]
 }
 
 // mask 隐去邮箱本地部分中段，避免日志泄露完整地址。

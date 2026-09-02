@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -15,7 +14,7 @@ import (
 	"chatgpt-register/internal/livecheck"
 	"chatgpt-register/internal/mailfetch"
 	"chatgpt-register/internal/models"
-	"chatgpt-register/internal/proxyutil"
+	"chatgpt-register/internal/prodcore"
 
 	"gorm.io/gorm"
 )
@@ -27,11 +26,6 @@ const (
 	codePollInterval = 2 * time.Second
 	maxLogBytes      = 64 * 1024
 
-	// defaultMaxConcurrency 未配置并发时的默认值：逐个开工。批量注册时多个
-	// 有头浏览器同时抢 CPU 会互相超时，串行最稳。
-	// 可用设置页「最大并发数」(max_concurrency) 调大。
-	defaultMaxConcurrency = 1
-
 	// defaultRetryCooldownMin 注册失败后重试同一邮箱前的等待分钟数，避免连续重试
 	// 撞风控。可在系统设置 retry_cooldown_min 覆盖，0 = 不冷却。
 	defaultRetryCooldownMin = 30
@@ -40,23 +34,23 @@ const (
 var digitCodeRe = regexp.MustCompile(`\b(\d{6})\b`)
 
 type Producer struct {
+	*prodcore.Core
+
 	db   *gorm.DB
 	mail *mailfetch.Client
 
 	mu      sync.Mutex
 	waiters map[uint]chan string
 	cancel  map[uint]context.CancelFunc
-	active  int
-	pxIdx   int
 	// topUpCancel 非空表示补任务循环在跑，StopAll 用它停掉补任务。
 	topUpCancel context.CancelFunc
 	runTarget   int    // 本次生产的目标数量
 	runTracked  []uint // 本次生产建过的任务 id
-
 }
 
 func New(db *gorm.DB, mail *mailfetch.Client) *Producer {
 	return &Producer{
+		Core:    prodcore.New(db),
 		db:      db,
 		mail:    mail,
 		waiters: map[uint]chan string{},
@@ -113,7 +107,7 @@ func (p *Producer) StartFromAccounts(count int) ([]models.LeonardoRegistration, 
 		return nil, fmt.Errorf("数量必须 >= 1")
 	}
 	// 首批只按并发数取号，跑完一条再补一条，避免一次把上百个邮箱全标成注册中。
-	started, cooling, err := p.claimTargets(minInt(count, p.maxConcurrency()))
+	started, cooling, err := p.claimTargets(min(count, p.MaxConcurrency()))
 	if err != nil {
 		return nil, err
 	}
@@ -226,14 +220,7 @@ func (p *Producer) hasCoolingFailure(cutoff time.Time) bool {
 
 // retryCooldown 失败地址的重试冷却，跟设置页 retry_cooldown_min，0 = 不冷却。
 func (p *Producer) retryCooldown() time.Duration {
-	raw := strings.TrimSpace(p.getSetting("retry_cooldown_min"))
-	min := defaultRetryCooldownMin
-	if raw != "" {
-		if n, err := strconv.Atoi(raw); err == nil && n >= 0 {
-			min = n
-		}
-	}
-	return time.Duration(min) * time.Minute
+	return p.SettingMinutes("retry_cooldown_min", defaultRetryCooldownMin)
 }
 
 // topUp 边跑边补：始终让在跑任务数维持在并发上限，直到本次生产拿到 count 个已注册
@@ -247,7 +234,7 @@ func (p *Producer) topUp(count int, started []models.LeonardoRegistration) {
 
 	tracked := p.trackedIDs()
 	for {
-		if !sleepCtx(ctx, 5*time.Second) {
+		if !prodcore.Sleep(ctx, 5*time.Second) {
 			return
 		}
 		running := p.runningNum()
@@ -258,11 +245,11 @@ func (p *Producer) topUp(count int, started []models.LeonardoRegistration) {
 			}
 			return
 		}
-		slots := p.maxConcurrency() - running
+		slots := p.MaxConcurrency() - running
 		if slots <= 0 {
 			continue
 		}
-		regs, cooling, err := p.claimTargets(minInt(remaining, slots))
+		regs, cooling, err := p.claimTargets(min(remaining, slots))
 		if err != nil {
 			return
 		}
@@ -270,7 +257,7 @@ func (p *Producer) topUp(count int, started []models.LeonardoRegistration) {
 			if running > 0 {
 				continue
 			}
-			if cooling && sleepCtx(ctx, 60*time.Second) {
+			if cooling && prodcore.Sleep(ctx, 60*time.Second) {
 				continue // 等失败地址过冷却
 			}
 			return
@@ -347,23 +334,6 @@ func (p *Producer) countRegistered(ids []uint) int {
 		Where("id IN ? AND status = ?", ids, "registered").
 		Count(&n)
 	return int(n)
-}
-
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-// sleepCtx 等一段时间；被取消时返回 false。
-func sleepCtx(ctx context.Context, d time.Duration) bool {
-	select {
-	case <-ctx.Done():
-		return false
-	case <-time.After(d):
-		return true
-	}
 }
 
 func (p *Producer) SubmitCode(id uint, code string) error {
@@ -479,7 +449,7 @@ func (p *Producer) run(id uint) {
 		})
 		return
 	}
-	defer p.releaseSlot()
+	defer p.ReleaseSlot()
 
 	p.appendLog(id, "开始 Leonardo 邮箱注册")
 	since := time.Now().Add(-30 * time.Second)
@@ -487,10 +457,10 @@ func (p *Producer) run(id uint) {
 	in := leonardoreg.Input{
 		Email:    reg.Email,
 		Password: reg.Password,
-		Proxy:    p.nextProxy(),
-		Headless: p.getSetting("leonardo_headless") == "1",
+		Proxy:    p.NextProxy(),
+		Headless: p.SettingOn("leonardo_headless"),
 		// 出口 IP 探测默认关闭以提速；需排障时置 leonardo_egress_check=1。
-		EgressCheck: p.getSetting("leonardo_egress_check") == "1",
+		EgressCheck: p.SettingOn("leonardo_egress_check"),
 		Log: func(f string, a ...any) {
 			p.appendLog(id, fmt.Sprintf(f, a...))
 		},
@@ -515,7 +485,7 @@ func (p *Producer) run(id uint) {
 		}
 		p.db.Model(&models.LeonardoRegistration{}).Where("id = ?", id).Updates(map[string]any{
 			"status": status,
-			"note":   truncateStr(err.Error(), 500),
+			"note":   prodcore.Truncate(err.Error(), 500),
 		})
 		return
 	}
@@ -640,113 +610,17 @@ func looksLikeLeonardo(m mailfetch.Message) bool {
 }
 
 func (p *Producer) appendLog(id uint, line string) {
-	stamp := time.Now().Format("2006-01-02 15:04:05")
 	var reg models.LeonardoRegistration
 	if err := p.db.Select("log").First(&reg, id).Error; err != nil {
 		return
 	}
-	log := reg.Log
-	if strings.TrimSpace(log) == "" {
-		log = ""
-	} else if !strings.HasSuffix(log, "\n") {
-		log += "\n"
-	}
-	log += stamp + " " + line + "\n"
-	if len(log) > maxLogBytes {
-		log = log[len(log)-maxLogBytes:]
-	}
-	p.db.Model(&models.LeonardoRegistration{}).Where("id = ?", id).Update("log", log)
+	p.db.Model(&models.LeonardoRegistration{}).Where("id = ?", id).
+		Update("log", prodcore.AppendLogLine(reg.Log, line, maxLogBytes))
 }
 
-// maxConcurrency 跟设置页「最大并发数」(max_concurrency)，未设置则默认 1。
-func (p *Producer) maxConcurrency() int {
-	raw := strings.TrimSpace(p.getSetting("max_concurrency"))
-	n := defaultMaxConcurrency
-	if raw != "" {
-		if parsed, err := strconv.Atoi(raw); err == nil {
-			n = parsed
-		}
-	}
-	if n < 1 {
-		n = 1
-	}
-	return n
-}
-
+// acquireSlot 阻塞直到拿到并发槽位；ctx 取消时返回 false。
 func (p *Producer) acquireSlot(ctx context.Context, id uint) bool {
-	logged := false
-	for {
-		if ctx.Err() != nil {
-			return false
-		}
-		limit := p.maxConcurrency()
-		p.mu.Lock()
-		if p.active < limit {
-			p.active++
-			p.mu.Unlock()
-			return true
-		}
-		p.mu.Unlock()
-		if !logged {
-			p.appendLog(id, "并发已满，排队等待空闲注册槽位")
-			logged = true
-		}
-		select {
-		case <-ctx.Done():
-			return false
-		case <-time.After(1 * time.Second):
-		}
-	}
-}
-
-func (p *Producer) releaseSlot() {
-	p.mu.Lock()
-	if p.active > 0 {
-		p.active--
-	}
-	p.mu.Unlock()
-}
-
-func (p *Producer) getSetting(key string) string {
-	var s models.Setting
-	if err := p.db.Where("key = ?", key).First(&s).Error; err != nil {
-		return ""
-	}
-	return s.Value
-}
-
-// nextProxy 跟设置页上的全局代理开关与代理列表，按任务轮换出口。
-func (p *Producer) nextProxy() string {
-	enabled := strings.TrimSpace(p.getSetting("proxy_enabled"))
-	raw := p.getSetting("proxy_list")
-	if enabled != "1" {
-		return ""
-	}
-	proxies := proxyList(raw)
-	if len(proxies) == 0 {
-		return ""
-	}
-	p.mu.Lock()
-	proxy := proxies[p.pxIdx%len(proxies)]
-	p.pxIdx++
-	p.mu.Unlock()
-	return proxyutil.WithBestGoTaskSession(proxy)
-}
-
-func proxyList(raw string) []string {
-	raw = strings.ReplaceAll(raw, ",", "\n")
-	var out []string
-	for _, line := range strings.Split(raw, "\n") {
-		if s := strings.TrimSpace(line); s != "" {
-			out = append(out, s)
-		}
-	}
-	return out
-}
-
-func truncateStr(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n]
+	return p.AcquireSlot(ctx, func() {
+		p.appendLog(id, "并发已满，排队等待空闲注册槽位")
+	})
 }

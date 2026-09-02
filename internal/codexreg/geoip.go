@@ -2,58 +2,17 @@ package codexreg
 
 import (
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
+	"chatgpt-register/internal/proxyutil"
+
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/proto"
 )
-
-// normalizeProxy 把 host:port:user:pass 之类的写法转成标准 URL；带 scheme 的原样返回。
-func normalizeProxy(raw string) string {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return ""
-	}
-	if strings.Contains(raw, "://") {
-		return raw
-	}
-	parts := strings.Split(raw, ":")
-	switch len(parts) {
-	case 2: // host:port
-		return "http://" + parts[0] + ":" + parts[1]
-	case 4: // host:port:user:pass
-		return "http://" + url.QueryEscape(parts[2]) + ":" + url.QueryEscape(parts[3]) + "@" + parts[0] + ":" + parts[1]
-	default:
-		return "http://" + raw
-	}
-}
-
-// parseProxy 解析代理串，返回 Chrome --proxy-server 用的 scheme://host:port（不含账号密码）
-// 以及单独的账号密码（交给 browser.MustHandleAuth 处理）。
-func parseProxy(raw string) (server, user, pass string, err error) {
-	u, err := url.Parse(normalizeProxy(raw))
-	if err != nil {
-		return "", "", "", err
-	}
-	if u.Host == "" {
-		return "", "", "", fmt.Errorf("代理缺少 host: %s", raw)
-	}
-	scheme := u.Scheme
-	if scheme == "" {
-		scheme = "http"
-	}
-	server = scheme + "://" + u.Host
-	if u.User != nil {
-		user = u.User.Username()
-		pass, _ = u.User.Password()
-	}
-	return server, user, pass, nil
-}
 
 // geoInfo 是 ip-api.com 的地理定位结果。
 type geoInfo struct {
@@ -75,7 +34,7 @@ func lookupGeoIPViaRequest(in Input) *geoInfo {
 
 	transport := &http.Transport{}
 	if strings.TrimSpace(in.Proxy) != "" {
-		pu, perr := url.Parse(normalizeProxy(in.Proxy))
+		pu, perr := url.Parse(proxyutil.Normalize(in.Proxy))
 		if perr != nil {
 			in.logf("⚠️ 代理解析失败，跳过地理位置对齐: %v", perr)
 			return nil

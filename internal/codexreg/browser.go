@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"chatgpt-register/internal/proxyutil"
+
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/launcher"
 	"github.com/go-rod/rod/lib/proto"
@@ -40,7 +42,7 @@ func registerBrowser(ctx context.Context, in Input) (token string, err error) {
 	// 1.1 挂代理（账号密码交给 HandleAuth）
 	var proxyUser, proxyPass string
 	if strings.TrimSpace(in.Proxy) != "" {
-		server, user, pass, perr := parseProxy(in.Proxy)
+		server, user, pass, perr := proxyutil.Parse(in.Proxy)
 		if perr != nil {
 			return "", fmt.Errorf("解析代理失败: %w", perr)
 		}

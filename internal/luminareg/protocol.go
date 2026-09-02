@@ -159,7 +159,7 @@ func registerProtocol(ctx context.Context, in Input) (*Result, error) {
 				}
 			}
 		case resp.errCode() == "ErrorRateLimit":
-			return nil, fmt.Errorf("%w（RegisterAccountV2 返回 ErrorRateLimit，换出口 IP 或稍后重试）", ErrRateLimited)
+			return nil, fmt.Errorf("%w：RegisterAccountV2 返回 ErrorRateLimit，需换其它域名的邮箱", ErrRateLimited)
 		default:
 			return nil, fmt.Errorf("注册接口失败: %w", err)
 		}

@@ -10,6 +10,7 @@ import (
 
 	"chatgpt-register/internal/grokreg/clearance"
 	"chatgpt-register/internal/grokreg/protocol"
+	"chatgpt-register/internal/proxyutil"
 )
 
 // signupConfigTTL 是注册配置（sitekey / Next-Action id / router state tree）的
@@ -56,7 +57,7 @@ func invalidateSignupConfig() {
 func registerProtocol(ctx context.Context, in Input) (*Result, error) {
 	in.logf("Grok 协议注册启动（浏览器仅用于签发 Turnstile 令牌）")
 	if strings.TrimSpace(in.Proxy) != "" {
-		server, _, _, perr := parseProxy(in.Proxy)
+		server, _, _, perr := proxyutil.Parse(in.Proxy)
 		if perr != nil {
 			return nil, fmt.Errorf("解析代理失败: %w", perr)
 		}
@@ -141,7 +142,7 @@ func registerProtocol(ctx context.Context, in Input) (*Result, error) {
 	// Chromium cannot authenticate to an upstream proxy via --proxy-server, so an
 	// authenticated proxy needs a loopback bridge for the Turnstile mint. The TLS
 	// client itself talks to the authenticated proxy directly.
-	in.mintProxy = normalizeProxy(in.Proxy)
+	in.mintProxy = proxyutil.Normalize(in.Proxy)
 	if bridge, addr := maybeAuthBridge(in.Proxy); bridge != nil {
 		defer bridge.Close()
 		in.mintProxy = addr
@@ -227,18 +228,18 @@ func registerProtocol(ctx context.Context, in Input) (*Result, error) {
 
 // maybeAuthBridge starts a loopback proxy bridge only when the upstream proxy
 // carries credentials (Chromium can use an unauthenticated proxy directly).
-func maybeAuthBridge(raw string) (*localAuthProxyBridge, string) {
+func maybeAuthBridge(raw string) (*proxyutil.AuthBridge, string) {
 	if strings.TrimSpace(raw) == "" {
 		return nil, ""
 	}
-	u, err := url.Parse(normalizeProxy(raw))
+	u, err := url.Parse(proxyutil.Normalize(raw))
 	if err != nil || u.User == nil {
 		return nil, ""
 	}
 	if pass, hasPass := u.User.Password(); !hasPass && pass == "" && u.User.Username() == "" {
 		return nil, ""
 	}
-	bridge, addr, berr := startLocalAuthProxyBridge(raw)
+	bridge, addr, berr := proxyutil.StartAuthBridge(raw)
 	if berr != nil {
 		return nil, ""
 	}

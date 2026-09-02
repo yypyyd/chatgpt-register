@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"net/url"
 	"time"
+
+	"chatgpt-register/internal/proxyutil"
 )
 
 // 滑块验证码的图像匹配参数。
@@ -67,7 +69,7 @@ func toGray(img image.Image) *grayImage {
 func fetchImage(rawURL, proxy, ua string) (image.Image, error) {
 	tr := &http.Transport{}
 	if proxy != "" {
-		pu, err := url.Parse(normalizeProxy(proxy))
+		pu, err := url.Parse(proxyutil.Normalize(proxy))
 		if err != nil {
 			return nil, fmt.Errorf("解析代理失败: %w", err)
 		}

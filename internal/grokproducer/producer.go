@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -15,7 +14,7 @@ import (
 	"chatgpt-register/internal/grokreg"
 	"chatgpt-register/internal/mailfetch"
 	"chatgpt-register/internal/models"
-	"chatgpt-register/internal/proxyutil"
+	"chatgpt-register/internal/prodcore"
 
 	"gorm.io/gorm"
 )
@@ -25,11 +24,6 @@ const (
 	codePollTimeout  = 4 * time.Minute
 	codePollInterval = 5 * time.Second
 	maxLogBytes      = 64 * 1024
-
-	// defaultMaxConcurrency 未配置并发时的默认值：逐个开工。批量注册时多个
-	// 有头浏览器 + Turnstile 令牌池同时抢 CPU 会互相超时，串行最稳。
-	// 可用设置页「最大并发数」(max_concurrency) 调大。
-	defaultMaxConcurrency = 1
 
 	// defaultRetryCooldownMin 注册失败后重试同一邮箱前的等待分钟数，避免连续重试
 	// 撞风控。可在系统设置 retry_cooldown_min 覆盖，0 = 不冷却。
@@ -47,23 +41,23 @@ var (
 )
 
 type Producer struct {
+	*prodcore.Core
+
 	db   *gorm.DB
 	mail *mailfetch.Client
 
 	mu      sync.Mutex
 	waiters map[uint]chan string
 	cancel  map[uint]context.CancelFunc
-	active  int // 当前真正在跑（已获得并发槽位）的任务数
-	pxIdx   int
 	// topUpCancel 非空表示补任务循环在跑，StopAll 用它停掉补任务。
 	topUpCancel context.CancelFunc
 	runTarget   int    // 本次生产的目标数量
 	runTracked  []uint // 本次生产建过的任务 id
-
 }
 
 func New(db *gorm.DB, mail *mailfetch.Client) *Producer {
 	return &Producer{
+		Core:    prodcore.New(db),
 		db:      db,
 		mail:    mail,
 		waiters: map[uint]chan string{},
@@ -120,7 +114,7 @@ func (p *Producer) StartFromAccounts(count int) ([]models.GrokRegistration, erro
 		return nil, fmt.Errorf("数量必须 >= 1")
 	}
 	// 首批只按并发数取号，跑完一条再补一条，避免一次把上百个邮箱全标成注册中。
-	started, cooling, err := p.claimTargets(minInt(count, p.maxConcurrency()))
+	started, cooling, err := p.claimTargets(min(count, p.MaxConcurrency()))
 	if err != nil {
 		return nil, err
 	}
@@ -265,25 +259,12 @@ func (p *Producer) hasBusyMailbox(cutoff time.Time) bool {
 // mailboxInterval 同一邮箱两次注册之间的最小间隔，跟设置页 mailbox_interval_min，
 // 0 = 不限。
 func (p *Producer) mailboxInterval() time.Duration {
-	return time.Duration(p.settingInt("mailbox_interval_min", defaultMailboxIntervalMin)) * time.Minute
+	return p.SettingMinutes("mailbox_interval_min", defaultMailboxIntervalMin)
 }
 
 // retryCooldown 失败地址的重试冷却，跟设置页 retry_cooldown_min，0 = 不冷却。
 func (p *Producer) retryCooldown() time.Duration {
-	return time.Duration(p.settingInt("retry_cooldown_min", defaultRetryCooldownMin)) * time.Minute
-}
-
-// settingInt 读一个非负整型设置，未设置或非法时用默认值。
-func (p *Producer) settingInt(key string, def int) int {
-	raw := strings.TrimSpace(p.getSetting(key))
-	if raw == "" {
-		return def
-	}
-	n, err := strconv.Atoi(raw)
-	if err != nil || n < 0 {
-		return def
-	}
-	return n
+	return p.SettingMinutes("retry_cooldown_min", defaultRetryCooldownMin)
 }
 
 // topUp 边跑边补：始终让在跑任务数维持在并发上限，直到本次生产拿到 count 个已注册
@@ -297,7 +278,7 @@ func (p *Producer) topUp(count int, started []models.GrokRegistration) {
 
 	tracked := p.trackedIDs()
 	for {
-		if !sleepCtx(ctx, 5*time.Second) {
+		if !prodcore.Sleep(ctx, 5*time.Second) {
 			return
 		}
 		running := p.runningNum()
@@ -308,11 +289,11 @@ func (p *Producer) topUp(count int, started []models.GrokRegistration) {
 			}
 			return
 		}
-		slots := p.maxConcurrency() - running
+		slots := p.MaxConcurrency() - running
 		if slots <= 0 {
 			continue
 		}
-		regs, cooling, err := p.claimTargets(minInt(remaining, slots))
+		regs, cooling, err := p.claimTargets(min(remaining, slots))
 		if err != nil {
 			return
 		}
@@ -320,7 +301,7 @@ func (p *Producer) topUp(count int, started []models.GrokRegistration) {
 			if running > 0 {
 				continue
 			}
-			if cooling && sleepCtx(ctx, 60*time.Second) {
+			if cooling && prodcore.Sleep(ctx, 60*time.Second) {
 				continue // 等失败地址过冷却
 			}
 			return
@@ -397,23 +378,6 @@ func (p *Producer) countRegistered(ids []uint) int {
 		Where("id IN ? AND status = ?", ids, "registered").
 		Count(&n)
 	return int(n)
-}
-
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-// sleepCtx 等一段时间；被取消时返回 false。
-func sleepCtx(ctx context.Context, d time.Duration) bool {
-	select {
-	case <-ctx.Done():
-		return false
-	case <-time.After(d):
-		return true
-	}
 }
 
 func (p *Producer) SubmitCode(id uint, code string) error {
@@ -531,7 +495,7 @@ func (p *Producer) run(id uint) {
 		})
 		return
 	}
-	defer p.releaseSlot()
+	defer p.ReleaseSlot()
 
 	p.appendLog(id, "开始 Grok 邮箱注册")
 	// since 在获得槽位后再取，避免排队期间旧验证码被误读。
@@ -540,18 +504,18 @@ func (p *Producer) run(id uint) {
 	in := grokreg.Input{
 		Email:    reg.Email,
 		Password: reg.Password,
-		Proxy:    p.nextProxy(),
+		Proxy:    p.NextProxy(),
 		// Match the reference project: Grok registration is headed by default.
 		// A dedicated opt-in setting can still enable headless for diagnostics.
-		Headless: p.getSetting("grok_headless") == "1",
+		Headless: p.SettingOn("grok_headless"),
 		// 协议注册为默认路径：只借浏览器签发 Turnstile 令牌，拿到后立即退出、
 		// 其余全走 HTTP/gRPC。设置 grok_engine=browser 可回退到旧的全程浏览器流程。
-		Engine:              p.getSetting("grok_engine"),
-		Impersonate:         p.getSetting("grok_impersonate"),
-		ImpersonateFallback: p.getSetting("grok_impersonate_fallback"),
-		FlareSolverrURL:     p.getSetting("grok_flaresolverr_url"),
-		ClearanceProxy:      p.getSetting("grok_clearance_proxy"),
-		ClearanceURLs:       p.getSetting("grok_clearance_urls"),
+		Engine:              p.Setting("grok_engine"),
+		Impersonate:         p.Setting("grok_impersonate"),
+		ImpersonateFallback: p.Setting("grok_impersonate_fallback"),
+		FlareSolverrURL:     p.Setting("grok_flaresolverr_url"),
+		ClearanceProxy:      p.Setting("grok_clearance_proxy"),
+		ClearanceURLs:       p.Setting("grok_clearance_urls"),
 		Log: func(f string, a ...any) {
 			p.appendLog(id, fmt.Sprintf(f, a...))
 		},
@@ -576,7 +540,7 @@ func (p *Producer) run(id uint) {
 		}
 		p.db.Model(&models.GrokRegistration{}).Where("id = ?", id).Updates(map[string]any{
 			"status": status,
-			"note":   truncateStr(err.Error(), 500),
+			"note":   prodcore.Truncate(err.Error(), 500),
 		})
 		return
 	}
@@ -695,117 +659,17 @@ func looksLikeGrok(m mailfetch.Message) bool {
 }
 
 func (p *Producer) appendLog(id uint, line string) {
-	stamp := time.Now().Format("2006-01-02 15:04:05")
 	var reg models.GrokRegistration
 	if err := p.db.Select("log").First(&reg, id).Error; err != nil {
 		return
 	}
-	log := reg.Log
-	if strings.TrimSpace(log) == "" {
-		log = ""
-	} else if !strings.HasSuffix(log, "\n") {
-		log += "\n"
-	}
-	log += stamp + " " + line + "\n"
-	if len(log) > maxLogBytes {
-		log = log[len(log)-maxLogBytes:]
-	}
-	p.db.Model(&models.GrokRegistration{}).Where("id = ?", id).Update("log", log)
+	p.db.Model(&models.GrokRegistration{}).Where("id = ?", id).
+		Update("log", prodcore.AppendLogLine(reg.Log, line, maxLogBytes))
 }
 
-// maxConcurrency 读取并发上限：跟设置页「最大并发数」(max_concurrency)，
-// 未设置则默认 1，最小为 1。
-func (p *Producer) maxConcurrency() int {
-	raw := strings.TrimSpace(p.getSetting("max_concurrency"))
-	n := defaultMaxConcurrency
-	if raw != "" {
-		if parsed, err := strconv.Atoi(raw); err == nil {
-			n = parsed
-		}
-	}
-	if n < 1 {
-		n = 1
-	}
-	return n
-}
-
-// acquireSlot 阻塞直到并发未满（获得槽位返回 true）或 ctx 取消（返回 false）。
-// 限额从设置动态读取，改大后新任务无需重启即可生效。
+// acquireSlot 阻塞直到拿到并发槽位；ctx 取消时返回 false。
 func (p *Producer) acquireSlot(ctx context.Context, id uint) bool {
-	logged := false
-	for {
-		if ctx.Err() != nil {
-			return false
-		}
-		limit := p.maxConcurrency()
-		p.mu.Lock()
-		if p.active < limit {
-			p.active++
-			p.mu.Unlock()
-			return true
-		}
-		p.mu.Unlock()
-		if !logged {
-			p.appendLog(id, "并发已满，排队等待空闲注册槽位")
-			logged = true
-		}
-		select {
-		case <-ctx.Done():
-			return false
-		case <-time.After(1 * time.Second):
-		}
-	}
-}
-
-// releaseSlot 释放一个并发槽位。
-func (p *Producer) releaseSlot() {
-	p.mu.Lock()
-	if p.active > 0 {
-		p.active--
-	}
-	p.mu.Unlock()
-}
-
-func (p *Producer) getSetting(key string) string {
-	var s models.Setting
-	if err := p.db.Where("key = ?", key).First(&s).Error; err != nil {
-		return ""
-	}
-	return s.Value
-}
-
-func (p *Producer) nextProxy() string {
-	// Grok 跟随设置页上的全局代理开关与代理列表，不再有独立的 Grok 开关。
-	enabled := strings.TrimSpace(p.getSetting("proxy_enabled"))
-	raw := p.getSetting("proxy_list")
-	if enabled != "1" {
-		return ""
-	}
-	proxies := proxyList(raw)
-	if len(proxies) == 0 {
-		return ""
-	}
-	p.mu.Lock()
-	proxy := proxies[p.pxIdx%len(proxies)]
-	p.pxIdx++
-	p.mu.Unlock()
-	return proxyutil.WithBestGoTaskSession(proxy)
-}
-
-func proxyList(raw string) []string {
-	raw = strings.ReplaceAll(raw, ",", "\n")
-	var out []string
-	for _, line := range strings.Split(raw, "\n") {
-		if s := strings.TrimSpace(line); s != "" {
-			out = append(out, s)
-		}
-	}
-	return out
-}
-
-func truncateStr(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n]
+	return p.AcquireSlot(ctx, func() {
+		p.appendLog(id, "并发已满，排队等待空闲注册槽位")
+	})
 }

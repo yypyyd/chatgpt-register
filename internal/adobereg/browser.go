@@ -14,6 +14,8 @@ import (
 	"strings"
 	"time"
 
+	"chatgpt-register/internal/proxyutil"
+
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/input"
 	"github.com/go-rod/rod/lib/launcher"
@@ -38,7 +40,7 @@ const (
 // launchAdobeBrowser 按注册用的一整套反爬/代理配置启动并连接 Adobe 专用 Chromium。
 // 返回的 browser 由调用方负责关闭；若返回了 bridge（认证代理桥），也要一并 Close；
 // cleanup 在浏览器关闭后调用，负责清理 launcher 的临时用户数据目录。
-func launchAdobeBrowser(in Input) (browser *rod.Browser, bridge *localAuthProxyBridge, cleanup func(), err error) {
+func launchAdobeBrowser(in Input) (browser *rod.Browser, bridge *proxyutil.AuthBridge, cleanup func(), err error) {
 	// 与 grokreg 一致：删掉 rod 默认追加的一批自动化特征标志，降低被反爬识别的概率。
 	l := launcher.New()
 	for _, flag := range []string{
@@ -93,13 +95,13 @@ func launchAdobeBrowser(in Input) (browser *rod.Browser, bridge *localAuthProxyB
 	}
 
 	if strings.TrimSpace(in.Proxy) != "" {
-		server, user, pass, perr := parseProxy(in.Proxy)
+		server, user, pass, perr := proxyutil.Parse(in.Proxy)
 		if perr != nil {
 			return nil, nil, nil, fmt.Errorf("解析代理失败: %w", perr)
 		}
 		if user != "" || pass != "" {
 			upstreamServer := server
-			bridge, server, perr = startLocalAuthProxyBridge(in.Proxy)
+			bridge, server, perr = proxyutil.StartAuthBridge(in.Proxy)
 			if perr != nil {
 				return nil, nil, nil, fmt.Errorf("启动认证代理桥失败: %w", perr)
 			}
@@ -1192,45 +1194,6 @@ func availableLoopbackPort() (int, error) {
 		return 0, err
 	}
 	return port, nil
-}
-
-func normalizeProxy(raw string) string {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return ""
-	}
-	if strings.Contains(raw, "://") {
-		return raw
-	}
-	parts := strings.Split(raw, ":")
-	switch len(parts) {
-	case 2:
-		return "http://" + parts[0] + ":" + parts[1]
-	case 4:
-		return "http://" + url.QueryEscape(parts[2]) + ":" + url.QueryEscape(parts[3]) + "@" + parts[0] + ":" + parts[1]
-	default:
-		return "http://" + raw
-	}
-}
-
-func parseProxy(raw string) (server, user, pass string, err error) {
-	u, err := url.Parse(normalizeProxy(raw))
-	if err != nil {
-		return "", "", "", err
-	}
-	if u.Host == "" {
-		return "", "", "", fmt.Errorf("代理缺少 host: %s", raw)
-	}
-	scheme := u.Scheme
-	if scheme == "" {
-		scheme = "http"
-	}
-	server = scheme + "://" + u.Host
-	if u.User != nil {
-		user = u.User.Username()
-		pass, _ = u.User.Password()
-	}
-	return server, user, pass, nil
 }
 
 func trimText(s string, n int) string {

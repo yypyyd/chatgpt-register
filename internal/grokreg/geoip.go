@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"chatgpt-register/internal/proxyutil"
+
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/proto"
 )
@@ -29,7 +31,7 @@ func lookupGeoIPViaRequest(in Input) *geoInfo {
 
 	transport := &http.Transport{}
 	if strings.TrimSpace(in.Proxy) != "" {
-		pu, perr := url.Parse(normalizeProxy(in.Proxy))
+		pu, perr := url.Parse(proxyutil.Normalize(in.Proxy))
 		if perr != nil {
 			in.logf("代理解析失败，跳过地理位置对齐: %v", perr)
 			return nil

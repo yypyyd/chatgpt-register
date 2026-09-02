@@ -2,6 +2,7 @@ package proxyutil
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -27,6 +28,40 @@ func Normalize(raw string) string {
 	default:
 		return "http://" + raw
 	}
+}
+
+// Parse 解析代理串，返回 Chrome --proxy-server 用的 scheme://host:port（不含账号密码）
+// 以及单独的账号密码（交给 browser.MustHandleAuth / 认证桥处理）。
+func Parse(raw string) (server, user, pass string, err error) {
+	u, err := url.Parse(Normalize(raw))
+	if err != nil {
+		return "", "", "", err
+	}
+	if u.Host == "" {
+		return "", "", "", fmt.Errorf("代理缺少 host: %s", raw)
+	}
+	scheme := u.Scheme
+	if scheme == "" {
+		scheme = "http"
+	}
+	server = scheme + "://" + u.Host
+	if u.User != nil {
+		user = u.User.Username()
+		pass, _ = u.User.Password()
+	}
+	return server, user, pass, nil
+}
+
+// List 把多行/逗号分隔的代理串拆成切片，去掉空行。
+func List(raw string) []string {
+	raw = strings.ReplaceAll(raw, ",", "\n")
+	var out []string
+	for _, line := range strings.Split(raw, "\n") {
+		if s := strings.TrimSpace(line); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // Transport 按代理串构造 http 出口；代理为空返回 nil（直连）。

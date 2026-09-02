@@ -6,13 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"chatgpt-register/internal/proxyutil"
+	"chatgpt-register/internal/turnstilepatch"
 
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/launcher"
@@ -97,7 +99,7 @@ func registerBrowser(ctx context.Context, in Input) (res *Result, err error) {
 	// invisible managed Turnstile issues a token to a real checkbox click — no
 	// third-party solver required. It also exposes window.__cfSolve, which the
 	// minted-token injection needs, so it is loaded in headless (new) mode too.
-	if patchDir, perr := extractTurnstilePatch(); perr != nil {
+	if patchDir, perr := turnstilepatch.Extract("turnstilepatch-*"); perr != nil {
 		in.logf("释放 Turnstile 补丁扩展失败，回退到无扩展模式: %v", perr)
 	} else {
 		defer os.RemoveAll(patchDir)
@@ -105,16 +107,16 @@ func registerBrowser(ctx context.Context, in Input) (res *Result, err error) {
 		in.logf("已加载 Turnstile 补丁扩展")
 	}
 
-	var authBridge *localAuthProxyBridge
+	var authBridge *proxyutil.AuthBridge
 	proxyConfigured := strings.TrimSpace(in.Proxy) != ""
 	if proxyConfigured {
-		server, user, pass, perr := parseProxy(in.Proxy)
+		server, user, pass, perr := proxyutil.Parse(in.Proxy)
 		if perr != nil {
 			return nil, fmt.Errorf("解析代理失败: %w", perr)
 		}
 		if user != "" || pass != "" {
 			upstreamServer := server
-			authBridge, server, perr = startLocalAuthProxyBridge(in.Proxy)
+			authBridge, server, perr = proxyutil.StartAuthBridge(in.Proxy)
 			if perr != nil {
 				return nil, fmt.Errorf("启动认证代理桥失败: %w", perr)
 			}
@@ -1578,45 +1580,6 @@ func captureAuth(page *rod.Page, in Input) (map[string]any, error) {
 		"cookies":     cookieList,
 		"storage":     storage,
 	}, nil
-}
-
-func normalizeProxy(raw string) string {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return ""
-	}
-	if strings.Contains(raw, "://") {
-		return raw
-	}
-	parts := strings.Split(raw, ":")
-	switch len(parts) {
-	case 2:
-		return "http://" + parts[0] + ":" + parts[1]
-	case 4:
-		return "http://" + url.QueryEscape(parts[2]) + ":" + url.QueryEscape(parts[3]) + "@" + parts[0] + ":" + parts[1]
-	default:
-		return "http://" + raw
-	}
-}
-
-func parseProxy(raw string) (server, user, pass string, err error) {
-	u, err := url.Parse(normalizeProxy(raw))
-	if err != nil {
-		return "", "", "", err
-	}
-	if u.Host == "" {
-		return "", "", "", fmt.Errorf("代理缺少 host: %s", raw)
-	}
-	scheme := u.Scheme
-	if scheme == "" {
-		scheme = "http"
-	}
-	server = scheme + "://" + u.Host
-	if u.User != nil {
-		user = u.User.Username()
-		pass, _ = u.User.Password()
-	}
-	return server, user, pass, nil
 }
 
 func trimText(s string, n int) string {

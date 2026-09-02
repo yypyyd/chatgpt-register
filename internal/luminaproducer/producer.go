@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
-	"strconv"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -14,7 +14,7 @@ import (
 	"chatgpt-register/internal/luminareg"
 	"chatgpt-register/internal/mailfetch"
 	"chatgpt-register/internal/models"
-	"chatgpt-register/internal/proxyutil"
+	"chatgpt-register/internal/prodcore"
 
 	"gorm.io/gorm"
 )
@@ -26,61 +26,125 @@ const (
 	codePollInterval = 2 * time.Second
 	maxLogBytes      = 64 * 1024
 
-	// defaultMaxConcurrency 未配置并发时的默认值：逐个开工。批量注册时多个
-	// 有头浏览器同时抢 CPU 会互相超时，串行最稳。
-	// 可用设置页「最大并发数」(max_concurrency) 调大。
-	defaultMaxConcurrency = 1
-
 	// defaultRetryCooldownMin 注册失败后重试同一邮箱前的等待分钟数，避免连续重试
 	// 撞风控。可在系统设置 retry_cooldown_min 覆盖，0 = 不冷却。
 	defaultRetryCooldownMin = 30
 
-	// defaultRegisterSpacingSec 相邻两单注册的最小启动间隔秒数。实测 BytePlus 按注册
-	// 数量给配额：猛冲能连过 50~70 单，之后封 20~30 分钟，平均约每分钟 2 单；把节奏
-	// 压到这个间隔内基本不会再撞限流。可在系统设置 register_spacing_sec 覆盖，0 = 不错峰。
+	// defaultRegisterSpacingSec 相邻两单注册的最小启动间隔秒数，把节奏放缓一点，
+	// 避免同一域名的配额被瞬间打空。可在系统设置 register_spacing_sec 覆盖，0 = 不错峰。
 	defaultRegisterSpacingSec = 25
 
 	// rateLimitCooldown 被限流的邮箱的重试冷却：限流不是这个邮箱的问题，别按失败
-	// 罚它 30 分钟，短暂避让后放回池子继续用。
+	// 罚它 30 分钟，短暂避让后放回池子继续用（真正的挡板是下面的域名冷却）。
 	rateLimitCooldown = 5 * time.Minute
-
-	// maxRegisterSpacingSec 自适应错峰的间隔上限：BytePlus 配额吃紧时逐步拉长到
-	// 这个值为止，避免无限变慢。
-	maxRegisterSpacingSec = 180
 
 	// rateLimitNote 限流失败记录的备注前缀，取号时据此走短冷却。
 	rateLimitNote = "[限流]"
+
+	// domainCooldown 某个邮箱域名撞到 ErrorRateLimit 后整体停用的时长。线上实测
+	// BytePlus 的限流按邮箱域名计，处在额度边缘时是间歇性拒绝（前后一分钟内有过
+	// 有拒有放），彻底打满后封十几到二十几小时。短冷却既避免连续拿真邮箱去撞，
+	// 又不会在间歇性限流时白白停工一小时。
+	domainCooldown = 10 * time.Minute
+
+	// candidateFetchLimit 取号时每类来源最多捞多少候选邮箱，再在内存里按域名轮询挑选。
+	candidateFetchLimit = 500
 )
 
 var digitCodeRe = regexp.MustCompile(`\b(\d{6})\b`)
 
+// excludedDomains 取号时始终跳过的邮箱域名：这些域名在 BytePlus 长期处于限流状态，
+// 拿去注册只会白白消耗邮箱和验证码。
+var excludedDomains = map[string]bool{
+	"outlook.de": true,
+}
+
 type Producer struct {
+	*prodcore.Core
+
 	db   *gorm.DB
 	mail *mailfetch.Client
 
 	mu      sync.Mutex
 	waiters map[uint]chan string
 	cancel  map[uint]context.CancelFunc
-	active  int
-	pxIdx   int
 	// topUpCancel 非空表示补任务循环在跑，StopAll 用它停掉补任务。
 	topUpCancel context.CancelFunc
 	runTarget   int    // 本次生产的目标数量
 	runTracked  []uint // 本次生产建过的任务 id
 	// lastStart 上一单注册的开工时间，用于相邻两单错峰。
 	lastStart time.Time
-	// dynSpacing 自适应错峰的当前间隔：撞限流加倍拉长，注册成功逐步收窄，
-	// 始终不低于 registerSpacing 的基础值。零值表示尚未调整过。
-	dynSpacing time.Duration
+	// domainBlockedUntil 撞限流的邮箱域名 → 解禁时间。
+	domainBlockedUntil map[string]time.Time
 }
 
 func New(db *gorm.DB, mail *mailfetch.Client) *Producer {
 	return &Producer{
-		db:      db,
-		mail:    mail,
-		waiters: map[uint]chan string{},
-		cancel:  map[uint]context.CancelFunc{},
+		Core:               prodcore.New(db),
+		db:                 db,
+		mail:               mail,
+		waiters:            map[uint]chan string{},
+		cancel:             map[uint]context.CancelFunc{},
+		domainBlockedUntil: map[string]time.Time{},
 	}
+}
+
+// emailDomain 取邮箱 @ 后的域名（小写）。
+func emailDomain(email string) string {
+	if i := strings.LastIndex(email, "@"); i >= 0 {
+		return strings.ToLower(strings.TrimSpace(email[i+1:]))
+	}
+	return ""
+}
+
+// blockDomain 把域名整体停用 domainCooldown，期间取号跳过该域名的所有邮箱。
+func (p *Producer) blockDomain(domain string) time.Time {
+	until := time.Now().Add(domainCooldown)
+	p.mu.Lock()
+	p.domainBlockedUntil[domain] = until
+	p.mu.Unlock()
+	return until
+}
+
+// domainBlocked 返回域名是否仍在冷却中，到点的顺手清掉。
+func (p *Producer) domainBlocked(domain string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if until, ok := p.domainBlockedUntil[domain]; ok {
+		if time.Now().Before(until) {
+			return true
+		}
+		delete(p.domainBlockedUntil, domain)
+	}
+	return false
+}
+
+// blockedDomains 当前仍在冷却中的域名列表（已排序）。
+func (p *Producer) blockedDomains() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	out := make([]string, 0, len(p.domainBlockedUntil))
+	for d, until := range p.domainBlockedUntil {
+		if now.Before(until) {
+			out = append(out, d)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// anyDomainBlocked 是否还有域名在冷却中（此时值得等，而不是收工）。
+func (p *Producer) anyDomainBlocked() bool {
+	return len(p.blockedDomains()) > 0
+}
+
+// domainUsable 取号前判断域名能否注册：长期限流的域名和冷却中的域名直接跳过。
+func (p *Producer) domainUsable(domain string) bool {
+	if domain == "" || excludedDomains[domain] {
+		return false
+	}
+	return !p.domainBlocked(domain)
 }
 
 func (p *Producer) Start(email, note string) (*models.LuminaRegistration, error) {
@@ -132,11 +196,15 @@ func (p *Producer) StartFromAccounts(count int) ([]models.LuminaRegistration, er
 		return nil, fmt.Errorf("数量必须 >= 1")
 	}
 	// 首批只按并发数取号，跑完一条再补一条，避免一次把上百个邮箱全标成注册中。
-	started, cooling, err := p.claimTargets(minInt(count, p.maxConcurrency()))
+	started, cooling, err := p.claimTargets(min(count, p.MaxConcurrency()))
 	if err != nil {
 		return nil, err
 	}
 	if len(started) == 0 {
+		if blocked := p.blockedDomains(); len(blocked) > 0 {
+			return nil, fmt.Errorf("可用邮箱的域名（%s）都撞了 BytePlus 的域名注册配额，正在冷却；请补充其它域名的邮箱或稍后再试",
+				strings.Join(blocked, ", "))
+		}
 		if cooling {
 			return nil, fmt.Errorf("可重试的邮箱都还在失败冷却中，请稍后再试")
 		}
@@ -150,14 +218,17 @@ func (p *Producer) StartFromAccounts(count int) ([]models.LuminaRegistration, er
 	return started, nil
 }
 
-// preferredDomainCond 圈出风控宽松的邮箱域：BytePlus 对 outlook.com / outlook.de
-// 的注册接口风控明显更严（直接回 ErrorRateLimit），hotmail / live 同为微软邮箱却能
-// 正常进滑块，所以先把它们用完，再回落到 outlook。
-const preferredDomainCond = "email LIKE '%@hotmail.com' OR email LIKE '%@hotmail.co%' " +
-	"OR email LIKE '%@live.com' OR email LIKE '%@live.co%'"
+// candidate 一个可用于注册的邮箱来源。
+type candidate struct {
+	email     string
+	mailboxID uint
+	note      string
+}
 
 // claimTargets 取最多 count 个可注册的邮箱并置为 registering。
-// cooling=true 表示还有失败邮箱可重试、只是没到冷却时间。
+// BytePlus 的注册配额按邮箱域名计，所以取号时按域名轮询交错，把用量摊到各个域名上；
+// 长期限流的域名与冷却中的域名整体跳过。
+// cooling=true 表示还有邮箱 / 域名可重试、只是没到冷却时间。
 func (p *Producer) claimTargets(count int) ([]models.LuminaRegistration, bool, error) {
 	cutoff := time.Now().Add(-p.retryCooldown())
 	rlCutoff := time.Now().Add(-rateLimitCooldown)
@@ -177,72 +248,98 @@ func (p *Producer) claimTargets(count int) ([]models.LuminaRegistration, bool, e
 		Where("status = ?", "register_failed")
 
 	started := make([]models.LuminaRegistration, 0, count)
-	// preferredOnly 那一轮只取 hotmail / live，用完才允许取 outlook。
-	claim := func(skipFailed, preferredOnly bool) error {
-		// 优先用已注册 ChatGPT 账号（其邮箱已在邮箱池且可读验证码）。
-		// 只取母号：裂变号是 +别名 邮箱，BytePlus 视作同一邮箱，不能用来注册。
-		accQ := p.db.
-			Where("status = ? AND mailbox_id <> 0 AND is_mother = ?", "registered", true).
-			Where("email NOT IN (?)", blocked)
-		if skipFailed {
-			accQ = accQ.Where("email NOT IN (?)", everFailed)
-		}
-		if preferredOnly {
-			accQ = accQ.Where(preferredDomainCond)
-		}
-		var accounts []models.Registration
-		if err := accQ.Order("id asc").Limit(count - len(started)).Find(&accounts).Error; err != nil {
-			return err
-		}
-		for _, acc := range accounts {
-			reg, err := p.claimOne(acc.Email, acc.MailboxID,
-				fmt.Sprintf("来源: ChatGPT账号 #%d，自动读取验证码", acc.ID))
-			if err != nil {
-				return err
-			}
-			started = append(started, *reg)
-		}
-		// 不足则从已验证邮箱池补齐。
-		if len(started) >= count {
-			return nil
-		}
-		mbQ := p.db.
-			Where("status = ?", "verified").
-			Where("email NOT IN (?)", blocked)
-		if skipFailed {
-			mbQ = mbQ.Where("email NOT IN (?)", everFailed)
-		}
-		if preferredOnly {
-			mbQ = mbQ.Where(preferredDomainCond)
-		}
-		var mailboxes []models.Mailbox
-		if err := mbQ.Order("id asc").Limit(count - len(started)).Find(&mailboxes).Error; err != nil {
-			return err
-		}
-		for _, mb := range mailboxes {
-			reg, err := p.claimOne(mb.Email, mb.ID,
-				fmt.Sprintf("来源: 邮箱管理 #%d，自动读取验证码", mb.ID))
-			if err != nil {
-				return err
-			}
-			started = append(started, *reg)
-		}
-		return nil
-	}
+	claimed := map[string]bool{}
 	for _, skipFailed := range []bool{true, false} {
-		for _, preferredOnly := range []bool{true, false} {
+		if len(started) >= count {
+			break
+		}
+		cands, err := p.fetchCandidates(blocked, everFailed, skipFailed)
+		if err != nil {
+			return started, false, err
+		}
+		for _, c := range interleaveByDomain(cands) {
 			if len(started) >= count {
 				break
 			}
-			if err := claim(skipFailed, preferredOnly); err != nil {
+			if claimed[c.email] || !p.domainUsable(emailDomain(c.email)) {
+				continue
+			}
+			reg, err := p.claimOne(c.email, c.mailboxID, c.note)
+			if err != nil {
 				return started, false, err
 			}
+			claimed[c.email] = true
+			started = append(started, *reg)
 		}
 	}
 	if len(started) > 0 {
 		return started, false, nil
 	}
-	return started, p.hasCoolingFailure(cutoff), nil
+	return started, p.hasCoolingFailure(cutoff) || p.anyDomainBlocked(), nil
+}
+
+// fetchCandidates 捞出可注册的候选邮箱：优先已注册 ChatGPT 账号（其邮箱已在邮箱池且
+// 可读验证码，只取母号——裂变号是 +别名 邮箱，BytePlus 视作同一邮箱），再补已验证邮箱池。
+func (p *Producer) fetchCandidates(blocked, everFailed *gorm.DB, skipFailed bool) ([]candidate, error) {
+	accQ := p.db.
+		Where("status = ? AND mailbox_id <> 0 AND is_mother = ?", "registered", true).
+		Where("email NOT IN (?)", blocked)
+	if skipFailed {
+		accQ = accQ.Where("email NOT IN (?)", everFailed)
+	}
+	var accounts []models.Registration
+	if err := accQ.Order("id asc").Limit(candidateFetchLimit).Find(&accounts).Error; err != nil {
+		return nil, err
+	}
+	cands := make([]candidate, 0, len(accounts))
+	for _, acc := range accounts {
+		cands = append(cands, candidate{
+			email: acc.Email, mailboxID: acc.MailboxID,
+			note: fmt.Sprintf("来源: ChatGPT账号 #%d，自动读取验证码", acc.ID),
+		})
+	}
+
+	mbQ := p.db.
+		Where("status = ?", "verified").
+		Where("email NOT IN (?)", blocked)
+	if skipFailed {
+		mbQ = mbQ.Where("email NOT IN (?)", everFailed)
+	}
+	var mailboxes []models.Mailbox
+	if err := mbQ.Order("id asc").Limit(candidateFetchLimit).Find(&mailboxes).Error; err != nil {
+		return nil, err
+	}
+	for _, mb := range mailboxes {
+		cands = append(cands, candidate{
+			email: mb.Email, mailboxID: mb.ID,
+			note: fmt.Sprintf("来源: 邮箱管理 #%d，自动读取验证码", mb.ID),
+		})
+	}
+	return cands, nil
+}
+
+// interleaveByDomain 按域名分组后轮询交错（a1 b1 c1 a2 b2 ...），组内保持原顺序，
+// 域名按首次出现顺序排列，让每一批取号尽量覆盖多个域名。
+func interleaveByDomain(cands []candidate) []candidate {
+	order := make([]string, 0, 4)
+	groups := map[string][]candidate{}
+	for _, c := range cands {
+		d := emailDomain(c.email)
+		if _, ok := groups[d]; !ok {
+			order = append(order, d)
+		}
+		groups[d] = append(groups[d], c)
+	}
+	out := make([]candidate, 0, len(cands))
+	for len(out) < len(cands) {
+		for _, d := range order {
+			if g := groups[d]; len(g) > 0 {
+				out = append(out, g[0])
+				groups[d] = g[1:]
+			}
+		}
+	}
+	return out
 }
 
 // claimOne 把一个邮箱置为 registering：已有记录就复用（重试同一条），否则新建。
@@ -285,80 +382,17 @@ func (p *Producer) hasCoolingFailure(cutoff time.Time) bool {
 
 // retryCooldown 失败地址的重试冷却，跟设置页 retry_cooldown_min，0 = 不冷却。
 func (p *Producer) retryCooldown() time.Duration {
-	raw := strings.TrimSpace(p.getSetting("retry_cooldown_min"))
-	min := defaultRetryCooldownMin
-	if raw != "" {
-		if n, err := strconv.Atoi(raw); err == nil && n >= 0 {
-			min = n
-		}
-	}
-	return time.Duration(min) * time.Minute
+	return p.SettingMinutes("retry_cooldown_min", defaultRetryCooldownMin)
 }
 
 // registerSpacing 相邻两单注册的最小启动间隔，跟设置页 register_spacing_sec，0 = 不错峰。
 func (p *Producer) registerSpacing() time.Duration {
-	raw := strings.TrimSpace(p.getSetting("register_spacing_sec"))
-	sec := defaultRegisterSpacingSec
-	if raw != "" {
-		if n, err := strconv.Atoi(raw); err == nil && n >= 0 {
-			sec = n
-		}
-	}
-	return time.Duration(sec) * time.Second
+	return time.Duration(p.SettingInt("register_spacing_sec", defaultRegisterSpacingSec)) * time.Second
 }
 
-// effectiveSpacing 当前生效的错峰间隔：取自适应间隔与基础间隔的较大者。
-func (p *Producer) effectiveSpacing() time.Duration {
-	base := p.registerSpacing()
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.dynSpacing > base {
-		return p.dynSpacing
-	}
-	return base
-}
-
-// bumpSpacing 撞限流后把错峰间隔加倍（不超过上限），让节奏自动降到配额线下。
-func (p *Producer) bumpSpacing(id uint) {
-	base := p.registerSpacing()
-	if base <= 0 {
-		return // 用户显式关掉了错峰，不自作主张
-	}
-	p.mu.Lock()
-	cur := p.dynSpacing
-	if cur < base {
-		cur = base
-	}
-	next := cur * 2
-	if max := maxRegisterSpacingSec * time.Second; next > max {
-		next = max
-	}
-	p.dynSpacing = next
-	p.mu.Unlock()
-	if next != cur {
-		p.appendLog(id, fmt.Sprintf("检测到限流，错峰间隔调整为 %d 秒", int(next.Seconds()+0.5)))
-	}
-}
-
-// easeSpacing 注册成功后逐步收窄错峰间隔（每次减 5 秒），直到回到基础值。
-func (p *Producer) easeSpacing() {
-	base := p.registerSpacing()
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.dynSpacing <= base {
-		p.dynSpacing = 0
-		return
-	}
-	p.dynSpacing -= 5 * time.Second
-	if p.dynSpacing < base {
-		p.dynSpacing = base
-	}
-}
-
-// waitSpacing 错峰：与上一单开工时间至少隔 effectiveSpacing，把平均注册频率压在
-// BytePlus 的配额线下。返回 false 表示等待期间被停止。
+// waitSpacing 错峰：与上一单开工时间至少隔 registerSpacing。返回 false 表示等待期间被停止。
 func (p *Producer) waitSpacing(ctx context.Context, id uint) bool {
-	gap := p.effectiveSpacing()
+	gap := p.registerSpacing()
 	if gap <= 0 {
 		return true
 	}
@@ -373,13 +407,13 @@ func (p *Producer) waitSpacing(ctx context.Context, id uint) bool {
 		}
 		p.mu.Unlock()
 		if !logged {
-			p.appendLog(id, fmt.Sprintf("错峰等待 %d 秒后开工（避免撞 BytePlus 注册配额）", int(wait.Seconds()+0.5)))
+			p.appendLog(id, fmt.Sprintf("错峰等待 %d 秒后开工", int(wait.Seconds()+0.5)))
 			logged = true
 		}
 		if wait > time.Second {
 			wait = time.Second
 		}
-		if !sleepCtx(ctx, wait) {
+		if !prodcore.Sleep(ctx, wait) {
 			return false
 		}
 	}
@@ -396,7 +430,7 @@ func (p *Producer) topUp(count int, started []models.LuminaRegistration) {
 
 	tracked := p.trackedIDs()
 	for {
-		if !sleepCtx(ctx, 5*time.Second) {
+		if !prodcore.Sleep(ctx, 5*time.Second) {
 			return
 		}
 		running := p.runningNum()
@@ -407,11 +441,11 @@ func (p *Producer) topUp(count int, started []models.LuminaRegistration) {
 			}
 			return
 		}
-		slots := p.maxConcurrency() - running
+		slots := p.MaxConcurrency() - running
 		if slots <= 0 {
 			continue
 		}
-		regs, cooling, err := p.claimTargets(minInt(remaining, slots))
+		regs, cooling, err := p.claimTargets(min(remaining, slots))
 		if err != nil {
 			return
 		}
@@ -419,7 +453,7 @@ func (p *Producer) topUp(count int, started []models.LuminaRegistration) {
 			if running > 0 {
 				continue
 			}
-			if cooling && sleepCtx(ctx, 60*time.Second) {
+			if cooling && prodcore.Sleep(ctx, 60*time.Second) {
 				continue // 等失败地址过冷却
 			}
 			return
@@ -496,23 +530,6 @@ func (p *Producer) countRegistered(ids []uint) int {
 		Where("id IN ? AND status = ?", ids, "registered").
 		Count(&n)
 	return int(n)
-}
-
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-// sleepCtx 等一段时间；被取消时返回 false。
-func sleepCtx(ctx context.Context, d time.Duration) bool {
-	select {
-	case <-ctx.Done():
-		return false
-	case <-time.After(d):
-		return true
-	}
 }
 
 func (p *Producer) SubmitCode(id uint, code string) error {
@@ -628,7 +645,7 @@ func (p *Producer) run(id uint) {
 		})
 		return
 	}
-	defer p.releaseSlot()
+	defer p.ReleaseSlot()
 
 	if !p.waitSpacing(ctx, id) {
 		p.appendLog(id, "已取消（错峰等待时被停止）")
@@ -648,7 +665,7 @@ func (p *Producer) run(id uint) {
 	var res *luminareg.Result
 	var err error
 	for attempt := 1; attempt <= maxRotateAttempts; attempt++ {
-		proxy := p.nextProxy() // 每次调用都会挂新的住宅 session
+		proxy := p.NextProxy() // 每次调用都会挂新的住宅 session
 		canRotate := strings.Contains(proxy, "-session-")
 		if attempt > 1 {
 			p.appendLog(id, fmt.Sprintf("♻ 更换住宅 IP 后第 %d/%d 次重试", attempt, maxRotateAttempts))
@@ -675,10 +692,12 @@ func (p *Producer) run(id uint) {
 			break
 		}
 		if errors.Is(err, luminareg.ErrRateLimited) {
-			// 实测换出口 IP、换浏览器特征都拦：限流按注册数量算，原地重试白占并发槽。
-			// 限流不是这个邮箱的问题，短冷却后放回池子继续用，不当成烧掉。
-			p.bumpSpacing(id)
-			p.appendLog(id, "注册未通过: "+err.Error()+"，先换下一个邮箱，本邮箱短暂避让后放回池子")
+			// 限流按邮箱域名计，换 IP / 原地重试都没用：整个域名拉进冷却，让后续取号
+			// 换其它域名；这个邮箱本身没问题，短冷却后放回池子。
+			domain := emailDomain(reg.Email)
+			until := p.blockDomain(domain)
+			p.appendLog(id, fmt.Sprintf("注册未通过: %v；域名 @%s 已停用至 %s，后续取号改用其它域名的邮箱",
+				err, domain, until.Format("15:04")))
 			break
 		}
 		if canRotate && attempt < maxRotateAttempts &&
@@ -701,12 +720,11 @@ func (p *Producer) run(id uint) {
 		}
 		p.db.Model(&models.LuminaRegistration{}).Where("id = ?", id).Updates(map[string]any{
 			"status": status,
-			"note":   truncateStr(note, 500),
+			"note":   prodcore.Truncate(note, 500),
 		})
 		return
 	}
 
-	p.easeSpacing()
 	authBytes, _ := json.MarshalIndent(res.AuthJSON, "", "  ")
 	p.appendLog(id, "Lumina 注册成功")
 	p.db.Model(&models.LuminaRegistration{}).Where("id = ?", id).Updates(map[string]any{
@@ -815,113 +833,17 @@ func looksLikeBytePlus(m mailfetch.Message) bool {
 }
 
 func (p *Producer) appendLog(id uint, line string) {
-	stamp := time.Now().Format("2006-01-02 15:04:05")
 	var reg models.LuminaRegistration
 	if err := p.db.Select("log").First(&reg, id).Error; err != nil {
 		return
 	}
-	log := reg.Log
-	if strings.TrimSpace(log) == "" {
-		log = ""
-	} else if !strings.HasSuffix(log, "\n") {
-		log += "\n"
-	}
-	log += stamp + " " + line + "\n"
-	if len(log) > maxLogBytes {
-		log = log[len(log)-maxLogBytes:]
-	}
-	p.db.Model(&models.LuminaRegistration{}).Where("id = ?", id).Update("log", log)
+	p.db.Model(&models.LuminaRegistration{}).Where("id = ?", id).
+		Update("log", prodcore.AppendLogLine(reg.Log, line, maxLogBytes))
 }
 
-// maxConcurrency 跟设置页「最大并发数」(max_concurrency)，未设置则默认 1。
-func (p *Producer) maxConcurrency() int {
-	raw := strings.TrimSpace(p.getSetting("max_concurrency"))
-	n := defaultMaxConcurrency
-	if raw != "" {
-		if parsed, err := strconv.Atoi(raw); err == nil {
-			n = parsed
-		}
-	}
-	if n < 1 {
-		n = 1
-	}
-	return n
-}
-
+// acquireSlot 阻塞直到拿到并发槽位；ctx 取消时返回 false。
 func (p *Producer) acquireSlot(ctx context.Context, id uint) bool {
-	logged := false
-	for {
-		if ctx.Err() != nil {
-			return false
-		}
-		limit := p.maxConcurrency()
-		p.mu.Lock()
-		if p.active < limit {
-			p.active++
-			p.mu.Unlock()
-			return true
-		}
-		p.mu.Unlock()
-		if !logged {
-			p.appendLog(id, "并发已满，排队等待空闲注册槽位")
-			logged = true
-		}
-		select {
-		case <-ctx.Done():
-			return false
-		case <-time.After(1 * time.Second):
-		}
-	}
-}
-
-func (p *Producer) releaseSlot() {
-	p.mu.Lock()
-	if p.active > 0 {
-		p.active--
-	}
-	p.mu.Unlock()
-}
-
-func (p *Producer) getSetting(key string) string {
-	var s models.Setting
-	if err := p.db.Where("key = ?", key).First(&s).Error; err != nil {
-		return ""
-	}
-	return s.Value
-}
-
-// nextProxy 跟设置页上的全局代理开关与代理列表，按任务轮换出口。
-func (p *Producer) nextProxy() string {
-	enabled := strings.TrimSpace(p.getSetting("proxy_enabled"))
-	raw := p.getSetting("proxy_list")
-	if enabled != "1" {
-		return ""
-	}
-	proxies := proxyList(raw)
-	if len(proxies) == 0 {
-		return ""
-	}
-	p.mu.Lock()
-	proxy := proxies[p.pxIdx%len(proxies)]
-	p.pxIdx++
-	p.mu.Unlock()
-	return proxyutil.WithBestGoTaskSession(proxy)
-}
-
-func proxyList(raw string) []string {
-	raw = strings.ReplaceAll(raw, ",", "\n")
-	var out []string
-	for _, line := range strings.Split(raw, "\n") {
-		if s := strings.TrimSpace(line); s != "" {
-			out = append(out, s)
-		}
-	}
-	return out
-}
-
-func truncateStr(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n]
+	return p.AcquireSlot(ctx, func() {
+		p.appendLog(id, "并发已满，排队等待空闲注册槽位")
+	})
 }
