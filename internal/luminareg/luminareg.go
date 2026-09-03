@@ -1,6 +1,6 @@
-// Package luminareg 完成 BytePlus Lumina（ai.byteplus.com/lumina）的邮箱注册，
-// 并采集 BytePlus 账号会话 Cookie（digest / AccountID / userInfo）供导出。
-// 全程纯协议链路（protocol.go），不依赖浏览器。
+// Package luminareg 完成 BytePlus Lumina（ai.byteplus.com/lumina）的邮箱注册，并采集
+// console.byteplus.com 域 + Lumina 侧的全部会话 Cookie 供导出。全程纯协议链路
+// （protocol.go），不依赖浏览器。
 package luminareg
 
 import (

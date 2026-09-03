@@ -121,22 +121,8 @@ func registerProtocol(ctx context.Context, in Input) (*Result, error) {
 			in.logf("注册接口已通过")
 			// 注册接口签发的会话在 Lumina 侧仍是 guest，而同一会话重登会报
 			// InvalidState，所以用干净的会话账密登录一次，拿到的才是可用会话。
-			// 账号此时已建好，代理瞬断（如 502）导致的登录失败重试几次即可，
-			// 别把成功的注册记成失败。
-			var lc *protoClient
-			var lerr error
-			for try := 1; try <= 3; try++ {
-				lc, lerr = c.loginFresh(ctx)
-				if lerr == nil {
-					break
-				}
-				if try < 3 {
-					in.logf("登录换取会话失败（第 %d/3 次）: %v，稍后重试", try, lerr)
-					if !sleepCtxProto(ctx, 5*time.Second) {
-						return nil, ctx.Err()
-					}
-				}
-			}
+			// 账号此时已建好，别把成功的注册记成失败。
+			lc, lerr := c.loginRetry(ctx)
 			if lerr != nil {
 				return nil, fmt.Errorf("注册成功但登录换取会话失败: %w", lerr)
 			}
@@ -210,6 +196,8 @@ func (c *protoClient) syncLuminaCookies() {
 }
 
 // loginFresh 用全新的 cookie jar 走一次账密登录，返回拿到正式会话的客户端。
+// BytePlus 的会话（digest）是登录时签发、固定 48 小时到期的 JWT，重放任何接口都不会
+// 延长；到期后由 2API 拿导出的账密自行重登，我们这边不做续期。
 func (c *protoClient) loginFresh(ctx context.Context) (*protoClient, error) {
 	lc, err := newProtoClient(c.in, &c.fp)
 	if err != nil {
@@ -226,6 +214,26 @@ func (c *protoClient) loginFresh(ctx context.Context) (*protoClient, error) {
 		return nil, err
 	}
 	return lc, nil
+}
+
+// loginRetry 账密登录，代理瞬断（如 502）之类的临时失败重试几次。
+func (c *protoClient) loginRetry(ctx context.Context) (*protoClient, error) {
+	const attempts = 3
+	var lc *protoClient
+	var err error
+	for try := 1; try <= attempts; try++ {
+		lc, err = c.loginFresh(ctx)
+		if err == nil {
+			return lc, nil
+		}
+		if try < attempts {
+			c.in.logf("登录换取会话失败（第 %d/%d 次）: %v，稍后重试", try, attempts, err)
+			if !sleepCtxProto(ctx, 5*time.Second) {
+				return nil, ctx.Err()
+			}
+		}
+	}
+	return nil, err
 }
 
 // cookie 读取 console.byteplus.com 域下的 Cookie 值。
@@ -446,37 +454,23 @@ func dragTrack(target int) []map[string]int {
 	return track
 }
 
-// collect 采集注册成功后的会话：会话 Cookie（digest / AccountID / userInfo）、
-// Lumina 使用条款 flag 与账号元信息，结构与浏览器流程保持一致。
+// collect 采集登录后的完整会话供导出：先把 console 会话同步到 lumi-api，走完 Lumina 侧
+// 接口（同意条款、拉账号元信息），最后再把 console.byteplus.com 域与 Lumina 侧种下的
+// 全部 Cookie 一起汇总——上游要的是"console 全部 Cookie + Lumina Cookie 拼成一串"，
+// 中途快照会漏掉后续接口种的 Cookie。
+// 线上实测 lumi-api 与 ai.byteplus.com 页面都不种会话类 Cookie（只有共用的 .byteplus.com
+// 那几条），所以不必再额外访问 Lumina 页面——那一跳经住宅代理要几十秒且一条都不多。
 func (c *protoClient) collect(ctx context.Context) (*Result, error) {
-	u, err := url.Parse(consoleBase)
-	if err != nil {
-		return nil, err
+	if c.cookie("digest") == "" || c.cookie("AccountID") == "" {
+		return nil, fmt.Errorf("未采集到 BytePlus 会话 cookie（digest/AccountID），登录可能未完成（现有 cookie: %s）",
+			trimText(strings.Join(c.cookieNames(consoleBase), " "), 300))
 	}
-	cookieList := make([]map[string]any, 0, 8)
-	names := map[string]bool{}
-	for _, ck := range c.cli.GetCookies(u) {
-		names[strings.ToLower(ck.Name)] = true
-		cookieList = append(cookieList, map[string]any{
-			"name":     ck.Name,
-			"value":    ck.Value,
-			"domain":   ".byteplus.com",
-			"path":     "/",
-			"expires":  ck.Expires.Unix(),
-			"httpOnly": ck.HttpOnly,
-			"secure":   ck.Secure,
-		})
-	}
-	if !names["digest"] || !names["accountid"] {
-		got := make([]string, 0, len(names))
-		for n := range names {
-			got = append(got, n)
-		}
-		return nil, fmt.Errorf("未采集到 BytePlus 会话 cookie（digest/AccountID），注册可能未完成（现有 cookie: %s）",
-			trimText(strings.Join(got, " "), 300))
-	}
-	c.in.logf("已采集 %d 条 Cookie（含 BytePlus 会话 cookie）", len(cookieList))
 	c.syncLuminaCookies()
+	terms := c.acceptTermsProto(ctx)
+	info := c.accountInfo(ctx)
+
+	cookieList := c.exportCookies()
+	c.in.logf("已采集 %d 条 Cookie（console.byteplus.com 全部 + Lumina 侧）", len(cookieList))
 
 	auth := map[string]any{
 		"auth_mode":      "lumina_protocol_session",
@@ -484,12 +478,86 @@ func (c *protoClient) collect(ctx context.Context) (*Result, error) {
 		"email":          c.in.Email,
 		"captured_at":    time.Now().UTC().Format(time.RFC3339),
 		"cookies":        cookieList,
-		"terms_accepted": c.acceptTermsProto(ctx),
+		"terms_accepted": terms,
 	}
-	if info := c.accountInfo(ctx); info != nil {
+	if info != nil {
 		auth["account"] = info
 	}
 	return &Result{AuthJSON: auth}, nil
+}
+
+// cookieNames 列出某个站点 jar 里现有的 Cookie 名（小写），用于报错。
+func (c *protoClient) cookieNames(base string) []string {
+	u, err := url.Parse(base)
+	if err != nil {
+		return nil
+	}
+	cks := c.cli.GetCookies(u)
+	names := make([]string, 0, len(cks))
+	for _, ck := range cks {
+		names = append(names, strings.ToLower(ck.Name))
+	}
+	return names
+}
+
+// exportCookies 汇总会话里所有 BytePlus 站点的 Cookie。tls-client 的 jar 按主机的后两
+// 级归桶：console.byteplus.com 与 ai.byteplus.com 同在 byteplus.com 桶，lumi-api（四级
+// 域名）单独一桶，所以两边都要读；同名只留一份，console 侧优先（lumi-api 桶里有一份
+// syncLuminaCookies 复制过去的副本）。
+func (c *protoClient) exportCookies() []map[string]any {
+	now := time.Now()
+	out := make([]map[string]any, 0, 16)
+	seen := map[string]bool{}
+	for _, base := range []string{consoleBase, luminaAPIBase} {
+		u, err := url.Parse(base)
+		if err != nil {
+			continue
+		}
+		for _, ck := range c.cli.GetCookies(u) {
+			key := strings.ToLower(ck.Name)
+			if ck.Name == "" || ck.Value == "" || seen[key] {
+				continue
+			}
+			seen[key] = true
+			out = append(out, exportCookie(ck, u.Hostname(), now))
+		}
+	}
+	return out
+}
+
+// exportCookie 把 jar 里的 Cookie 转成导出结构。domain 取 Set-Cookie 里的真实值：没带
+// Domain 的是 host-only（如 console 独有的 connect.sid / s_v_web_id），记成所属主机；
+// 带 Domain 的统一成 .byteplus.com 形式。BytePlus 只用 Max-Age 不发 Expires，导出的
+// 到期时间按采集时刻折算，否则全是零值。
+func exportCookie(ck *http.Cookie, host string, now time.Time) map[string]any {
+	domain := ck.Domain
+	hostOnly := domain == ""
+	if hostOnly {
+		domain = host
+	} else if !strings.HasPrefix(domain, ".") {
+		domain = "." + domain
+	}
+	var expires int64
+	switch {
+	case ck.MaxAge > 0:
+		expires = now.Add(time.Duration(ck.MaxAge) * time.Second).Unix()
+	case !ck.Expires.IsZero():
+		expires = ck.Expires.Unix()
+	}
+	path := ck.Path
+	if path == "" {
+		path = "/"
+	}
+	return map[string]any{
+		"name":     ck.Name,
+		"value":    ck.Value,
+		"domain":   domain,
+		"path":     path,
+		"expires":  expires,
+		"hostOnly": hostOnly,
+		"httpOnly": ck.HttpOnly,
+		"secure":   ck.Secure,
+	}
 }
 
 // acceptTermsProto 直接调 Lumina 的 flag 接口同意使用条款（对应首登弹窗的两个勾选框）。

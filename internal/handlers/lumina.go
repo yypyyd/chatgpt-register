@@ -178,13 +178,12 @@ func (h *Handler) LuminaShot(c *gin.Context) {
 	c.Data(http.StatusOK, "image/png", reg.Shot)
 }
 
-// LuminaDownload 导出选中 Lumina 账号的站点 Cookie（含 digest/AccountID 会话 cookie），
-// 仅对已注册且有会话数据的记录开放。
+// LuminaDownload 导出选中 Lumina 账号给 2API，仅对已注册且有会话数据的记录开放。
 // 请求体：{ "ids": [1,2,3], "format": "string|json|array", "unshipped_only": false }。
 // unshipped_only=true 时忽略 ids，导出全部已注册且未出库的账号。
 //   - string：Cookie 字符串 k=v; k=v; ...（单账号 .txt，多账号 .zip）
-//   - json  ：单个 Lumina 的 Cookie JSON 对象（单账号 .json，多账号 .zip）
-//   - array ：多个 Lumina 批量的 Cookie 数组，始终单个 .json 文件
+//   - json  ：单个账号的 {email, password, cookie_string}（单账号 .json，多账号 .zip）
+//   - array ：多个账号的 {email, password, cookie_string} 数组，始终单个 .json 文件
 func (h *Handler) LuminaDownload(c *gin.Context) {
 	var in struct {
 		IDs           []uint `json:"ids"`
@@ -318,40 +317,14 @@ func luminaCookieString(authData string) string {
 	return strings.Join(parts, "; ")
 }
 
-// luminaExportObject 构造单个 Lumina 账号的导出对象（Cookie JSON 对象 / 数组元素）。
+// luminaExportObject 构造单个 Lumina 账号的导出对象（JSON 对象 / 数组元素）。
+// 2API 只认这三个字段：email 是登录账号，password 供其到期时自行重登续期，
+// cookie_string 是登录成功后的完整 Cookie（含 csrfToken / digest / AccountID）；
+// 到期时间、AccountID、账号资料等它都直接从 Cookie 里读，不要额外带。
 func luminaExportObject(r models.LuminaRegistration) map[string]any {
-	var auth map[string]any
-	_ = json.Unmarshal([]byte(r.AuthData), &auth)
-
-	cookies := luminaCookies(r.AuthData)
-	cookieMap := map[string]string{}
-	for _, ck := range cookies {
-		name, _ := ck["name"].(string)
-		if strings.TrimSpace(name) == "" {
-			continue
-		}
-		value, _ := ck["value"].(string)
-		cookieMap[name] = value
-	}
-	obj := map[string]any{
+	return map[string]any{
 		"email":         r.Email,
-		"platform":      "lumina",
+		"password":      r.Password,
 		"cookie_string": luminaCookieString(r.AuthData),
-		"cookies_map":   cookieMap,
-		"cookies":       cookies,
 	}
-	if v, ok := auth["captured_at"]; ok {
-		obj["captured_at"] = v
-	}
-	if v, ok := auth["storage"]; ok {
-		obj["storage"] = v
-	}
-	// 账号元信息（user_id / 租户 / 到期 / 额度 / 套餐有效期），供取号方直接映射展示。
-	if v, ok := auth["account"]; ok {
-		obj["account"] = v
-	}
-	if v, ok := auth["terms_accepted"]; ok {
-		obj["terms_accepted"] = v
-	}
-	return obj
 }
