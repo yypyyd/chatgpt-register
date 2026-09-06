@@ -10,6 +10,7 @@ import (
 	"time"
 	"unicode"
 
+	"chatgpt-register/internal/codexreg"
 	"chatgpt-register/internal/models"
 
 	"github.com/gin-gonic/gin"
@@ -94,6 +95,44 @@ func cpaFileName(email string) string {
 		safe = "account"
 	}
 	return "codex-" + safe + ".json"
+}
+
+func webSessionFileName(email string) string {
+	return strings.TrimSuffix(cpaFileName(email), ".json") + "-web-session.json"
+}
+
+// buildWebSession exports only the browser-session material needed to restore
+// chatgpt.com. Cookie values are intentionally available only through the
+// authenticated download endpoint; list and log endpoints never expose them.
+func buildWebSession(authData, email string) (map[string]any, bool) {
+	var parsed map[string]any
+	if json.Unmarshal([]byte(authData), &parsed) != nil {
+		return nil, false
+	}
+	cookies, err := codexreg.WebCookiesFromAuthData(authData)
+	if err != nil || len(cookies) == 0 {
+		return nil, false
+	}
+	str := func(k string) string { s, _ := parsed[k].(string); return s }
+	em := str("email")
+	if em == "" {
+		em = email
+	}
+	return map[string]any{
+		"format":               "chatgpt_web_session_v1",
+		"url":                  "https://chatgpt.com/",
+		"email":                em,
+		"user_agent":           str("user_agent"),
+		"screen":               parsed["screen"],
+		"registered_ip":        str("registered_ip"),
+		"registered_country":   str("registered_country"),
+		"registered_timezone":  str("registered_timezone"),
+		"registered_locale":    str("registered_locale"),
+		"registered_languages": str("registered_languages"),
+		"proxy":                str("proxy"),
+		"cookie_header":        codexreg.WebCookieHeader(cookies),
+		"cookies":              cookies,
+	}, true
 }
 
 // buildCredentials 把库里存的 auth.json（agent_identity 结构）映射成导出用的 credentials。
@@ -218,8 +257,8 @@ func (h *Handler) SetShipped(c *gin.Context) {
 }
 
 // Download 下载选中账号。默认导出 Sub2API 聚合 JSON；format=cpa 时
-// 按 CLIProxyAPI auth-dir 格式导出，单账号为 JSON，多账号为 ZIP。
-// 请求体：{ "ids": [1,2,3], "format": "sub2api|cpa", "unshipped_only": false }。
+// 按 CLIProxyAPI auth-dir 格式导出；format=web 时导出可恢复的 ChatGPT 网页 Cookie 会话。
+// 请求体：{ "ids": [1,2,3], "format": "sub2api|cpa|web", "unshipped_only": false }。
 // unshipped_only=true 时忽略 ids，导出全部已注册且未出库的账号。
 func (h *Handler) Download(c *gin.Context) {
 	var in struct {
@@ -238,7 +277,7 @@ func (h *Handler) Download(c *gin.Context) {
 	if in.Format == "" {
 		in.Format = "sub2api"
 	}
-	if in.Format != "sub2api" && in.Format != "cpa" {
+	if in.Format != "sub2api" && in.Format != "cpa" && in.Format != "web" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "不支持的导出格式"})
 		return
 	}
@@ -270,6 +309,14 @@ func (h *Handler) Download(c *gin.Context) {
 			}
 		}
 	}
+	if in.Format == "web" {
+		for _, r := range regs {
+			if _, ok := buildWebSession(r.AuthData, r.Email); !ok {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "账号 " + r.Email + " 是旧版 token-only 记录，没有可恢复的网页 Cookie"})
+				return
+			}
+		}
+	}
 
 	ids := make([]uint, 0, len(regs))
 	for _, r := range regs {
@@ -281,6 +328,10 @@ func (h *Handler) Download(c *gin.Context) {
 
 	if in.Format == "cpa" {
 		h.downloadCPA(c, regs)
+		return
+	}
+	if in.Format == "web" {
+		h.downloadWebSessions(c, regs)
 		return
 	}
 
@@ -302,6 +353,40 @@ func (h *Handler) Download(c *gin.Context) {
 	out, _ := json.MarshalIndent(bundle, "", "  ")
 	c.Header("Content-Disposition", "attachment; filename=auth.json")
 	c.Data(http.StatusOK, "application/json; charset=utf-8", out)
+}
+
+func (h *Handler) downloadWebSessions(c *gin.Context, regs []models.Registration) {
+	if len(regs) == 1 {
+		payload, _ := buildWebSession(regs[0].AuthData, regs[0].Email)
+		out, _ := json.MarshalIndent(payload, "", "  ")
+		c.Header("Content-Disposition", `attachment; filename="`+webSessionFileName(regs[0].Email)+`"`)
+		c.Data(http.StatusOK, "application/json; charset=utf-8", out)
+		return
+	}
+
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for _, r := range regs {
+		entry, err := zw.Create(webSessionFileName(r.Email))
+		if err != nil {
+			_ = zw.Close()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "创建网页会话压缩包失败"})
+			return
+		}
+		payload, _ := buildWebSession(r.AuthData, r.Email)
+		out, _ := json.MarshalIndent(payload, "", "  ")
+		if _, err = entry.Write(out); err != nil {
+			_ = zw.Close()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "写入网页会话压缩包失败"})
+			return
+		}
+	}
+	if err := zw.Close(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "完成网页会话压缩包失败"})
+		return
+	}
+	c.Header("Content-Disposition", `attachment; filename="chatgpt_web_sessions_`+time.Now().UTC().Format("20060102_150405")+`.zip"`)
+	c.Data(http.StatusOK, "application/zip", buf.Bytes())
 }
 
 func (h *Handler) downloadCPA(c *gin.Context, regs []models.Registration) {

@@ -6,8 +6,23 @@ import (
 	"strconv"
 )
 
-var firstNames = []string{"Alex", "Jamie", "Taylor", "Jordan", "Casey", "Morgan", "Riley", "Avery", "Quinn", "Parker", "Cameron", "Reese", "Skyler", "Drew", "Emerson"}
-var lastNames = []string{"Ray", "Lee", "Cole", "Reed", "Hunt", "Ford", "Shaw", "Gray", "Vance", "Wolfe", "Brooks", "Hayes", "Pierce", "Quinn", "Sloan"}
+// 名字池尽量大一些：池子太小时成千上万个账号只会撞出两百多种姓名组合，本身就是一种批量特征。
+var firstNames = []string{
+	"Alex", "Jamie", "Taylor", "Jordan", "Casey", "Morgan", "Riley", "Avery", "Quinn", "Parker",
+	"Cameron", "Reese", "Skyler", "Drew", "Emerson", "Liam", "Noah", "Oliver", "Ethan", "Lucas",
+	"Mason", "Logan", "James", "Henry", "Owen", "Daniel", "Jack", "Samuel", "Nathan", "Caleb",
+	"Emma", "Olivia", "Ava", "Sophia", "Mia", "Chloe", "Ella", "Grace", "Lily", "Hannah",
+	"Zoe", "Nora", "Leah", "Maya", "Claire", "Julia", "Sarah", "Anna", "Lucy", "Ruby",
+	"Evan", "Adam", "Ryan", "Kyle", "Blake", "Cole", "Dylan", "Aaron", "Luke", "Isaac",
+}
+var lastNames = []string{
+	"Ray", "Lee", "Cole", "Reed", "Hunt", "Ford", "Shaw", "Gray", "Vance", "Wolfe",
+	"Brooks", "Hayes", "Pierce", "Quinn", "Sloan", "Smith", "Johnson", "Brown", "Miller", "Davis",
+	"Wilson", "Moore", "Clark", "Lewis", "Walker", "Hall", "Allen", "Young", "King", "Wright",
+	"Scott", "Green", "Baker", "Adams", "Nelson", "Carter", "Mitchell", "Turner", "Parker", "Collins",
+	"Edwards", "Stewart", "Morris", "Murphy", "Cook", "Rogers", "Morgan", "Cooper", "Peterson", "Bailey",
+	"Bennett", "Foster", "Howard", "Ward", "Cox", "Hughes", "Price", "Bell", "Kelly", "Sanders",
+}
 
 func ri(n int) int {
 	if n <= 0 {

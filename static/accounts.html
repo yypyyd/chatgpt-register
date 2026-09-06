@@ -44,6 +44,7 @@
         <div class="px-select-menu">
           <button type="button" class="px-select-opt" onclick="downloadUnshipped('sub2api')">Sub2API</button>
           <button type="button" class="px-select-opt" onclick="downloadUnshipped('cpa')">CPA</button>
+		  <button type="button" class="px-select-opt" onclick="downloadUnshipped('web')">网页会话</button>
         </div>
       </div>
       <button class="px-btn" onclick="liveCheckAll()">测活</button>
@@ -55,6 +56,7 @@
       <span id="acc-batch-count">已选 0 项</span>
       <button class="px-btn" onclick="downloadSelected('sub2api')">导出 Sub2API</button>
       <button class="px-btn" onclick="downloadSelected('cpa')">导出 CPA</button>
+	  <button class="px-btn" onclick="downloadSelected('web')">导出网页会话</button>
       <button class="px-btn" onclick="liveCheckSelected()">测活所选</button>
       <button class="px-btn danger" onclick="delSelected()">删除所选</button>
       <button class="px-btn ghost" onclick="clearSelection()">取消</button>

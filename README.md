@@ -26,22 +26,22 @@
 
 ## 🤖 无头注册——技术亮点
 
-> 基于 **go-rod + rod/stealth** 驱动真实 Chromium 内核，模拟真人操作全程自动完成注册，OpenAI 无法识别为机器人。
+> 基于 **go-rod** 驱动本机真实 Chrome（new headless），不改浏览器原生指纹，只修正无头标记并对齐出口地区；键盘/鼠标全部走真实输入事件，模拟真人操作全程自动完成注册。
 
 ### 注册全流程（全自动，无需人工）
 
 ```
-启动浏览器（无头/有头可配）
+查出口 IP 归属地 → 按地区决定语言 / 时区
     ↓
-打开 ChatGPT 注册页，注入 Stealth 脚本（绕过 bot 检测）
+启动本机 Chrome（new headless，去自动化参数，随机屏幕规格，真实 UA + Client Hints）
     ↓
-自动填写邮箱 + 随机密码
+打开 ChatGPT 注册页，逐键输入邮箱 + 随机密码，真实鼠标点击提交
     ↓
 实时监听邮箱，自动读取 6 位验证码并填入（最长等待 3 分钟）
     ↓
-完成注册 → 获取 accessToken
+完成注册 → 进入主界面 → 预热：发一条普通对话并等待回复（可关）
     ↓
-保存 ChatGPT accessToken 和账号元数据（不注册 Agent Identity）
+验证真实网页对话，保存登录 Cookie 与 accessToken，并记录注册 UA / 出口 IP / 地区 / 代理（不注册 Agent Identity）
     ↓
 导出 ChatGPT 账号凭据 JSON
     ↓
@@ -52,11 +52,17 @@
 
 | 特性 | 说明 |
 |------|------|
-| **Stealth 反检测** | 注入 rod/stealth 脚本，抹除 `navigator.webdriver` 等浏览器自动化特征，绕过 OpenAI 的机器人识别 |
+| **原生指纹** | 不注入 stealth 脚本、不写死 UA：用本机真实 Chrome 的 UA / WebGL / 插件 / Client Hints，只把无头标记（`HeadlessChrome`）换回正常品牌，避免 "UA 说 Chrome 150、Client Hints 为空、WebGL 是 Mac 显卡" 这类互相矛盾的指纹 |
+| **真人交互** | 键盘逐键 keydown/keyup（Shift 字符带修饰键）、鼠标带轨迹移动后再点击（`isTrusted=true`）、步骤间随机停顿；不用 `insertText` 和 `element.click()` |
+| **屏幕随机化** | 每次注册随机一套常见桌面分辨率，并还原"屏幕 > 窗口 > 视口"的层次，账号之间不共用同一屏幕指纹 |
+| **注册后预热** | 注册成功先在同一浏览器、同一出口 IP 里发一条普通问题并等回复；开启时预热是成功关卡，不能完成网页对话的账号不会进入可用库存 |
+| **网页会话持久化** | 在销毁临时浏览器前保存 ChatGPT/OpenAI 域的完整 Cookie（含 domain/path/httpOnly/secure/expiry），可导出并恢复真正的 `chatgpt.com` 登录会话；access token 仅作为会话派生凭据保存 |
 | **验证码自动读取** | 直接对接邮箱 API（Outlook/Gmail），每 5 秒轮询一次，无需人工复制粘贴 |
-| **IP 与浏览器一致** | 浏览器注册和后续 API 请求走同一个代理出口，保证同 IP 签发 Token，避免风控拦截 |
-| **GeoIP 自动检测** | 注册前检测代理 IP 归属地，自动设置匹配的浏览器语言 / 时区，降低异常风控概率 |
-| **Chromium 自动下载** | 首次运行自动下载匹配版本的 Chromium，无需手动安装 Chrome |
+| **GeoIP 自动对齐** | 注册前检测代理 IP 归属地，自动设置匹配的浏览器语言 / 时区 / 坐标；注册 UA、出口 IP、地区、代理写入 `auth_data`，下游用号时可沿用 |
+| **测活不串号** | 测活为每个账号单独一个浏览器上下文、单独走代理出口，恢复该账号 Cookie 后验证 `/api/auth/session`；不再把 token 塞进无 Cookie 的新浏览器请求 `/backend-api/me` 造成 401 误判 |
+| **共享进程池** | 多个账号共用一个 Chrome 进程、各自独立 BrowserContext（cookie / 代理出口 / 窗口尺寸 / 屏幕 / 语言互相隔离），每号省 150~300MB 内存与 1~3 秒启动，上下文分配约 2ms；进程按时长 / 累计账号数自动退役重启 |
+| **IP 拦截识别** | Cloudflare 整页人机验证、提交邮箱后服务端无响应都识别为「出口 IP 被拦」，自动换住宅 IP 重试，不再当成邮箱失败白等 60 秒进冷却 |
+| **浏览器选择** | 默认优先本机安装的 Chrome/Edge（最新版、真实品牌）；没有则回退到自动下载的 Chromium |
 | **无头模式** | 生产环境开启无头模式，无需显示器，支持服务器 / VPS 部署 |
 | **截图存证** | 注册每个关键步骤自动截图，失败时可直接在管理台查看现场图，快速定位问题 |
 | **并发安全** | 多个注册任务并发执行，每个任务独立浏览器上下文，互不干扰 |
@@ -238,9 +244,13 @@ ADDR=8080 ./chatgpt-register.exe
 | 参数 | 说明 | 建议值 |
 |------|------|--------|
 | 并发数 | 同时注册的账号数量 | 3 ~ 5 |
-| 裂变数量 | 每个邮箱注册的子号数 | 5（即 1母 + 5子 = 6个账号） |
+| 裂变数量 | 每个邮箱注册的子号数 | 5（即 1母 + 5子 = 6个账号）；`+别名` 子号与母号天然可被关联，追求存活率时建议调低甚至设为 0 |
 | 无头模式 | 是否隐藏浏览器窗口 | 生产环境建议开启 |
-| 代理池 | 每行一个代理，格式见下方 | 按需配置 |
+| 代理池 | 每行一个代理，格式见下方 | 建议动态住宅代理，每号独立出口 |
+| GPT 注册后预热对话 | 注册成功后先发一条普通对话再取 token（`chatgpt_warmup`） | 开启 |
+| GPT 注册浏览器 | 留空优先本机 Chrome；`rod` 用内置 Chromium；或填路径（`chatgpt_browser_bin`） | 留空 |
+| GPT 共享浏览器进程池 | 多账号共用 Chrome 进程、独立上下文（`chatgpt_browser_pool`） | 开启 |
+| 每进程账号数 | 一个 Chrome 进程同时承载的账号数（`chatgpt_contexts_per_host`） | 4；16 核 16G 机器并发 8 时可设 4~8 |
 
 **代理格式：**
 ```
@@ -265,7 +275,7 @@ http://ip:port
 - 进入「GPT 注册」点击任意账号可查看**实时执行日志**（步骤级别，精确到秒）
 - 点击「截图」可查看注册过程中的**浏览器截图**，方便排查失败原因
 - 支持按状态筛选：待注册 / 注册中 / 已注册 / 注册失败
-- 支持直接导出 Sub2API 聚合 JSON，或导出 CLIProxyAPI（CPA）auth-dir 格式；CPA 批量导出为 ZIP，解压后每个账号对应一个 `codex-*.json`
+- 支持导出 ChatGPT 网页 Cookie 会话、Sub2API 聚合 JSON，或 CLIProxyAPI（CPA）auth-dir 格式；网页会话和 CPA 多账号导出均为 ZIP
 
 ---
 
@@ -280,8 +290,19 @@ http://ip:port
 **Q：不配置代理可以用吗？**
 > A：可以，留空即直连。但大量并发注册建议配置代理池，避免 IP 被限流。
 
+**Q：能不能做成纯协议注册（不开浏览器）？**
+> A：ChatGPT 注册链路（`auth.openai.com`）每一步都要带 OpenAI Sentinel 头：VM 级混淆 JS 产出的浏览器指纹载荷 + PoW + Turnstile（有时叠 Arkose），脚本几周换一版；外层 Cloudflare 还校验 TLS/HTTP2 指纹 ↔ UA ↔ Client Hints ↔ Sentinel 载荷是否自洽。纯协议 = 常态化跟版，且协议号在 OpenAI 那边的画像（tls-client 指纹 + 零前端遥测）正是批量封号的画像。本项目选的路线是「真实 Chrome + 共享进程池」：一个进程带多个隔离上下文，资源接近协议方案，指纹和行为仍是真人级。Grok 之所以能纯协议，是因为 x.ai 只有一层 Turnstile。
+
+**Q：注册出来的号一用（生图）就被封 / 还没用就死了？**
+> A：封号几乎都是"关联"问题，而不是单个号的行为。请逐项对照：
+> 1. **注册指纹**：本版本已改为本机真实 Chrome + 真实 Client Hints + 真人输入事件。
+> 2. **测活**：旧版测活用无 Cookie 的新浏览器请求 `/backend-api/me`，会制造假 401；本版本恢复账号 Cookie、注册 UA、屏幕、时区和原粘性代理 session，并由网页自身验证 `/api/auth/session`。
+> 3. **用号方式**：`auth_data` 里带有注册时的 `user_agent` / `screen` / `registered_ip` / `registered_country` / `registered_timezone` / `proxy`。下游网关应沿用同一地区和代理线路，不要用一台服务器的固定 IP 集中调用大量账号。
+> 4. **裂变子号**：`a+001@…`、`a+002@…` 与母号是同一个邮箱，OpenAI 一眼就能关联；母号被封时子号大概率跟着走。看重存活率就把裂变数量调低。
+> 5. **节奏**：免费号有很低的生图配额，新号第一天就高频生图会立刻触发风控；建议养号（先正常聊几轮）、分散使用时间、单号限速。
+
 **Q：账号导出格式是什么？**
-> A：在「GPT 注册」勾选账号后，可直接选择“导出 Sub2API”或“导出 CPA”。Sub2API 使用单个聚合 JSON；CPA 单账号导出 JSON，多账号导出 ZIP，解压后放入 CLIProxyAPI 的 `auth-dir`。当前网页会话凭据没有 `refresh_token`，Token 到期后 CPA 无法自动续期。
+> A：在「GPT 注册」勾选账号后可选择“导出网页会话”“导出 Sub2API”或“导出 CPA”。网页会话包含可恢复到 `chatgpt.com` 的 Cookie、Cookie Header、注册 UA、屏幕、时区和代理信息；单账号为 JSON，多账号为 ZIP。2026-09-06 以前的旧记录只保存了 access token，没有 Cookie，需重新登录或重新注册才能恢复网页会话。用于网页生图时请使用网页会话导出，并恢复结构化 Cookie 与注册现场，不要把 access token 直接请求 `api.openai.com/v1`。
 
 ---
 

@@ -5,11 +5,14 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	"chatgpt-register/internal/codexreg"
 	"chatgpt-register/internal/livecheck"
 	"chatgpt-register/internal/models"
+	"chatgpt-register/internal/proxyutil"
 
 	"github.com/gin-gonic/gin"
 )
@@ -132,18 +135,39 @@ func (h *Handler) LiveCheckStart(c *gin.Context) {
 		return
 	}
 	runner.setTotal(len(items))
+	opt := h.cgLiveOptions()
 	go func() {
 		defer runner.finish("")
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+		ctx, cancel := context.WithTimeout(context.Background(), livecheck.EstimateChatGPTDuration(len(items)))
 		defer cancel()
 		livecheck.CheckChatGPT(ctx, items, func(chunk map[uint]string) {
 			for id, st := range chunk {
 				h.applyCGAlive(id, st)
 				runner.tally(st)
 			}
-		})
+		}, opt)
 	}()
 	c.JSON(http.StatusOK, gin.H{"ok": true, "total": len(items)})
+}
+
+// cgLiveOptions 测活与注册走同一套代理池 / 浏览器选择：每个账号独立出口，避免所有账号从服务器同一 IP 被探测。
+func (h *Handler) cgLiveOptions() livecheck.CGOptions {
+	opt := livecheck.CGOptions{
+		BrowserBin: strings.TrimSpace(h.settingValue("chatgpt_browser_bin")),
+		UsePool:    h.settingValue("chatgpt_browser_pool") != "0",
+	}
+	if h.settingValue("proxy_enabled") != "0" {
+		opt.Proxies = proxyutil.List(h.settingValue("proxy_list"))
+	}
+	return opt
+}
+
+func (h *Handler) settingValue(key string) string {
+	var s models.Setting
+	if err := h.DB.Where("key = ?", key).First(&s).Error; err != nil {
+		return ""
+	}
+	return s.Value
 }
 
 func (h *Handler) LiveCheckStatus(c *gin.Context) {
@@ -159,7 +183,7 @@ func (h *Handler) LiveCheckOne(c *gin.Context) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
-	res := livecheck.CheckChatGPT(ctx, []livecheck.CGItem{item}, nil)
+	res := livecheck.CheckChatGPT(ctx, []livecheck.CGItem{item}, nil, h.cgLiveOptions())
 	st := res[item.ID]
 	if st == "" {
 		st = livecheck.StatusUnknown
@@ -188,8 +212,8 @@ func (h *Handler) loadCGItems(ids []uint) ([]livecheck.CGItem, error) {
 	}
 	items := make([]livecheck.CGItem, 0, len(regs))
 	for _, r := range regs {
-		if tok := cgAccessToken(r.AuthData); tok != "" {
-			items = append(items, livecheck.CGItem{ID: r.ID, Token: tok})
+		if it, ok := cgItemFromAuth(r.ID, r.AuthData); ok {
+			items = append(items, it)
 		}
 	}
 	return items, nil
@@ -200,20 +224,21 @@ func (h *Handler) loadCGItem(id uint) (livecheck.CGItem, bool) {
 	if err := h.DB.Select("id", "auth_data").First(&r, id).Error; err != nil {
 		return livecheck.CGItem{}, false
 	}
-	tok := cgAccessToken(r.AuthData)
-	if tok == "" {
-		return livecheck.CGItem{}, false
-	}
-	return livecheck.CGItem{ID: r.ID, Token: tok}, true
+	return cgItemFromAuth(r.ID, r.AuthData)
 }
 
-func cgAccessToken(authData string) string {
-	var m map[string]any
-	if json.Unmarshal([]byte(authData), &m) != nil {
-		return ""
+// cgItemFromAuth 从 auth.json 取网页 Cookie、旧 access_token 与注册时代理。
+// 旧记录只有 token 时仍返回 item，测活层会标 unknown，避免继续误判成 dead。
+func cgItemFromAuth(id uint, authData string) (livecheck.CGItem, bool) {
+	session, err := codexreg.WebSessionFromAuthData(authData)
+	if err != nil || (session.AccessToken == "" && len(session.Cookies) == 0) {
+		return livecheck.CGItem{}, false
 	}
-	v, _ := m["access_token"].(string)
-	return v
+	return livecheck.CGItem{
+		ID: id, Token: session.AccessToken, Cookies: session.Cookies, Proxy: session.Proxy,
+		UserAgent: session.UserAgent, Screen: session.Screen, Timezone: session.Timezone,
+		Locale: session.Locale, Languages: session.Languages,
+	}, true
 }
 
 /* ===================== Grok ===================== */

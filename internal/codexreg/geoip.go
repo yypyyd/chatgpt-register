@@ -41,7 +41,8 @@ func lookupGeoIPViaRequest(in Input) *geoInfo {
 		}
 		transport.Proxy = http.ProxyURL(pu)
 	}
-	client := &http.Client{Timeout: 30 * time.Second, Transport: transport}
+	// 只是拿地区做语言/时区对齐，拿不到就回退 en-US；别让它吃掉注册预算。
+	client := &http.Client{Timeout: 12 * time.Second, Transport: transport}
 
 	req, err := http.NewRequest(http.MethodGet,
 		"http://ip-api.com/json/?fields=status,message,country,countryCode,region,city,timezone,lat,lon,query", nil)
@@ -49,8 +50,8 @@ func lookupGeoIPViaRequest(in Input) *geoInfo {
 		in.logf("⚠️ GeoIP 查询失败，跳过地理位置对齐: %v", err)
 		return nil
 	}
-	// 带上与浏览器一致的 UA/语言，避免被 ip-api 以空 UA 拒绝
-	req.Header.Set("User-Agent", userAgent)
+	// 带上正常浏览器的 UA/语言，避免被 ip-api 以空 UA 拒绝
+	req.Header.Set("User-Agent", geoLookupUserAgent)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 
@@ -76,7 +77,8 @@ func lookupGeoIPViaRequest(in Input) *geoInfo {
 	return &g
 }
 
-// applyGeo 把地理信息映射到浏览器：时区、经纬度、locale、Accept-Language。
+// applyGeo 把地理信息映射到浏览器：时区、经纬度、locale。
+// UA / Accept-Language 已在 Session.NewPage 里按同一份地理信息注入。
 func applyGeo(page *rod.Page, g *geoInfo, in Input) {
 	if g.Timezone != "" {
 		_ = (proto.EmulationSetTimezoneOverride{TimezoneID: g.Timezone}).Call(page)
@@ -84,64 +86,48 @@ func applyGeo(page *rod.Page, g *geoInfo, in Input) {
 	lat, lon, acc := g.Lat, g.Lon, 50.0
 	_ = (proto.EmulationSetGeolocationOverride{Latitude: &lat, Longitude: &lon, Accuracy: &acc}).Call(page)
 
-	locale, acceptLang := localeForCountry(g.CountryCode)
+	locale, languages := localeForCountry(g.CountryCode)
 	_ = (proto.EmulationSetLocaleOverride{Locale: locale}).Call(page)
-	// UA/AcceptLanguage 已在创建页面时按地理信息一次性注入，这里不再重复设置。
-	in.logf("✅ 已对齐时区/坐标/语言: tz=%s locale=%s lang=%s", g.Timezone, locale, acceptLang)
+	in.logf("✅ 已对齐时区/坐标/语言: tz=%s locale=%s lang=%s", g.Timezone, locale, languages)
 }
 
-// localeForCountry 按国家码给出 ICU locale 与 Accept-Language，未知国家回退 en-US。
-func localeForCountry(cc string) (locale, acceptLang string) {
+// localeForCountry 按国家码给出 ICU locale 与语言列表，未知国家回退 en-US。
+// 语言列表不带 q 值：CDP 的 acceptLanguage 只接受语言标签列表，Chrome 自己生成
+// Accept-Language 的 q 值与 navigator.languages；带 q 值传进去会得到
+// "en-US,en;q=0.9;q=0.9" 这种畸形请求头。
+func localeForCountry(cc string) (locale, languages string) {
 	switch strings.ToUpper(strings.TrimSpace(cc)) {
 	case "US":
-		return "en_US", "en-US,en;q=0.9"
+		return "en_US", "en-US,en"
 	case "GB", "UK":
-		return "en_GB", "en-GB,en;q=0.9"
+		return "en_GB", "en-GB,en"
 	case "CA":
-		return "en_CA", "en-CA,en;q=0.9,fr-CA;q=0.8"
+		return "en_CA", "en-CA,en,fr-CA"
 	case "AU":
-		return "en_AU", "en-AU,en;q=0.9"
+		return "en_AU", "en-AU,en"
 	case "DE":
-		return "de_DE", "de-DE,de;q=0.9,en;q=0.8"
+		return "de_DE", "de-DE,de,en"
 	case "FR":
-		return "fr_FR", "fr-FR,fr;q=0.9,en;q=0.8"
+		return "fr_FR", "fr-FR,fr,en"
 	case "ES":
-		return "es_ES", "es-ES,es;q=0.9,en;q=0.8"
+		return "es_ES", "es-ES,es,en"
 	case "IT":
-		return "it_IT", "it-IT,it;q=0.9,en;q=0.8"
+		return "it_IT", "it-IT,it,en"
 	case "NL":
-		return "nl_NL", "nl-NL,nl;q=0.9,en;q=0.8"
+		return "nl_NL", "nl-NL,nl,en"
 	case "JP":
-		return "ja_JP", "ja-JP,ja;q=0.9,en;q=0.8"
+		return "ja_JP", "ja-JP,ja,en"
 	case "KR":
-		return "ko_KR", "ko-KR,ko;q=0.9,en;q=0.8"
+		return "ko_KR", "ko-KR,ko,en"
 	case "BR":
-		return "pt_BR", "pt-BR,pt;q=0.9,en;q=0.8"
+		return "pt_BR", "pt-BR,pt,en"
 	case "RU":
-		return "ru_RU", "ru-RU,ru;q=0.9,en;q=0.8"
+		return "ru_RU", "ru-RU,ru,en"
 	case "IN":
-		return "en_IN", "en-IN,en;q=0.9,hi;q=0.8"
+		return "en_IN", "en-IN,en,hi"
 	case "SG":
-		return "en_SG", "en-SG,en;q=0.9"
+		return "en_SG", "en-SG,en"
 	default:
-		return "en_US", "en-US,en;q=0.9"
+		return "en_US", "en-US,en"
 	}
-}
-
-// blockResources 拦截并放弃图片/字体/媒体请求，降低带宽占用与被检测面。
-func blockResources(page *rod.Page, in Input) func() {
-	router := page.HijackRequests()
-	router.MustAdd("*", func(ctx *rod.Hijack) {
-		switch ctx.Request.Type() {
-		case proto.NetworkResourceTypeImage,
-			proto.NetworkResourceTypeMedia,
-			proto.NetworkResourceTypeFont:
-			ctx.Response.Fail(proto.NetworkErrorReasonBlockedByClient)
-		default:
-			ctx.ContinueRequest(&proto.FetchContinueRequest{})
-		}
-	})
-	go router.Run()
-	in.logf("🚫 已开启资源屏蔽: image/media/font")
-	return router.MustStop
 }

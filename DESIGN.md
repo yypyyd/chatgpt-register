@@ -24,11 +24,17 @@
 
 IMAP 读取固定使用 TLS 993 和最低 TLS 1.2，读取 `INBOX`，并通过 `LIST` 的 `\Junk` 属性发现垃圾邮件目录（兼容 `Junk` / `Junk Email`）。列表只取信封头，正文按需通过 UID FETCH 获取；对外 ID 使用 `imap:<base64-folder>:<uid>` 的不透明格式，MIME 正文限制为单个文本部分最多 8 MiB。访问令牌连同协议类型缓存在内存中，不写入数据库或日志。
 
-### 双格式凭据导出
+### 三格式凭据导出
 
-下载接口通过显式 `format` 参数区分 Sub2API 与 CLIProxyAPI（CPA），缺省保持原有 Sub2API 格式以兼容旧客户端。CPA 使用其 auth-dir 所需的扁平 `type=codex` JSON，并从 access token 的 JWT `exp` 生成 RFC3339 `expired`；单账号直接返回 JSON，多账号返回 ZIP 且每个账号独立成文件。文件名会过滤路径分隔符，避免压缩包路径穿越。
+下载接口通过显式 `format` 参数区分 ChatGPT 网页会话（`web`）、Sub2API 与 CLIProxyAPI（CPA），缺省保持原有 Sub2API 格式以兼容旧客户端。网页会话导出包含 ChatGPT/OpenAI 域 Cookie、Cookie Header、注册 UA 和地区，单账号直接返回 JSON，多账号返回 ZIP；CPA 使用其 auth-dir 所需的扁平 `type=codex` JSON，并从 access token 的 JWT `exp` 生成 RFC3339 `expired`。文件名统一过滤路径分隔符，避免压缩包路径穿越。
 
-注册流程只获得 ChatGPT 网页会话 access token，因此 CPA 导出的 `refresh_token` 和 `id_token` 为空。导出格式转换不改变上游授权范围，也不能解决账号本身对 Codex Responses 的 401；凭据过期后不能由 CPA 自动刷新。
+注册流程只获得 ChatGPT 网页会话 access token，因此 CPA 导出的 `refresh_token` 和 `id_token` 为空。网页生图使用结构化 Cookie 恢复 ChatGPT 会话，不把 access token 直接当作 `api.openai.com/v1` 的 API 凭据。
+
+### ChatGPT 网页会话持久化与测活
+
+ChatGPT 登录态的边界是浏览器 Cookie，会话接口返回的 access token 只是短期派生凭据。注册结束、销毁临时 BrowserContext 前，系统保存 ChatGPT/OpenAI 域 Cookie 的 name/value/domain/path/expiry/httpOnly/secure/sameSite 元数据到 `auth_data.cookies`。开启预热时，真实网页对话必须完成，否则注册失败，不允许只拿到 token 的账号进入库存。
+
+测活创建隔离浏览器上下文，恢复 Cookie、注册 UA、屏幕、时区、语言和原粘性代理 session，再由页面带 `credentials=include` 请求 `/api/auth/session`：HTTP 200 且返回 access token 才是 alive，明确 401 是 dead，Cloudflare 403、限流、网络错误为 unknown。旧版只有 access token 的记录无法重建原网页会话，一律 unknown，不再调用 `/backend-api/me` 制造假 401。
 
 ### 独立 Adobe 注册（Firefly 免费额度）
 
@@ -56,11 +62,53 @@ Adobe 注册与 ChatGPT、Grok 完全隔离：独立数据表 `adobe_registratio
 - **授权边界**：重新认证和全部删除接口全部位于现有 `/api` 鉴权组内，未登录请求不能触发后台任务或删除数据。
 - **破坏性操作**：前端使用两次确认降低误触风险；账户生产任务运行时，后端以 `409 Conflict` 拒绝全部删除。
 - **敏感信息**：后台调度日志只记录任务 ID 和数据库错误，不输出邮箱密码、refresh token 或 access token。
+- **ChatGPT 会话秘密**：Cookie value 与 access token 都只存在数据库 `auth_data` 和受鉴权下载响应中；列表、日志、测活状态接口不返回明文。网页导出不附带代理密码或数据库中的账户密码。
 - **IMAP 安全边界**：服务器地址固定为 `outlook.office365.com:993`，启用证书校验和 TLS 1.2 下限，避免用户输入形成 SSRF；XOAUTH2 响应和服务器认证挑战均不写日志。
 - **页面渲染**：现有列表使用模板字符串生成静态结构，来自 API 的文本字段继续统一经过 `esc()` 转义。本次没有新增未经转义的动态 HTML。
 - **已知风险**：管理员凭据被盗后仍可执行不可恢复的全部删除；应依赖强管理员密码、HTTPS 与数据库备份降低风险。
 
 ## 变更历史
+
+### 2026-09-06 - ChatGPT 网页会话持久化、消除 token-only 401 误判
+
+**变更内容**：注册成功后保存 ChatGPT/OpenAI 域完整 Cookie；开启预热时真实网页对话失败即注册失败；测活改为恢复 Cookie 后验证 `/api/auth/session`，旧 token-only 记录标 unknown；下载接口和管理页新增“网页会话”格式，单账号 JSON、多账号 ZIP。
+
+**变更理由**：线上记录只保存 `/api/auth/session` 派生的 access token，随后销毁 BrowserContext；测活又在全新无 Cookie 的浏览器中用 Bearer 请求 `/backend-api/me`。该请求返回 401 只能说明凭据组合不被端点接受，不能证明原网页登录态失效，也无法满足网页生图所需的会话语义。
+
+**影响范围**：`internal/codexreg` 会话采集与成功条件、`internal/livecheck` 与 `handlers/livecheck.go`、`handlers/produce.go`、GPT 账号管理页和文档。旧数据无 Cookie，不能无损补回，只能保持 unknown 或重新登录/注册。
+
+**决策依据**：验证目标是 ChatGPT 网页会话，因此持久化和测活都以 Cookie 会话为边界；access token 导出仅保留兼容，不再作为网页会话存活判据。
+
+### 2026-09-03 - ChatGPT 注册指纹与行为对齐真人、测活去关联
+
+**背景**：注册出来的号在生第一张图前后大量被停用，且常常整批一起死，说明问题主要在"账号被关联"和"注册即被打上自动化标记"，而不是单个号的使用量。对比新旧浏览器指纹后确认旧注册浏览器有多处硬伤：`Network.setUserAgentOverride` 写死 Chrome/150 却没带 `userAgentMetadata`，导致 Client Hints 整体消失（`Sec-CH-UA` 不发、`navigator.userAgentData.brands` 为空）；`AcceptLanguage` 传了带 q 值的字符串，发出去的请求头是畸形的 `en-US,en;q=0.9;q=0.9`；rod 默认套 "Mac Chrome/114 1280x800" 设备模拟，`devicePixelRatio` 变成 1.0000000149；stealth 把 WebGL 伪造成 Mac 的 "Intel Iris OpenGL Engine"、`hardwareConcurrency` 写死 4，与 Win32 UA 互相矛盾；实际运行的是 Chrome 128 旧 headless；所有点击是 `element.click()`（`isTrusted=false`），所有输入是一次性 `insertText`（零按键事件）。测活则用服务器同一 IP、同一个浏览器并发探测所有账号的 token，直接把整批号关联在一起。
+
+**变更内容**：
+- 新增 `codexreg/launch.go`：`LaunchBrowser` / `Session.NewPage`。new headless；删掉 rod 的 Puppeteer 风格默认参数、随机非零调试端口、`NoDefaultDevice`；优先本机安装的 Chrome/Edge（设置 `chatgpt_browser_bin`，`rod` 强制内置 Chromium）；有认证的 http 代理走本地认证桥；UA 取浏览器真实 UA 只去掉 Headless 标记，Client Hints 从一个回环安全上下文页读出真实值、仅把 `HeadlessChrome` 品牌换回 `Google Chrome`/丢弃（Chromium）后原样回写；语言列表不带 q 值；每次随机一套常见分辨率并用 `setDeviceMetricsOverride` 还原"屏幕 > 窗口 > 视口"层次。
+- 新增 `codexreg/human.go`：`HumanClick`（光标缓动轨迹 + 按下/抬起，`isTrusted=true`）、`HumanType`（逐键 keydown/keyup，Shift 字符带修饰键，随机间隔）；`browser.go` 全部改用它们并加入步骤间随机停顿，去掉 stealth。
+- 新增 `codexreg/warmup.go`：注册成功后在同一浏览器发一条普通问题并等回复（设置 `chatgpt_warmup`，默认开），失败只记日志不影响结果。
+- `Result`/`auth_data` 新增 `user_agent`、`screen`、`registered_ip`、`registered_country`、`registered_timezone`、`registered_at`、`warmed_up`、`proxy`，供下游沿用同 UA / 同地区用号；导出格式（Sub2API / CPA）不变。
+- `livecheck.CheckChatGPT` 改为每个账号独立起一个与注册同指纹的浏览器、独立代理出口（优先沿用 `auth_data.proxy` 的线路，BestGo 每号换 session），逐个探测并错开间隔；`handlers` 按账号数放大超时。删除 `livecheck/browser.go`。
+- 姓名池从 15×15 扩到 60×60；设置页新增「GPT 注册后预热对话」「GPT 注册浏览器」。
+
+**影响范围**：`internal/codexreg`、`internal/livecheck`、`internal/handlers/livecheck.go`、`internal/producer/producer.go`、`static/settings.html`、文档。单号注册耗时增加约 30~90 秒（真人节奏 + 预热）；全量测活改为串行、每号约 6~10 秒。Grok / Adobe / Leonardo 等其它平台不受影响。仍无法在本项目内解决的风险：`+别名` 裂变子号与母号的天然关联，以及下游网关用固定服务器 IP、无浏览器指纹批量调用 backend-api 的使用方式。
+
+### 2026-09-03 - ChatGPT 共享浏览器进程池、IP 拦截识别、线上实测
+
+**背景**：用户要求"全协议 + 存活率"。评估结论：ChatGPT 注册链路每步都要 OpenAI Sentinel（VM 混淆 JS 指纹载荷 + PoW + Turnstile/Arkose），脚本几周换版，外层 Cloudflare 还校验 TLS/HTTP2 ↔ UA ↔ Client Hints ↔ Sentinel 自洽性；纯协议既是常态化跟版，其产出账号的画像（tls-client 指纹 + 零前端遥测）又正是批量封号的画像，与"存活率"目标相悖（Grok 能纯协议是因为 x.ai 只有一层 Turnstile）。用户真实诉求是资源与速度，改为在真实 Chrome 路线上做"共享进程池"。
+
+同时巡检线上库（457 已注册 / 176 失败）：9-02 晚并发 7、`proxy_enabled=0` 直连机房 IP（Arosscloud AS400619，`hosting=true`）时 168 个失败全是 `context deadline exceeded`，截图两类：Cloudflare「Verify you are human」整页拦截、提交邮箱后按钮永远转圈——都是出口 IP 被拦，旧代码却按"邮箱失败"白等 60 秒再进 30 分钟冷却。
+
+**变更内容**：
+- `codexreg/launch.go` 拆出 `host`（Chrome 进程：真实 UA / Client Hints，进程级属性）；新增 `codexreg/pool.go`：`Pool.Acquire` 用 `Target.createBrowserContext{proxyServer}` 为每个账号建独立上下文（cookie / 缓存 / 代理出口 / 窗口尺寸 `Browser.setWindowBounds` / 屏幕 / 语言 / 时区互不共享），`ContextsPerHost` 控制每进程账号数，进程按 `HostMaxAge` / `HostMaxContexts` 退役、最后一个上下文释放后关闭。有认证的 http 代理在池模式下同样走本地认证桥（进程级 `HandleAuth` 会串号，不支持带账号密码的 socks5）。`Session.Close` 区分独占进程 / 归还上下文。本地 `fptest -mode pool` 验证：同进程两个上下文屏幕不同、cookie 不串、第二个上下文分配 2ms。加 `--force-webrtc-ip-handling-policy=default_public_interface_only` 防 STUN 泄露真实 IP。
+- `codexreg/browser.go`：`Race()+MustDo()` 状态机改为不 panic 的轮询（`pollState` / `pollStateJS`），加 `waitEmailForm`；识别 Cloudflare 整页 / 可见 Turnstile 与"提交后按钮持续处理态无响应"为新错误 `ErrIPBlocked`；按钮未进入处理态则先重提交一次再判定。页面句柄改为 `base`（只绑任务 ctx）+ 每步派生 `Timeout`，不再链式 `CancelTimeout()`——它会 cancel 掉上一步的 ctx，`HumanType` 等保留旧句柄的调用就会 `context canceled`。提交按钮定位改为与语言无关的 `submitButtonJS`（表单内 submit → 唯一主按钮 → 回车），日文界面下不再"未找到提交按钮"。`human.go` 不再用 rod 的 `ScrollIntoView/Focus/SelectAllText`（内含 `WaitStableRAF`，遇到持续动画会等到超时，实测资料页填两个框耗尽 60 秒），改为直接 DOM 调用。
+- `codexreg/warmup.go`：实测新账号第一次发消息会弹「準備が完了しました / You're all set」条款确认层，可能在进入主界面时、也可能在第一次敲键时出现并吞掉发送；改为发送前后都检测（`gateButton`：屏幕中央顶层大按钮，排除顶部 Chat/Work 分段控件）并点掉、被吞则重发；输入框识别用 `findPromptBox`（多套候选选择器 + `elementFromPoint` 确认顶层可点到）；回复判定同时看 assistant 节点 / 停止按钮 / URL 进入 `/c/` / 用户消息。预热失败保存截图。
+- `producer`：按 `chatgpt_browser_pool`（默认开）/ `chatgpt_contexts_per_host`（默认 4）建池、任务结束关池；`ErrIPBlocked` 与 `ErrTermsRejected` 一样换住宅 IP 重试（最多 3 次），耗尽后标 `register_failed` 并提示开代理。GeoIP 查询超时 30s → 12s。`livecheck` 批量时也用池（每号一个上下文）。设置页新增两项。
+- 姓名池等前一条目内容不变。
+
+**验证**：服务器（16C/16G，Chrome 151，BestGo JP 住宅代理）连续 6 次单号端到端注册成功，耗时 82~185 秒（含 20~75 秒预热）；池模式并发 2 号同一进程、各自出口 IP 不同，1m43s / 1m58s 双成功、`warmed=true`，进程用完即关（`hosts=1 active=0`）。第一次 e2e 直连模式复现线上"提交无响应"，现已识别为 `ErrIPBlocked`。
+
+**影响范围**：`internal/codexreg/{launch,pool,browser,human,warmup}.go`、`internal/producer/producer.go`、`internal/livecheck/chatgpt.go`、`internal/handlers/livecheck.go`、`static/settings.html`、文档。线上建议：开启 `proxy_enabled`（直连机房 IP 会被 Cloudflare 拦）、并发 6~8、每进程 4 个上下文；`fission_count` 视存活率需要调低。
 
 ### 2026-08-10 - Adobe 注册不再使用裂变账号
 
@@ -90,11 +138,11 @@ Adobe 注册与 ChatGPT、Grok 完全隔离：独立数据表 `adobe_registratio
 
 ### 2026-08-08 - Grok 注册配置缓存
 
-**变更内容**：`sitekey / Next-Action id / router state tree` 在进程内缓存 20 分钟（`signupConfigTTL`），命中缓存时只做一次 `WarmSignup` 养 cookie + 探 Cloudflare，跳过抓 `_next` JS chunk 找 action id；注册成功后写入缓存，注册未拿到 SSO 或缓存 warm 不过则丢控重抓。Turnstile 令牌签发也提前到取码之前启动，与取码、等码全程重叠。`cmd/groktest` 支持一次传多个配置在同进程内顺序注册，便于验证跨账号复用。
+**变更内容**：`sitekey / Next-Action id / router state tree` 在进程内缓存 20 分钟（`signupConfigTTL`），命中缓存时只做一次 `WarmSignup` 养 cookie + 探 Cloudflare，跳过抓 `_next` JS chunk 找 action id；注册成功后写入缓存，注册未拿到 SSO 或缓存 warm 不过则丢控重抓。Turnstile 令牌签发也提前到取码之前启动，与取码、等码全程重叠。
 
 **变更理由**：这三个值只跟着 x.ai 发版变，每个号重抓要多花 3～22 秒。
 
-**影响范围**：`internal/grokreg/protocol_register.go`、`cmd/groktest/main.go`。实测同进程连续注册：首号 37 秒（抓配置 10 秒），次号 26 秒（复用配置 1 秒）。此时耗时几乎全在 Turnstile 签发（经住宅代理约 23 秒，直连 13 秒），且已完全与收码重叠。
+**影响范围**：`internal/grokreg/protocol_register.go`。实测同进程连续注册：首号 37 秒（抓配置 10 秒），次号 26 秒（复用配置 1 秒）。此时耗时几乎全在 Turnstile 签发（经住宅代理约 23 秒，直连 13 秒），且已完全与收码重叠。
 
 ### 2026-08-08 - Grok 协议注册提速
 

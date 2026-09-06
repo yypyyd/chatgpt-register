@@ -63,6 +63,31 @@
             <span class="suffix">秒</span>
           </div>
         </div>
+        <label class="switch-row">
+          <input id="set-chatgpt-warmup" type="checkbox">
+          <span class="switch-ui"></span>
+	          <span class="switch-label">GPT 注册后预热对话</span>
+	        </label>
+	        <span class="field-hint">注册成功后先在同一浏览器、同一出口 IP 里发一条普通问题再取 token，让账号的首次使用与注册同源（每号多耗时约 20~60 秒，建议开启）</span>
+        <div class="field">
+          <label>GPT 注册浏览器</label>
+          <span class="field-hint">留空 = 优先使用本机安装的 Chrome/Edge（最新版、真实品牌）；填 rod = 使用内置下载的 Chromium 128；也可填浏览器可执行文件完整路径</span>
+          <input id="set-chatgpt-browser-bin" class="px-input" type="text" spellcheck="false" autocomplete="off" placeholder="留空自动选择">
+        </div>
+        <label class="switch-row">
+          <input id="set-chatgpt-browser-pool" type="checkbox">
+          <span class="switch-ui"></span>
+          <span class="switch-label">GPT 共享浏览器进程池</span>
+        </label>
+        <span class="field-hint">多个账号共用一个 Chrome 进程、各自独立上下文（cookie / 代理出口 / 窗口尺寸 / 屏幕互相隔离），每号省 150~300MB 内存与 1~3 秒启动；关闭则每号独占一个进程</span>
+        <div class="field">
+          <label>每进程账号数</label>
+          <span class="field-hint">一个 Chrome 进程同时承载的账号上下文数；再多会互相抢渲染进程与 CPU</span>
+          <div class="input-suffix">
+            <input id="set-chatgpt-contexts-per-host" class="px-input" type="number" min="1" max="16" placeholder="默认 4">
+            <span class="suffix">个</span>
+          </div>
+        </div>
         <div class="settings-foot">
           <button class="px-btn primary" onclick="saveSettings()">保存设置</button>
         </div>
@@ -165,6 +190,10 @@ async function loadSettings() {
   document.getElementById('set-retry-cooldown').value = d.retry_cooldown_min || '30';
   document.getElementById('set-mailbox-interval').value = d.mailbox_interval_min || '5';
   document.getElementById('set-launch-stagger').value = d.launch_stagger_sec === undefined ? '45' : d.launch_stagger_sec;
+  document.getElementById('set-chatgpt-warmup').checked = d.chatgpt_warmup !== '0';
+  document.getElementById('set-chatgpt-browser-bin').value = d.chatgpt_browser_bin || '';
+  document.getElementById('set-chatgpt-browser-pool').checked = d.chatgpt_browser_pool !== '0';
+  document.getElementById('set-chatgpt-contexts-per-host').value = d.chatgpt_contexts_per_host || '4';
   document.getElementById('set-proxy-enabled').checked = d.proxy_enabled === '1';
   document.getElementById('set-proxy-list').value = d.proxy_list || '';
   document.getElementById('set-captcha-enabled').checked = d.captcha_enabled === '1';
@@ -254,6 +283,10 @@ async function saveSettings() {
     retry_cooldown_min: document.getElementById('set-retry-cooldown').value.trim(),
     mailbox_interval_min: document.getElementById('set-mailbox-interval').value.trim(),
     launch_stagger_sec: document.getElementById('set-launch-stagger').value.trim(),
+    chatgpt_warmup: document.getElementById('set-chatgpt-warmup').checked ? '1' : '0',
+    chatgpt_browser_bin: document.getElementById('set-chatgpt-browser-bin').value.trim(),
+    chatgpt_browser_pool: document.getElementById('set-chatgpt-browser-pool').checked ? '1' : '0',
+    chatgpt_contexts_per_host: document.getElementById('set-chatgpt-contexts-per-host').value.trim(),
   };
   const r = await api('/api/settings', {
     method: 'PUT',

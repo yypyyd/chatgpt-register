@@ -63,6 +63,14 @@ type Config struct {
 	RetryCooldown  time.Duration // 失败地址的重试冷却时间
 	// MailboxInterval 同一邮箱两次注册之间的最小间隔，避免验证码邮件互相干扰
 	MailboxInterval time.Duration
+	// Warmup 注册成功后先在同一浏览器里发一条普通对话再取 token（设置 chatgpt_warmup，默认开）。
+	Warmup bool
+	// BrowserBin 注册用浏览器（设置 chatgpt_browser_bin）：空=优先本机 Chrome，rod=强制 rod 下载的 Chromium。
+	BrowserBin string
+	// BrowserPool 共享 Chrome 进程、按账号隔离上下文（设置 chatgpt_browser_pool，默认开）；
+	// ContextsPerHost 每个进程承载的账号数（设置 chatgpt_contexts_per_host，默认 4）。
+	BrowserPool     bool
+	ContextsPerHost int
 }
 
 // Progress 生产进度快照，供 /api/produce/status 展示。
@@ -148,7 +156,24 @@ func (p *Producer) run(ctx context.Context, target int) {
 	}()
 
 	cfg := p.loadConfig()
-	p.logf("开始生产，目标 %d 个账号（每邮箱母号+%d 裂变，并发 %d）", target, cfg.FissionCount, cfg.MaxConcurrency)
+	warm := "开"
+	if !cfg.Warmup {
+		warm = "关"
+	}
+	poolDesc := "独占进程"
+	var pool *codexreg.Pool
+	if cfg.BrowserPool {
+		pool = codexreg.NewPool(codexreg.PoolOptions{
+			Headless:        cfg.Headless,
+			BrowserBin:      cfg.BrowserBin,
+			ContextsPerHost: cfg.ContextsPerHost,
+			Log:             func(f string, a ...any) { p.logf("  [浏览器池] "+f, a...) },
+		})
+		defer pool.Close()
+		poolDesc = fmt.Sprintf("共享进程池（每进程 %d 个账号）", cfg.ContextsPerHost)
+	}
+	p.logf("开始生产，目标 %d 个账号（每邮箱母号+%d 裂变，并发 %d，注册后预热对话=%s，浏览器=%s）",
+		target, cfg.FissionCount, cfg.MaxConcurrency, warm, poolDesc)
 
 	sem := make(chan struct{}, cfg.MaxConcurrency)
 	var wg sync.WaitGroup
@@ -213,7 +238,7 @@ func (p *Producer) run(ctx context.Context, target int) {
 			}()
 			p.updateProgress()
 
-			if err := p.produceOne(ctx, cfg, mb, email, isMother); err != nil {
+			if err := p.produceOne(ctx, cfg, pool, mb, email, isMother); err != nil {
 				if errors.Is(err, codexreg.ErrAccountTaken) {
 					// 账号停用不再重试，也不计为“失败”（属于跳过换号）
 					p.logf("⚠ %s 停用（%v），不再重试，换下一个地址", mask(email), err)
@@ -304,7 +329,7 @@ func (p *Producer) nextJob(cfg Config) (models.Mailbox, string, bool, bool, bool
 }
 
 // produceOne 完整生产一个账号：注册 ChatGPT → 保存账号凭据 → 入库。
-func (p *Producer) produceOne(ctx context.Context, cfg Config, mb models.Mailbox, email string, isMother bool) error {
+func (p *Producer) produceOne(ctx context.Context, cfg Config, pool *codexreg.Pool, mb models.Mailbox, email string, isMother bool) error {
 	password := codexreg.GenPassword(16)
 	note := ""
 	if !isMother {
@@ -335,18 +360,18 @@ func (p *Producer) produceOne(ctx context.Context, cfg Config, mb models.Mailbox
 	}
 
 	// 出口 IP：轮转代理池取一个基础代理。若为 bestgo 住宅代理（可换 IP），
-	// Terms of Use 拒绝时换新住宅 session(=新 IP) 重试，最多 maxTermsAttempts 次；
+	// Terms of Use 拒绝 / Cloudflare 拦截时换新住宅 session(=新 IP) 重试，最多 maxIPAttempts 次；
 	// 直连/固定出口无法换 IP，Terms 拒绝直接标记 rejected，不空转重试。
-	const maxTermsAttempts = 3
+	const maxIPAttempts = 3
 	baseProxy := p.nextProxy(cfg)
 	canRotate := isRotatable(baseProxy)
 	attempts := 1
 	if canRotate {
-		attempts = maxTermsAttempts
+		attempts = maxIPAttempts
 	}
 
 	// 代理隧道瞬断（ERR_TUNNEL_CONNECTION_FAILED 等）换出口重试通常可恢复，
-	// 独立于 Terms 重试计数，最多 maxNetRetries 次。
+	// 独立于换 IP 重试计数，最多 maxNetRetries 次。
 	const maxNetRetries = 2
 	netRetry := 0
 	var res *codexreg.Result
@@ -356,15 +381,18 @@ func (p *Producer) produceOne(ctx context.Context, cfg Config, mb models.Mailbox
 		if canRotate {
 			proxy = rotateBestgoSession(baseProxy) // 每次尝试换新住宅 session = 新出口 IP
 			if attempt > 1 {
-				appendLog(fmt.Sprintf("♻ Terms of Use 拒绝，更换住宅 IP 后第 %d/%d 次重试", attempt, attempts))
+				appendLog(fmt.Sprintf("♻ 更换住宅 IP 后第 %d/%d 次重试（上次：%v）", attempt, attempts, err))
 			}
 		}
 		since := time.Now().Add(-30 * time.Second)
 		in := codexreg.Input{
-			Email:    email,
-			Password: password,
-			Proxy:    proxy,
-			Headless: cfg.Headless,
+			Email:      email,
+			Password:   password,
+			Proxy:      proxy,
+			Headless:   cfg.Headless,
+			Warmup:     cfg.Warmup,
+			BrowserBin: cfg.BrowserBin,
+			Pool:       pool,
 			Log: func(f string, a ...any) {
 				msg := fmt.Sprintf(f, a...)
 				appendLog(msg)
@@ -386,8 +414,10 @@ func (p *Producer) produceOne(ctx context.Context, cfg Config, mb models.Mailbox
 		if err == nil {
 			break
 		}
-		if errors.Is(err, codexreg.ErrTermsRejected) && canRotate && attempt < attempts {
-			continue // 换 IP 再来一次
+		// Terms 拒绝 / IP 被拦都是出口问题，换 IP 再来一次。
+		if (errors.Is(err, codexreg.ErrTermsRejected) || errors.Is(err, codexreg.ErrIPBlocked)) &&
+			canRotate && attempt < attempts && ctx.Err() == nil {
+			continue
 		}
 		if isTransientNetErr(err) && netRetry < maxNetRetries && ctx.Err() == nil {
 			netRetry++
@@ -410,6 +440,14 @@ func (p *Producer) produceOne(ctx context.Context, cfg Config, mb models.Mailbox
 				appendLog("⛔ Terms of Use 拒绝（直连/固定出口无法换 IP），标记为不可注册")
 			}
 			p.setRegistrationStatus(email, "register_rejected", "Terms of Use 拒绝："+err.Error(), logBuf.String())
+			return err
+		case errors.Is(err, codexreg.ErrIPBlocked):
+			if canRotate {
+				appendLog("🛡 多次更换住宅 IP 仍被拦截（Cloudflare / 提交无响应），本轮放弃，稍后重试")
+			} else {
+				appendLog("🛡 出口 IP 被拦截（Cloudflare / 提交无响应）。当前为直连或固定出口，请开启代理池；本轮放弃，稍后重试")
+			}
+			p.setRegistrationFailed(email, "出口 IP 被拦截："+err.Error(), logBuf.String())
 			return err
 		default:
 			appendLog("✗ 失败: " + err.Error())
@@ -686,6 +724,15 @@ func (p *Producer) loadConfig() Config {
 		intervalMin = 0
 	}
 	cfg.MailboxInterval = time.Duration(intervalMin) * time.Minute
+	// 预热默认开，仅显式 "0" 关闭。
+	cfg.Warmup = p.getSetting("chatgpt_warmup") != "0"
+	cfg.BrowserBin = strings.TrimSpace(p.getSetting("chatgpt_browser_bin"))
+	// 浏览器池默认开，仅显式 "0" 关闭（回到每号独占一个 Chrome 进程）。
+	cfg.BrowserPool = p.getSetting("chatgpt_browser_pool") != "0"
+	cfg.ContextsPerHost = atoiDefault(p.getSetting("chatgpt_contexts_per_host"), 4)
+	if cfg.ContextsPerHost < 1 {
+		cfg.ContextsPerHost = 1
+	}
 	// 代理默认开：未设置(空)视为开，仅显式 "0" 才关闭(直连)。可在设置页开关/编辑。
 	if p.getSetting("proxy_enabled") != "0" {
 		cfg.Proxies = proxyutil.List(p.getSetting("proxy_list"))
