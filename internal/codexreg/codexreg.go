@@ -1,8 +1,9 @@
-// Package codexreg 用浏览器自动化注册 ChatGPT 账号并保存可恢复的网页会话。
+// Package codexreg 注册 ChatGPT 账号并保存可恢复的网页会话；默认纯协议，可切回浏览器自动化。
 // Agent Identity 注册不属于当前生产流程。
 //
 // 迁移自独立的 got 命令行工具：
-//   - browser.go  : 打开 chatgpt.com 完成注册（邮箱→验证码→资料），提取 accessToken
+//   - protocol.go : 纯 HTTP（Chrome TLS 指纹）完成注册（邮箱→验证码→资料→OAuth 回调），提取 accessToken
+//   - browser.go  : 浏览器版同一流程，作为协议链路被风控时的回退
 //   - geoip.go    : 代理解析 + 按出口 IP 对齐时区/坐标/语言 + 资源屏蔽
 //   - codex.go    : accessToken 元数据解析
 //
@@ -13,7 +14,10 @@ package codexreg
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
+
+	"github.com/go-rod/rod"
 )
 
 // geoLookupUserAgent 仅用于 Go 侧查询 ip-api 的请求头；浏览器本身使用其真实 UA。
@@ -32,11 +36,19 @@ type Input struct {
 	// Pool 非空时从共享 Chrome 进程池分配独立上下文，而不是为本账号独占启动一个进程。
 	Pool *Pool
 	// Warmup 注册成功后在同一浏览器里先发一条普通对话再取 token，让账号首次使用与注册同源。
+	// 仅浏览器引擎支持；协议引擎忽略。
 	Warmup bool
+	// Engine 注册引擎："protocol"（默认，纯 HTTP，不开浏览器）或 "browser"（rod 驱动 Chrome）。
+	// 其他取值按 protocol 处理。
+	Engine string
 
 	// FetchCode 拉取 ChatGPT 发到邮箱的验证码。由 producer 用 mailfetch 实现。
 	// after 非零时只接受该时刻之后收到的邮件，用于重发验证码后避免抓回旧码。
 	FetchCode func(ctx context.Context, after time.Time) (string, error)
+
+	// PageHook 在注册页创建后、导航前回调一次，供协议探针等调试工具挂 CDP 网络事件。
+	// 生产流程恒为 nil。
+	PageHook func(page *rod.Page)
 
 	// Log 输出进度（可为 nil）。
 	Log func(format string, a ...any)
@@ -80,7 +92,13 @@ func Register(ctx context.Context, in Input) (*Result, error) {
 		in.Password = GenPassword(16)
 	}
 
-	br, err := registerBrowser(ctx, in)
+	var br *browserResult
+	var err error
+	if in.UseBrowser() {
+		br, err = registerBrowser(ctx, in)
+	} else {
+		br, err = registerProtocol(ctx, in)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("ChatGPT 注册失败: %w", err)
 	}
@@ -102,12 +120,26 @@ func Register(ctx context.Context, in Input) (*Result, error) {
 	res.AuthJSON["registered_at"] = time.Now().UTC().Format(time.RFC3339)
 	res.AuthJSON["warmed_up"] = br.Warmed
 	res.AuthJSON["session_type"] = "chatgpt_web"
+	res.AuthJSON["register_engine"] = in.EngineName()
 	res.AuthJSON["cookies"] = br.Cookies
 	if in.Proxy != "" {
 		res.AuthJSON["proxy"] = in.Proxy
 	}
 	in.logf("✅ ChatGPT 注册完成（已跳过 Agent Identity）")
 	return res, nil
+}
+
+// UseBrowser 报告是否走浏览器引擎。
+func (in Input) UseBrowser() bool {
+	return strings.EqualFold(strings.TrimSpace(in.Engine), "browser")
+}
+
+// EngineName 归一化后的引擎名。
+func (in Input) EngineName() string {
+	if in.UseBrowser() {
+		return "browser"
+	}
+	return "protocol"
 }
 
 func buildChatGPTResult(accessToken, fallbackEmail string) (*Result, error) {

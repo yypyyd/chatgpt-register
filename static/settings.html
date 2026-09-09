@@ -63,6 +63,14 @@
             <span class="suffix">秒</span>
           </div>
         </div>
+        <div class="field">
+          <label>GPT 注册引擎</label>
+          <span class="field-hint">纯协议 = 不开浏览器、直接用 Chrome TLS 指纹调 auth.openai.com（快、省内存，默认）；浏览器 = rod 驱动 Chrome 走页面（协议被风控时回退，预热对话/进程池等选项仅浏览器引擎生效）</span>
+          <select id="set-chatgpt-engine" class="px-input">
+            <option value="protocol">纯协议（默认）</option>
+            <option value="browser">浏览器自动化</option>
+          </select>
+        </div>
         <label class="switch-row">
           <input id="set-chatgpt-warmup" type="checkbox">
           <span class="switch-ui"></span>
@@ -190,6 +198,7 @@ async function loadSettings() {
   document.getElementById('set-retry-cooldown').value = d.retry_cooldown_min || '30';
   document.getElementById('set-mailbox-interval').value = d.mailbox_interval_min || '5';
   document.getElementById('set-launch-stagger').value = d.launch_stagger_sec === undefined ? '45' : d.launch_stagger_sec;
+  document.getElementById('set-chatgpt-engine').value = d.chatgpt_engine === 'browser' ? 'browser' : 'protocol';
   document.getElementById('set-chatgpt-warmup').checked = d.chatgpt_warmup !== '0';
   document.getElementById('set-chatgpt-browser-bin').value = d.chatgpt_browser_bin || '';
   document.getElementById('set-chatgpt-browser-pool').checked = d.chatgpt_browser_pool !== '0';
@@ -283,6 +292,7 @@ async function saveSettings() {
     retry_cooldown_min: document.getElementById('set-retry-cooldown').value.trim(),
     mailbox_interval_min: document.getElementById('set-mailbox-interval').value.trim(),
     launch_stagger_sec: document.getElementById('set-launch-stagger').value.trim(),
+    chatgpt_engine: document.getElementById('set-chatgpt-engine').value,
     chatgpt_warmup: document.getElementById('set-chatgpt-warmup').checked ? '1' : '0',
     chatgpt_browser_bin: document.getElementById('set-chatgpt-browser-bin').value.trim(),
     chatgpt_browser_pool: document.getElementById('set-chatgpt-browser-pool').checked ? '1' : '0',

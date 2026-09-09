@@ -105,6 +105,9 @@ func registerBrowser(ctx context.Context, in Input) (res *browserResult, err err
 	if err != nil {
 		return nil, fmt.Errorf("打开标签页失败: %w", err)
 	}
+	if in.PageHook != nil {
+		in.PageHook(base)
+	}
 	if geo != nil {
 		applyGeo(base, geo, in)
 	}

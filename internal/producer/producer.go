@@ -71,6 +71,8 @@ type Config struct {
 	// ContextsPerHost 每个进程承载的账号数（设置 chatgpt_contexts_per_host，默认 4）。
 	BrowserPool     bool
 	ContextsPerHost int
+	// Engine 注册引擎（设置 chatgpt_engine）："protocol"（默认）或 "browser"。
+	Engine string
 }
 
 // Progress 生产进度快照，供 /api/produce/status 展示。
@@ -162,7 +164,9 @@ func (p *Producer) run(ctx context.Context, target int) {
 	}
 	poolDesc := "独占进程"
 	var pool *codexreg.Pool
-	if cfg.BrowserPool {
+	if cfg.Engine != "browser" {
+		poolDesc = "纯协议（不开浏览器）"
+	} else if cfg.BrowserPool {
 		pool = codexreg.NewPool(codexreg.PoolOptions{
 			Headless:        cfg.Headless,
 			BrowserBin:      cfg.BrowserBin,
@@ -393,6 +397,7 @@ func (p *Producer) produceOne(ctx context.Context, cfg Config, pool *codexreg.Po
 			Warmup:     cfg.Warmup,
 			BrowserBin: cfg.BrowserBin,
 			Pool:       pool,
+			Engine:     cfg.Engine,
 			Log: func(f string, a ...any) {
 				msg := fmt.Sprintf(f, a...)
 				appendLog(msg)
@@ -729,6 +734,10 @@ func (p *Producer) loadConfig() Config {
 	cfg.BrowserBin = strings.TrimSpace(p.getSetting("chatgpt_browser_bin"))
 	// 浏览器池默认开，仅显式 "0" 关闭（回到每号独占一个 Chrome 进程）。
 	cfg.BrowserPool = p.getSetting("chatgpt_browser_pool") != "0"
+	cfg.Engine = "protocol"
+	if strings.EqualFold(strings.TrimSpace(p.getSetting("chatgpt_engine")), "browser") {
+		cfg.Engine = "browser"
+	}
 	cfg.ContextsPerHost = atoiDefault(p.getSetting("chatgpt_contexts_per_host"), 4)
 	if cfg.ContextsPerHost < 1 {
 		cfg.ContextsPerHost = 1
