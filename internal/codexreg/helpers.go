@@ -42,7 +42,7 @@ func genName() string {
 
 // genAge 随机成年年龄（18-45）。
 func genAge() string {
-	return strconv.Itoa(18 + ri(28))
+	return strconv.Itoa(21 + ri(20)) // 21–40
 }
 
 // GenPassword 生成满足强度要求（大小写+数字）的随机密码，供 producer 复用。

@@ -1,4 +1,4 @@
-// Package codexreg 注册 ChatGPT 账号并保存可恢复的网页会话；默认纯协议，可切回浏览器自动化。
+// Package codexreg 用纯协议注册 ChatGPT 账号并保存可恢复的网页会话。
 // Agent Identity 注册不属于当前生产流程。
 //
 // 迁移自独立的 got 命令行工具：
@@ -92,13 +92,7 @@ func Register(ctx context.Context, in Input) (*Result, error) {
 		in.Password = GenPassword(16)
 	}
 
-	var br *browserResult
-	var err error
-	if in.UseBrowser() {
-		br, err = registerBrowser(ctx, in)
-	} else {
-		br, err = registerProtocol(ctx, in)
-	}
+	br, err := registerProtocol(ctx, in)
 	if err != nil {
 		return nil, fmt.Errorf("ChatGPT 注册失败: %w", err)
 	}
@@ -136,9 +130,6 @@ func (in Input) UseBrowser() bool {
 
 // EngineName 归一化后的引擎名。
 func (in Input) EngineName() string {
-	if in.UseBrowser() {
-		return "browser"
-	}
 	return "protocol"
 }
 

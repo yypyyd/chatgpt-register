@@ -30,9 +30,11 @@ IMAP 读取固定使用 TLS 993 和最低 TLS 1.2，读取 `INBOX`，并通过 `
 
 注册流程只获得 ChatGPT 网页会话 access token，因此 CPA 导出的 `refresh_token` 和 `id_token` 为空。网页生图使用结构化 Cookie 恢复 ChatGPT 会话，不把 access token 直接当作 `api.openai.com/v1` 的 API 凭据。
 
-### ChatGPT 网页会话持久化与测活
+### ChatGPT 注册引擎与网页会话持久化、测活
 
-ChatGPT 登录态的边界是浏览器 Cookie，会话接口返回的 access token 只是短期派生凭据。注册结束、销毁临时 BrowserContext 前，系统保存 ChatGPT/OpenAI 域 Cookie 的 name/value/domain/path/expiry/httpOnly/secure/sameSite 元数据到 `auth_data.cookies`。开启预热时，真实网页对话必须完成，否则注册失败，不允许只拿到 token 的账号进入库存。
+ChatGPT 注册默认走纯协议引擎（`chatgpt_engine=protocol`，`codexreg/protocol.go`）：bogdanfinn tls-client 以 Chrome 146 TLS/HTTP2 指纹直连 chatgpt.com → `/api/auth/csrf` → signin/openai → auth.openai.com `/api/accounts/authorize` → 邮箱 OTP 校验（含一次重发重试）→ 新账号走 `/api/accounts/create_account` 补全姓名/生日 → 跟随 callback 302 回 chatgpt.com → `/api/auth/session` 取 access token。`cf-mitigated: challenge` 响应映射为 ErrIPBlocked，`/log-in/password` 落点映射为 ErrAccountTaken，`registration_disallowed*` 映射为 ErrTermsRejected，代理错误重试与浏览器引擎完全一致。`chatgpt_engine=browser` 切回 rod 浏览器引擎（共享进程池、预热对话等选项仅该引擎生效）。
+
+ChatGPT 登录态的边界是 Cookie，会话接口返回的 access token 只是短期派生凭据。两个引擎在注册结束前都把 ChatGPT/OpenAI 域 Cookie 的 name/value/domain/path/expiry/httpOnly/secure/sameSite 元数据保存到 `auth_data.cookies`（协议引擎从 cookie jar 导出，浏览器引擎从 BrowserContext 抓取）。开启预热时，真实网页对话必须完成，否则注册失败，不允许只拿到 token 的账号进入库存。
 
 测活创建隔离浏览器上下文，恢复 Cookie、注册 UA、屏幕、时区、语言和原粘性代理 session，再由页面带 `credentials=include` 请求 `/api/auth/session`：HTTP 200 且返回 access token 才是 alive，明确 401 是 dead，Cloudflare 403、限流、网络错误为 unknown。旧版只有 access token 的记录无法重建原网页会话，一律 unknown，不再调用 `/backend-api/me` 制造假 401。
 
@@ -68,6 +70,14 @@ Adobe 注册与 ChatGPT、Grok 完全隔离：独立数据表 `adobe_registratio
 - **已知风险**：管理员凭据被盗后仍可执行不可恢复的全部删除；应依赖强管理员密码、HTTPS 与数据库备份降低风险。
 
 ## 变更历史
+
+### 2026-09-09 - ChatGPT 注册默认纯协议（不启动浏览器）
+
+**变更内容**：新增 `codexreg/protocol.go`，用 bogdanfinn tls-client 以 Chrome 146 TLS/HTTP2 指纹直连完成 ChatGPT 注册全流程：`GET chatgpt.com/auth/login` 拿 CSRF Cookie → `POST /api/auth/signin/openai` → `GET auth.openai.com authorize`（服务端自动发出邮箱 OTP）→ `POST /api/accounts/email-otp/validate` → 新号走 `POST /api/accounts/create_account`（name + birthdate，按注册年龄换算）→ 跟随 callback 302 建立网页会话 → `GET /api/auth/session` 取 access token → 从 Cookie Jar 导出 ChatGPT/OpenAI 域完整 Cookie，产出与浏览器引擎完全一致的 `auth_data`（含 `register_engine=protocol`）。新增设置项 `chatgpt_engine`（默认 `protocol`，可切 `browser` 回退旧路径），设置页有对应下拉框；浏览器进程池仅在浏览器引擎下启动。错误映射：命中 Cloudflare challenge（`cf-mitigated`）、authorize 返回 `rate_limit_exceeded` → `ErrIPBlocked` 让上层换 IP；已注册/已停用 → `ErrAccountTaken`；年龄/Terms 拒绝 → `ErrTermsRejected`；OTP 被拒自动重发重试一次。线上实测：`TeenaTu24911@outlook.de` 纯协议建号 18 秒，35 个 Cookie、access token 齐全，livecheck 返回 `alive`。
+
+**变更理由**：实测（2026-09，线上住宅代理）服务端不强制 OpenAI Sentinel 头，Cloudflare 只校验 TLS 指纹与 UA 自洽——Chrome 131 指纹会被 403 challenge，Chrome 133/146 直接放行。纯协议单号约 15~20 秒（浏览器约 2~4 分钟），无浏览器进程、无 Xvfb 依赖，内存与启动开销大幅降低。
+
+**决策依据**：协议引擎产出与浏览器引擎同构（同 UA 族、同 Cookie 域、同会话类型），测活/导出/CPA 下游零改动。Sentinel 是最大不确定项：脚本数周一换版，一旦服务端开始强制校验，协议请求会在 authorize/validate 被拒并映射为可重试错误，此时切换 `chatgpt_engine=browser` 即回到真实 Chrome 路径，两条引擎共用同一套 `Input`/`Result` 与错误语义。指纹与行为对齐真人的价值体现在 Sentinel/前端遥测被强制时；当前阶段先用协议引擎换取吞吐，把浏览器引擎作为随时可切换的回退。
 
 ### 2026-09-06 - ChatGPT 网页会话持久化、消除 token-only 401 误判
 

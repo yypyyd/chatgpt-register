@@ -157,6 +157,7 @@ func capture() error {
 		Password:  os.Getenv("PROBE_PASSWORD"),
 		Proxy:     os.Getenv("PROXY_URL"),
 		Headless:  true,
+		Engine:    "browser",
 		PageHook:  hook,
 		FetchCode: makeCodeFetcher(),
 		Log: func(f string, a ...any) {

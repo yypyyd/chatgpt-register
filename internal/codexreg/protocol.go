@@ -51,7 +51,11 @@ type protocolClient struct {
 	cli       tls_client.HttpClient
 	ua        string
 	acceptLng string
+	languages string
 	platform  string
+	deviceID  string
+	navID     string
+	screen    ScreenProfile
 	in        Input
 }
 
@@ -76,7 +80,11 @@ func newProtocolClient(in Input, languages string) (*protocolClient, error) {
 		return nil, fmt.Errorf("创建 TLS 客户端失败: %w", err)
 	}
 	ua := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/" + protocolChromeMajor + ".0.0.0 Safari/537.36"
-	return &protocolClient{cli: cli, ua: ua, acceptLng: acceptLanguageHeader(languages), platform: "Windows", in: in}, nil
+	return &protocolClient{
+		cli: cli, ua: ua, acceptLng: acceptLanguageHeader(languages),
+		languages: languages, platform: "Windows", navID: uuid.NewString(),
+		screen: pickScreenProfile(), in: in,
+	}, nil
 }
 
 // acceptLanguageHeader 把 "en-SG,en" 变成 "en-SG,en;q=0.9"。
@@ -170,6 +178,12 @@ func (c *protocolClient) postJSON(ctx context.Context, u, referer string, payloa
 	req.Header.Set("content-type", "application/json")
 	pu, _ := url.Parse(u)
 	req.Header.Set("origin", pu.Scheme+"://"+pu.Host)
+	if strings.Contains(u, "/api/accounts/create_account") {
+		c.attachSentinel(req, "oauth_create_account")
+	}
+	if strings.Contains(u, "/api/accounts/email-otp/validate") {
+		c.attachSentinel(req, "email_otp_validate")
+	}
 	return c.do(ctx, req)
 }
 
@@ -204,12 +218,12 @@ type authAPIError struct {
 	} `json:"error"`
 }
 
-func parseAuthError(body []byte) (code, msg string) {
+func parseAuthError(body []byte) (code, msg, redirect string) {
 	var e authAPIError
 	if json.Unmarshal(body, &e) == nil && e.Error.Code != "" {
-		return e.Error.Code, e.Error.Message
+		return e.Error.Code, e.Error.Message, e.Error.RedirectURI
 	}
-	return "", strings.TrimSpace(string(body))
+	return "", strings.TrimSpace(string(body)), ""
 }
 
 // authErrorPayload 是 /error?payload=<base64 json> 里的内容。
@@ -222,7 +236,11 @@ func mapAuthError(code, msg string) error {
 	switch code {
 	case "account_deactivated":
 		return ErrAccountTaken
-	case "registration_disallowed", "registration_disallowed_too_young":
+	case "user_already_exists":
+		return ErrEmailExists
+	case "registration_disallowed_too_young":
+		return fmt.Errorf("%w: 生日未满 18 岁", ErrTermsRejected)
+	case "registration_disallowed":
 		return ErrTermsRejected
 	case "rate_limit_exceeded":
 		return fmt.Errorf("%w: auth.openai.com 限流(rate_limit_exceeded)", ErrIPBlocked)
@@ -254,7 +272,7 @@ func registerProtocol(ctx context.Context, in Input) (res *browserResult, err er
 	if err != nil {
 		return nil, err
 	}
-	res = &browserResult{UserAgent: c.ua, Screen: pickScreenProfile(), Locale: locale, Languages: languages}
+	res = &browserResult{UserAgent: c.ua, Screen: c.screen, Locale: locale, Languages: languages}
 	if geo != nil {
 		res.EgressIP, res.Country, res.Timezone = geo.Query, geo.CountryCode, geo.Timezone
 	}
@@ -268,6 +286,12 @@ func registerProtocol(ctx context.Context, in Input) (res *browserResult, err er
 	}
 	in.logf("✅ 注册页已加载")
 
+	deviceID := cookieValue(c, "https://chatgpt.com/", "oai-did")
+	if deviceID == "" {
+		deviceID = uuid.NewString()
+	}
+	c.deviceID = deviceID
+
 	// 2. csrf
 	r, err := c.get(ctx, "https://chatgpt.com/api/auth/csrf", loginPage, false)
 	if err != nil {
@@ -280,19 +304,21 @@ func registerProtocol(ctx context.Context, in Input) (res *browserResult, err er
 		return nil, fmt.Errorf("csrf 响应异常 (HTTP %d): %s", r.Status, truncateForLog(string(r.Body), 200))
 	}
 
-	// 3. signin/openai → authorize url
-	deviceID := uuid.NewString()
+	// 3. signin/openai → authorize url（ext-oai-did 必须与 chatgpt.com 的 oai-did cookie 相同）
 	q := url.Values{}
 	q.Set("prompt", "login")
 	q.Set("ext-oai-did", deviceID)
 	q.Set("auth_session_logging_id", uuid.NewString())
 	q.Set("screen_hint", "login_or_signup")
-	q.Set("login_hint", in.Email)
+	// login_hint 必须保留 plus addressing 的 '+'。url.Values.Encode 会把 '+'
+	// 编成空格，OpenAI 就会把 user+001@ 当成母号 user@，OTP 后 create_account
+	// 报 user_already_exists / Terms。
+	authQuery := q.Encode() + "&login_hint=" + url.QueryEscape(in.Email)
 	form := url.Values{}
 	form.Set("callbackUrl", "/")
 	form.Set("csrfToken", csrf.CSRFToken)
 	form.Set("json", "true")
-	req, _ := http.NewRequest(http.MethodPost, "https://chatgpt.com/api/auth/signin/openai?"+q.Encode(), strings.NewReader(form.Encode()))
+	req, _ := http.NewRequest(http.MethodPost, "https://chatgpt.com/api/auth/signin/openai?"+authQuery, strings.NewReader(form.Encode()))
 	c.headers(req, loginPage, false)
 	req.Header.Set("accept", "*/*")
 	req.Header.Set("content-type", "application/x-www-form-urlencoded")
@@ -307,19 +333,42 @@ func registerProtocol(ctx context.Context, in Input) (res *browserResult, err er
 	if json.Unmarshal(r.Body, &signin) != nil || !strings.Contains(signin.URL, "auth.openai.com") {
 		return nil, fmt.Errorf("signin/openai 响应异常 (HTTP %d): %s", r.Status, truncateForLog(string(r.Body), 200))
 	}
+	in.logf("🔗 authorize login_hint=%s did=%s", extractLoginHint(signin.URL), deviceID)
 
 	// 4. authorize → 跟随跳转。落地 /email-verification 表示验证码已发出。
 	otpSentAt := time.Now().Add(-5 * time.Second)
 	landing, lr, err := c.followRedirects(ctx, signin.URL, "https://chatgpt.com/")
+	if err != nil && isTransientNetErr(err) {
+		in.logf("♻ authorize 连接中断，重试一次")
+		landing, lr, err = c.followRedirects(ctx, signin.URL, "https://chatgpt.com/")
+	}
 	if err != nil {
 		return nil, fmt.Errorf("authorize 跳转失败: %w", err)
 	}
 	switch {
 	case strings.Contains(landing, "/email-verification"):
 		in.logf("📧 已提交邮箱，验证码已发出")
+	case strings.Contains(landing, "/create-account/password"):
+		in.logf("🔒 创建密码页已出现，自动设置密码")
+		next, err := c.submitCreatePassword(ctx, landing, in.Password)
+		if err != nil {
+			return nil, err
+		}
+		if next != "" {
+			landing2, lr2, ferr := c.followRedirects(ctx, next, landing)
+			if ferr != nil {
+				return nil, fmt.Errorf("提交密码后跳转失败: %w", ferr)
+			}
+			landing, lr = landing2, lr2
+		}
+		if !strings.Contains(landing, "/email-verification") && !strings.Contains(landing, "/about-you") {
+			return nil, fmt.Errorf("提交密码后未进入验证码页: %s", truncateForLog(landing, 200))
+		}
+		if strings.Contains(landing, "/email-verification") {
+			in.logf("📧 已提交邮箱，验证码已发出")
+		}
 	case strings.Contains(landing, "/log-in/password"):
-		// 老号且设置过密码：走密码校验。
-		in.logf("🔒 该邮箱已有账号（密码登录页），尝试密码登录")
+		in.logf("🔒 该邮箱已有账号（密码登录页）")
 		return nil, ErrAccountTaken
 	case strings.Contains(landing, "/error"):
 		if lu, perr := url.Parse(landing); perr == nil {
@@ -368,18 +417,26 @@ func registerProtocol(ctx context.Context, in Input) (res *browserResult, err er
 		if _, err := c.get(ctx, continueURL, landing, true); err != nil {
 			return nil, fmt.Errorf("打开资料页失败: %w", err)
 		}
-		age, _ := strconv.Atoi(strings.TrimSpace(in.Age))
-		if age < 18 || age > 90 {
-			age = 18 + ri(28)
-		}
-		birth := time.Now().AddDate(-age, 0, -(30 + ri(300))).Format("2006-01-02")
-		r, err = c.postJSON(ctx, "https://auth.openai.com/api/accounts/create_account", continueURL,
-			map[string]string{"name": in.FullName, "birthdate": birth})
+		birth := protocolBirthdate(in.Age)
+		in.logf("👤 提交资料 name=%s age=%s birthdate=%s email=%s", in.FullName, in.Age, birth, in.Email)
+		r, err = c.postJSON(ctx, "https://auth.openai.com/api/accounts/create_account", continueURL, map[string]any{
+			"name":      in.FullName,
+			"birthdate": birth,
+		})
 		if err != nil {
 			return nil, fmt.Errorf("create_account 失败: %w", err)
 		}
 		if r.Status != 200 {
-			code, msg := parseAuthError(r.Body)
+			code, msg, redirect := parseAuthError(r.Body)
+			in.logf("⛔ create_account HTTP %d code=%s redirect=%s body=%s", r.Status, code, redirect, truncateForLog(string(r.Body), 800))
+			if code == "user_already_exists" {
+				who, probeErr := c.probeExistingSessionEmail(ctx, continueURL, redirect)
+				if probeErr != nil {
+					in.logf("🔎 跟随 login 探测失败: %v", probeErr)
+				} else {
+					in.logf("🔎 user_already_exists 登录后 session.email=%s 提交邮箱=%s", who, in.Email)
+				}
+			}
 			return nil, mapAuthError(code, msg)
 		}
 		var cr struct {
@@ -388,7 +445,7 @@ func registerProtocol(ctx context.Context, in Input) (res *browserResult, err er
 		if json.Unmarshal(r.Body, &cr) != nil || cr.ContinueURL == "" {
 			return nil, fmt.Errorf("create_account 响应缺少 continue_url: %s", truncateForLog(string(r.Body), 200))
 		}
-		in.logf("👤 已提交资料 (name/age)")
+		in.logf("👤 资料已接受")
 		continueURL = cr.ContinueURL
 	}
 
@@ -419,10 +476,196 @@ func registerProtocol(ctx context.Context, in Input) (res *browserResult, err er
 
 	res.Cookies = c.webCookies()
 	if len(res.Cookies) == 0 {
-		return nil, fmt.Errorf("登录成功但没有捕获到 ChatGPT 网页 Cookie")
+		return nil, fmt.Errorf("登录成功但没有捕获到会话 Cookie")
 	}
-	in.logf("🍪 ChatGPT 网页会话已保存（%d 个 Cookie）", len(res.Cookies))
+	in.logf("🍪 协议会话已保存（%d 个 Cookie）", len(res.Cookies))
 	return res, nil
+}
+
+func sessionUserEmail(body []byte) string {
+	var sess map[string]any
+	if json.Unmarshal(body, &sess) != nil {
+		return ""
+	}
+	if u, ok := sess["user"].(map[string]any); ok {
+		if e, _ := u["email"].(string); e != "" {
+			return e
+		}
+	}
+	if e, _ := sess["email"].(string); e != "" {
+		return e
+	}
+	return ""
+}
+
+func (c *protocolClient) probeExistingSessionEmail(ctx context.Context, aboutYouURL, redirect string) (string, error) {
+	start := strings.TrimSpace(redirect)
+	if start == "" {
+		start = "https://chatgpt.com/auth/login_with?callback_path=/"
+	}
+	landing, _, err := c.followRedirects(ctx, start, aboutYouURL)
+	if err != nil {
+		return "", err
+	}
+	c.in.logf("🔎 login redirect 落地=%s", truncateForLog(landing, 180))
+	r, err := c.get(ctx, "https://chatgpt.com/api/auth/session", "https://chatgpt.com/", false)
+	if err != nil {
+		return "", err
+	}
+	c.in.logf("🔎 session HTTP %d body=%s", r.Status, truncateForLog(string(r.Body), 400))
+	return sessionUserEmail(r.Body), nil
+}
+
+func cookieValue(c *protocolClient, site, name string) string {
+	u, err := url.Parse(site)
+	if err != nil {
+		return ""
+	}
+	for _, ck := range c.cli.GetCookies(u) {
+		if ck != nil && ck.Name == name && ck.Value != "" {
+			return ck.Value
+		}
+	}
+	return ""
+}
+
+func isTransientNetErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	for _, k := range []string{"eof", "connection reset", "broken pipe", "i/o timeout", "tls handshake"} {
+		if strings.Contains(s, k) {
+			return true
+		}
+	}
+	return false
+}
+
+func extractLoginHint(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return u.Query().Get("login_hint")
+}
+
+func preserveLoginHintPlus(raw, email string) string {
+	if !strings.Contains(email, "+") {
+		return raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	q := u.Query()
+	hint := q.Get("login_hint")
+	if hint == email {
+		return raw
+	}
+	// url.Parse Query() 会把 %2B 解成 '+'；若服务端回的是空格替换后的母号，强制写回原邮箱。
+	q.Set("login_hint", email)
+	// Query().Encode() 会把 space 编成 '+'，必须手动拼 login_hint。
+	q.Del("login_hint")
+	enc := q.Encode()
+	if enc != "" {
+		enc += "&"
+	}
+	u.RawQuery = enc + "login_hint=" + url.QueryEscape(email)
+	return u.String()
+}
+
+func (c *protocolClient) attachSentinel(req *http.Request, flow string) {
+	id := c.deviceID
+	if id == "" {
+		id = uuid.NewString()
+		c.deviceID = id
+	}
+	if c.navID == "" {
+		c.navID = uuid.NewString()
+	}
+	tok := map[string]any{
+		"p":    c.sentinelP(),
+		"id":   id,
+		"flow": flow,
+	}
+	b, _ := json.Marshal(tok)
+	req.Header.Set("openai-sentinel-token", string(b))
+	req.Header.Set("x-openai-document-navigation-id", c.navID)
+	req.Header.Set("x-access-flow-invocation-id", uuid.NewString())
+}
+
+func (c *protocolClient) sentinelP() string {
+	lang := c.languages
+	if lang == "" {
+		lang = "en-US,en"
+	}
+	primary := strings.Split(lang, ",")[0]
+	sdk := "https://sentinel.openai.com/backend-api/sentinel/sdk.js"
+	now := time.Now()
+	fp := []any{
+		c.screen.Width,
+		now.Format("Mon Jan 02 2006 15:04:05 GMT-0700 (MST)"),
+		c.screen.Width * c.screen.Height * 4,
+		5,
+		c.ua,
+		sdk,
+		nil,
+		primary,
+		lang,
+		26,
+		"languages−" + lang,
+		"location",
+		"cookieStore",
+		float64(55000+ri(2000)) + 0.9,
+		c.navID,
+		"",
+		16,
+		float64(now.UnixMilli()) + 0.6,
+		0, 0, 0, 0, 0, 0, 0,
+	}
+	raw, _ := json.Marshal(fp)
+	return "gAAAAAB" + base64.StdEncoding.EncodeToString(raw) + "~S"
+}
+
+func protocolBirthdate(ageStr string) string {
+	age, _ := strconv.Atoi(strings.TrimSpace(ageStr))
+	if age < 19 || age > 90 {
+		age = 21 + ri(20) // 21–40，避开刚满 18 的边界
+	}
+	now := time.Now()
+	year := now.Year() - age
+	month := time.Month(1 + ri(12))
+	day := 1 + ri(28)
+	return time.Date(year, month, day, 0, 0, 0, 0, time.UTC).Format("2006-01-02")
+}
+
+func (c *protocolClient) submitCreatePassword(ctx context.Context, referer, password string) (string, error) {
+	if strings.TrimSpace(password) == "" {
+		password = GenPassword(16)
+	}
+	r, err := c.postJSON(ctx, "https://auth.openai.com/api/accounts/user/register", referer,
+		map[string]string{"password": password})
+	if err != nil {
+		return "", fmt.Errorf("创建密码失败: %w", err)
+	}
+	if r.Status/100 == 3 && r.Location != "" {
+		base, _ := url.Parse(referer)
+		next, perr := base.Parse(r.Location)
+		if perr == nil {
+			return next.String(), nil
+		}
+		return r.Location, nil
+	}
+	if r.Status == 200 {
+		var v struct {
+			ContinueURL string `json:"continue_url"`
+		}
+		_ = json.Unmarshal(r.Body, &v)
+		return v.ContinueURL, nil
+	}
+	code, msg, _ := parseAuthError(r.Body)
+	return "", mapAuthError(code, msg)
 }
 
 func (c *protocolClient) validateOTP(ctx context.Context, referer, code string) (string, error) {
@@ -431,7 +674,7 @@ func (c *protocolClient) validateOTP(ctx context.Context, referer, code string) 
 		return "", fmt.Errorf("提交验证码失败: %w", err)
 	}
 	if r.Status != 200 {
-		ecode, msg := parseAuthError(r.Body)
+		ecode, msg, _ := parseAuthError(r.Body)
 		if ecode == "wrong_email_otp_code" {
 			return "", fmt.Errorf("wrong_email_otp_code: %s", msg)
 		}
@@ -443,6 +686,7 @@ func (c *protocolClient) validateOTP(ctx context.Context, referer, code string) 
 	if json.Unmarshal(r.Body, &v) != nil || v.ContinueURL == "" {
 		return "", fmt.Errorf("验证码响应缺少 continue_url: %s", truncateForLog(string(r.Body), 200))
 	}
+	c.in.logf("🔑 OTP continue_url=%s", truncateForLog(v.ContinueURL, 180))
 	return v.ContinueURL, nil
 }
 

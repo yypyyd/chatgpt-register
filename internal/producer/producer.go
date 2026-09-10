@@ -158,26 +158,9 @@ func (p *Producer) run(ctx context.Context, target int) {
 	}()
 
 	cfg := p.loadConfig()
-	warm := "开"
-	if !cfg.Warmup {
-		warm = "关"
-	}
-	poolDesc := "独占进程"
 	var pool *codexreg.Pool
-	if cfg.Engine != "browser" {
-		poolDesc = "纯协议（不开浏览器）"
-	} else if cfg.BrowserPool {
-		pool = codexreg.NewPool(codexreg.PoolOptions{
-			Headless:        cfg.Headless,
-			BrowserBin:      cfg.BrowserBin,
-			ContextsPerHost: cfg.ContextsPerHost,
-			Log:             func(f string, a ...any) { p.logf("  [浏览器池] "+f, a...) },
-		})
-		defer pool.Close()
-		poolDesc = fmt.Sprintf("共享进程池（每进程 %d 个账号）", cfg.ContextsPerHost)
-	}
-	p.logf("开始生产，目标 %d 个账号（每邮箱母号+%d 裂变，并发 %d，注册后预热对话=%s，浏览器=%s）",
-		target, cfg.FissionCount, cfg.MaxConcurrency, warm, poolDesc)
+	p.logf("开始生产，目标 %d 个账号（每邮箱母号+%d 裂变，并发 %d，引擎=纯协议，跳过 hotmail.com）",
+		target, cfg.FissionCount, cfg.MaxConcurrency)
 
 	sem := make(chan struct{}, cfg.MaxConcurrency)
 	var wg sync.WaitGroup
@@ -250,7 +233,7 @@ func (p *Producer) run(ctx context.Context, target int) {
 					// Terms of Use 拒绝为终态，不再重试也不计为“失败”，换下一个地址
 					p.logf("⛔ %s Terms of Use 拒绝，标记为不可注册，换下一个地址", mask(email))
 				} else {
-					// 记为失败态；若后续重试成功会被 markSuccess 清除
+					// 记为失败态；若后续重试成功会被markSuccess 清除
 					p.markFailed(email)
 					p.logf("✗ %s 注册失败：%v", mask(email), err)
 				}
@@ -287,6 +270,9 @@ func (p *Producer) nextJob(cfg Config) (models.Mailbox, string, bool, bool, bool
 
 	// Pass 1：母号（邮箱本身地址）未注册成功且该邮箱空闲 → 注册母号
 	for _, mb := range mailboxes {
+		if skipHotmailMailbox(mb.Email) {
+			continue
+		}
 		if p.mailboxBusy(mb.ID) {
 			continue
 		}
@@ -306,6 +292,9 @@ func (p *Producer) nextJob(cfg Config) (models.Mailbox, string, bool, bool, bool
 
 	// Pass 2：母号已成功、该邮箱空闲、裂变未满 → 注册一个新的别名子号
 	for _, mb := range mailboxes {
+		if skipHotmailMailbox(mb.Email) {
+			continue
+		}
 		if p.mailboxBusy(mb.ID) {
 			continue
 		}
@@ -419,8 +408,8 @@ func (p *Producer) produceOne(ctx context.Context, cfg Config, pool *codexreg.Po
 		if err == nil {
 			break
 		}
-		// Terms 拒绝 / IP 被拦都是出口问题，换 IP 再来一次。
-		if (errors.Is(err, codexreg.ErrTermsRejected) || errors.Is(err, codexreg.ErrIPBlocked)) &&
+		// IP 被拦才换出口。registration_disallowed 是建号策略拒绝，换 IP 只会再发验证码。
+		if errors.Is(err, codexreg.ErrIPBlocked) &&
 			canRotate && attempt < attempts && ctx.Err() == nil {
 			continue
 		}
@@ -438,13 +427,13 @@ func (p *Producer) produceOne(ctx context.Context, cfg Config, pool *codexreg.Po
 			appendLog("⚠ 停用（账号不存在或已被删除/停用），不再重试，换下一个地址继续")
 			p.setRegistrationStatus(email, "already_registered", "停用："+err.Error(), logBuf.String())
 			return err
+		case errors.Is(err, codexreg.ErrEmailExists):
+			appendLog("⚠ OpenAI 返回 user_already_exists（Outlook plus 常被归一到母号），本地址不再重试")
+			p.setRegistrationStatus(email, "register_rejected", "user_already_exists："+err.Error(), logBuf.String())
+			return err
 		case errors.Is(err, codexreg.ErrTermsRejected):
-			if canRotate {
-				appendLog("⛔ 多次更换住宅 IP 仍被 Terms of Use 拒绝，标记为不可注册")
-			} else {
-				appendLog("⛔ Terms of Use 拒绝（直连/固定出口无法换 IP），标记为不可注册")
-			}
-			p.setRegistrationStatus(email, "register_rejected", "Terms of Use 拒绝："+err.Error(), logBuf.String())
+			appendLog("⛔ OpenAI 拒绝建号（registration_disallowed / Terms），不再换 IP 重试")
+			p.setRegistrationStatus(email, "register_rejected", "registration_disallowed："+err.Error(), logBuf.String())
 			return err
 		case errors.Is(err, codexreg.ErrIPBlocked):
 			if canRotate {
@@ -719,6 +708,7 @@ func (p *Producer) loadConfig() Config {
 	if cfg.FissionCount < 0 {
 		cfg.FissionCount = defaultFissionCount
 	}
+	cfg.Engine = "protocol"
 	cooldownMin := atoiDefault(p.getSetting("retry_cooldown_min"), defaultRetryCooldownMin)
 	if cooldownMin < 0 {
 		cooldownMin = 0
@@ -735,9 +725,6 @@ func (p *Producer) loadConfig() Config {
 	// 浏览器池默认开，仅显式 "0" 关闭（回到每号独占一个 Chrome 进程）。
 	cfg.BrowserPool = p.getSetting("chatgpt_browser_pool") != "0"
 	cfg.Engine = "protocol"
-	if strings.EqualFold(strings.TrimSpace(p.getSetting("chatgpt_engine")), "browser") {
-		cfg.Engine = "browser"
-	}
 	cfg.ContextsPerHost = atoiDefault(p.getSetting("chatgpt_contexts_per_host"), 4)
 	if cfg.ContextsPerHost < 1 {
 		cfg.ContextsPerHost = 1
@@ -823,7 +810,7 @@ func (p *Producer) incRegistered() {
 	p.mu.Unlock()
 }
 
-// markFailed 把邮箱标记为失败态，失败数=仍处于失败态的邮箱数。
+// kFailed 把邮箱标记为失败态，失败数=仍处于失败态的邮箱数。
 func (p *Producer) markFailed(email string) {
 	p.mu.Lock()
 	p.failed[email] = struct{}{}
@@ -831,7 +818,7 @@ func (p *Producer) markFailed(email string) {
 	p.mu.Unlock()
 }
 
-// markSuccess 邮箱最终注册成功，从失败态移除（重试成功不再计入失败）。
+// kSuccess 邮箱最终注册成功，从失败态移除（重试成功不再计入失败）。
 func (p *Producer) markSuccess(email string) {
 	p.mu.Lock()
 	delete(p.failed, email)
@@ -861,4 +848,9 @@ func (p *Producer) setMessage(msg string) {
 	p.prog.Message = msg
 	p.prog.UpdatedAt = time.Now()
 	p.mu.Unlock()
+}
+
+func skipHotmailMailbox(email string) bool {
+	_, domain, ok := strings.Cut(strings.ToLower(strings.TrimSpace(email)), "@")
+	return ok && domain == "hotmail.com"
 }

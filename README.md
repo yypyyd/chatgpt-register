@@ -24,9 +24,11 @@
 
 ---
 
-## 🤖 无头注册——技术亮点
+## 🤖 纯协议注册——技术亮点
 
-> 基于 **go-rod** 驱动本机真实 Chrome（new headless），不改浏览器原生指纹，只修正无头标记并对齐出口地区；键盘/鼠标全部走真实输入事件，模拟真人操作全程自动完成注册。
+> 默认引擎为**纯协议注册**：用 Chrome 146 的 TLS/HTTP2 指纹（bogdanfinn tls-client）直连 `chatgpt.com` / `auth.openai.com`，不发 Sentinel 头、不启动浏览器，单号约 15~20 秒；出口 IP 归属地决定语言/时区，Cookie 会话与 access token 完整保存。
+>
+> 若 OpenAI 收紧风控（例如开始强制 Sentinel 头），设置项 `chatgpt_engine=browser` 一键切回浏览器引擎：基于 **go-rod** 驱动本机真实 Chrome（new headless），真实 UA + Client Hints、随机屏幕规格、逐键输入和轨迹点击（`isTrusted=true`）。
 
 ### 注册全流程（全自动，无需人工）
 
@@ -248,7 +250,8 @@ ADDR=8080 ./chatgpt-register.exe
 | 裂变数量 | 每个邮箱注册的子号数 | 5（即 1母 + 5子 = 6个账号）；`+别名` 子号与母号天然可被关联，追求存活率时建议调低甚至设为 0 |
 | 无头模式 | 是否隐藏浏览器窗口 | 生产环境建议开启 |
 | 代理池 | 每行一个代理，格式见下方 | 建议动态住宅代理，每号独立出口 |
-| GPT 注册后预热对话 | 注册成功后先发一条普通对话再取 token（`chatgpt_warmup`） | 开启 |
+| GPT 注册引擎 | `protocol` 纯协议（默认）/ `browser` 浏览器自动化（`chatgpt_engine`） | protocol |
+| GPT 注册后预热对话 | 注册成功后先发一条普通对话再取 token（`chatgpt_warmup`，仅浏览器引擎生效） | 开启 |
 | GPT 注册浏览器 | 留空优先本机 Chrome；`rod` 用内置 Chromium；或填路径（`chatgpt_browser_bin`） | 留空 |
 | GPT 共享浏览器进程池 | 多账号共用 Chrome 进程、独立上下文（`chatgpt_browser_pool`） | 开启 |
 | 每进程账号数 | 一个 Chrome 进程同时承载的账号数（`chatgpt_contexts_per_host`） | 4；16 核 16G 机器并发 8 时可设 4~8 |
@@ -298,7 +301,7 @@ http://ip:port
 
 **Q：注册出来的号一用（生图）就被封 / 还没用就死了？**
 > A：封号几乎都是"关联"问题，而不是单个号的行为。请逐项对照：
-> 1. **注册指纹**：本版本已改为本机真实 Chrome + 真实 Client Hints + 真人输入事件。
+> 1. **注册指纹**：默认协议引擎用 Chrome 146 TLS/HTTP2 指纹 + 对应 UA/Client Hints；切到浏览器引擎时才是本机真实 Chrome + 真人输入事件。
 > 2. **测活**：旧版测活用无 Cookie 的新浏览器请求 `/backend-api/me`，会制造假 401；本版本恢复账号 Cookie、注册 UA、屏幕、时区和原粘性代理 session，并由网页自身验证 `/api/auth/session`。
 > 3. **用号方式**：`auth_data` 里带有注册时的 `user_agent` / `screen` / `registered_ip` / `registered_country` / `registered_timezone` / `proxy`。下游网关应沿用同一地区和代理线路，不要用一台服务器的固定 IP 集中调用大量账号。
 > 4. **裂变子号**：`a+001@…`、`a+002@…` 与母号是同一个邮箱，OpenAI 一眼就能关联；母号被封时子号大概率跟着走。看重存活率就把裂变数量调低。

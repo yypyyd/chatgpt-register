@@ -12,8 +12,13 @@ import (
 	"github.com/go-rod/rod/lib/input"
 )
 
-// ErrAccountTaken 注册时提示"账号不存在或已被删除/停用"，视为该地址已被注册，不应重试。
+// ErrAccountTaken 注册时提示账号停用/已删除，视为该地址不可再用。
 var ErrAccountTaken = errors.New("账号不存在或已被删除/停用")
+
+// ErrEmailExists create_account 返回 user_already_exists。
+// OTP 已通过并进入 about-you，说明本次别名曾被当成新号；随后建号失败通常是
+// OpenAI 把 plus addressing 归一到母号（母号已存在），不代表这个 +00x 自己注册成功过。
+var ErrEmailExists = errors.New("OpenAI 拒绝建号：该邮箱（或归一后的母号）已存在")
 
 // ErrTermsRejected 填完资料提交后命中 "We can't create your account due to our Terms of Use"
 // 拒绝页——通常是出口 IP 风控命中。原地重试无意义，交由上层换出口 IP 后重试或标记为不可注册。
