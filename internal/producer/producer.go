@@ -41,9 +41,8 @@ const (
 	// 两封验证码邮件挤在一起容易读错/读不到。可在系统设置 mailbox_interval_min
 	// 覆盖，0 = 不限。
 	defaultMailboxIntervalMin = 5
-	// registerAttemptTimeout 单次浏览器注册的墙钟上限：不加上限时任务卡死就一直处于 registering，
-	// “停止”也要等它跑完才能结束。
-	registerAttemptTimeout = 12 * time.Minute
+	// registerAttemptTimeout 单次协议注册的墙钟上限。
+	registerAttemptTimeout = 4 * time.Minute
 	codePollTimeout        = 3 * time.Minute
 	codePollInterval       = 5 * time.Second
 	// 邮箱服务（Graph）连续 503 等临时错误达到该时长即放弃并自动停用该邮箱。
@@ -58,21 +57,10 @@ var codeRe = regexp.MustCompile(`\b(\d{6})\b`)
 type Config struct {
 	MaxConcurrency int
 	FissionCount   int
-	Headless       bool
 	Proxies        []string      // 代理池，按账户轮转；空=直连
 	RetryCooldown  time.Duration // 失败地址的重试冷却时间
 	// MailboxInterval 同一邮箱两次注册之间的最小间隔，避免验证码邮件互相干扰
 	MailboxInterval time.Duration
-	// Warmup 注册成功后先在同一浏览器里发一条普通对话再取 token（设置 chatgpt_warmup，默认开）。
-	Warmup bool
-	// BrowserBin 注册用浏览器（设置 chatgpt_browser_bin）：空=优先本机 Chrome，rod=强制 rod 下载的 Chromium。
-	BrowserBin string
-	// BrowserPool 共享 Chrome 进程、按账号隔离上下文（设置 chatgpt_browser_pool，默认开）；
-	// ContextsPerHost 每个进程承载的账号数（设置 chatgpt_contexts_per_host，默认 4）。
-	BrowserPool     bool
-	ContextsPerHost int
-	// Engine 注册引擎（设置 chatgpt_engine）："protocol"（默认）或 "browser"。
-	Engine string
 }
 
 // Progress 生产进度快照，供 /api/produce/status 展示。
@@ -158,7 +146,6 @@ func (p *Producer) run(ctx context.Context, target int) {
 	}()
 
 	cfg := p.loadConfig()
-	var pool *codexreg.Pool
 	p.logf("开始生产，目标 %d 个账号（每邮箱母号+%d 裂变，并发 %d，引擎=纯协议，跳过 hotmail.com）",
 		target, cfg.FissionCount, cfg.MaxConcurrency)
 
@@ -211,8 +198,7 @@ func (p *Producer) run(ctx context.Context, target int) {
 				p.releaseInflight(email)
 				p.updateProgress()
 			}()
-			// 兜底：rod 的 MustXxx 会 panic，若不 recover 会连累整个进程崩溃（宕机）。
-			// 把 panic 归一成一次注册失败，服务继续存活。
+			// 兜底：注册路径 panic 时归一成一次失败，服务继续存活。
 			defer func() {
 				if r := recover(); r != nil {
 					p.markFailed(email)
@@ -225,7 +211,7 @@ func (p *Producer) run(ctx context.Context, target int) {
 			}()
 			p.updateProgress()
 
-			if err := p.produceOne(ctx, cfg, pool, mb, email, isMother); err != nil {
+			if err := p.produceOne(ctx, cfg, mb, email, isMother); err != nil {
 				if errors.Is(err, codexreg.ErrAccountTaken) {
 					// 账号停用不再重试，也不计为“失败”（属于跳过换号）
 					p.logf("⚠ %s 停用（%v），不再重试，换下一个地址", mask(email), err)
@@ -322,7 +308,7 @@ func (p *Producer) nextJob(cfg Config) (models.Mailbox, string, bool, bool, bool
 }
 
 // produceOne 完整生产一个账号：注册 ChatGPT → 保存账号凭据 → 入库。
-func (p *Producer) produceOne(ctx context.Context, cfg Config, pool *codexreg.Pool, mb models.Mailbox, email string, isMother bool) error {
+func (p *Producer) produceOne(ctx context.Context, cfg Config, mb models.Mailbox, email string, isMother bool) error {
 	password := codexreg.GenPassword(16)
 	note := ""
 	if !isMother {
@@ -379,14 +365,9 @@ func (p *Producer) produceOne(ctx context.Context, cfg Config, pool *codexreg.Po
 		}
 		since := time.Now().Add(-30 * time.Second)
 		in := codexreg.Input{
-			Email:      email,
-			Password:   password,
-			Proxy:      proxy,
-			Headless:   cfg.Headless,
-			Warmup:     cfg.Warmup,
-			BrowserBin: cfg.BrowserBin,
-			Pool:       pool,
-			Engine:     cfg.Engine,
+			Email:    email,
+			Password: password,
+			Proxy:    proxy,
 			Log: func(f string, a ...any) {
 				msg := fmt.Sprintf(f, a...)
 				appendLog(msg)
@@ -397,9 +378,6 @@ func (p *Producer) produceOne(ctx context.Context, cfg Config, pool *codexreg.Po
 					return p.fetchCode(ctx, mb, after)
 				}
 				return p.fetchCode(ctx, mb, since)
-			},
-			SaveShot: func(png []byte) {
-				p.db.Model(&models.Registration{}).Where("email = ?", email).Update("shot", png)
 			},
 		}
 		attemptCtx, cancelAttempt := context.WithTimeout(ctx, registerAttemptTimeout)
@@ -700,7 +678,6 @@ func (p *Producer) loadConfig() Config {
 	cfg := Config{
 		MaxConcurrency: atoiDefault(p.getSetting("max_concurrency"), defaultMaxConcurrency),
 		FissionCount:   atoiDefault(p.getSetting("fission_count"), defaultFissionCount),
-		Headless:       p.getSetting("headless") != "0", // 默认无头，仅当设置为 "0" 时才有头
 	}
 	if cfg.MaxConcurrency < 1 {
 		cfg.MaxConcurrency = 1
@@ -708,7 +685,6 @@ func (p *Producer) loadConfig() Config {
 	if cfg.FissionCount < 0 {
 		cfg.FissionCount = defaultFissionCount
 	}
-	cfg.Engine = "protocol"
 	cooldownMin := atoiDefault(p.getSetting("retry_cooldown_min"), defaultRetryCooldownMin)
 	if cooldownMin < 0 {
 		cooldownMin = 0
@@ -719,16 +695,6 @@ func (p *Producer) loadConfig() Config {
 		intervalMin = 0
 	}
 	cfg.MailboxInterval = time.Duration(intervalMin) * time.Minute
-	// 预热默认开，仅显式 "0" 关闭。
-	cfg.Warmup = p.getSetting("chatgpt_warmup") != "0"
-	cfg.BrowserBin = strings.TrimSpace(p.getSetting("chatgpt_browser_bin"))
-	// 浏览器池默认开，仅显式 "0" 关闭（回到每号独占一个 Chrome 进程）。
-	cfg.BrowserPool = p.getSetting("chatgpt_browser_pool") != "0"
-	cfg.Engine = "protocol"
-	cfg.ContextsPerHost = atoiDefault(p.getSetting("chatgpt_contexts_per_host"), 4)
-	if cfg.ContextsPerHost < 1 {
-		cfg.ContextsPerHost = 1
-	}
 	// 代理默认开：未设置(空)视为开，仅显式 "0" 才关闭(直连)。可在设置页开关/编辑。
 	if p.getSetting("proxy_enabled") != "0" {
 		cfg.Proxies = proxyutil.List(p.getSetting("proxy_list"))

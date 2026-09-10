@@ -73,24 +73,7 @@ async function loadProduce() {
   } catch (e) { /* ignore */ }
 }
 
-/* 浏览器就绪状态：未就绪禁用生产 */
-let browserReady = true;
-async function loadBrowserGate() {
-  try {
-    const s = await (await api('/api/browser/status')).json();
-    browserReady = !!s.ready;
-    const btn = document.getElementById('produce-btn');
-    if (btn) {
-      btn.disabled = !browserReady;
-      btn.title = browserReady ? '' : (s.message || '缺少浏览器');
-    }
-    const msg = document.getElementById('pd-msg');
-    if (!browserReady && msg) msg.textContent = '⚠ ' + (s.message || '缺少浏览器，暂不能生产');
-  } catch (e) { /* ignore */ }
-}
-
 function openProduceModal() {
-  if (!browserReady) return toast('缺少浏览器，正在下载或下载失败，暂不能生产', true);
   document.getElementById('produce-count').value = 10;
   document.getElementById('produce-modal').style.display = 'flex';
 }
@@ -328,8 +311,6 @@ document.getElementById('filter-status').addEventListener('change', () => { page
 
 load();
 loadProduce();
-loadBrowserGate();
 pollLive();
 setInterval(load, 3000);
 setInterval(loadProduce, 2000);
-setInterval(loadBrowserGate, 2500);

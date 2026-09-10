@@ -3,7 +3,6 @@ package grokreg
 import (
 	"context"
 	"fmt"
-	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -51,11 +50,10 @@ func invalidateSignupConfig() {
 }
 
 // registerProtocol drives the whole Grok signup over HTTP/gRPC using a
-// Chrome-impersonating TLS client. A browser is spawned only to mint the
-// single-use Cloudflare Turnstile token (via the CloakBrowser helper), which
-// exits as soon as the token is issued — everything else is protocol traffic.
+// Chrome-impersonating TLS client. Turnstile is solved via 2Captcha HTTP;
+// a local browser is never started.
 func registerProtocol(ctx context.Context, in Input) (*Result, error) {
-	in.logf("Grok 协议注册启动（浏览器仅用于签发 Turnstile 令牌）")
+	in.logf("Grok 协议注册启动")
 	if strings.TrimSpace(in.Proxy) != "" {
 		server, _, _, perr := proxyutil.Parse(in.Proxy)
 		if perr != nil {
@@ -139,29 +137,6 @@ func registerProtocol(ctx context.Context, in Input) (*Result, error) {
 	in.logf("注册配置就绪 site_key=%s action=%s… source=%s profile=%s",
 		scfg.SiteKey, trimText(scfg.ActionID, 12), scfg.Source, client.Profile())
 
-	// Chromium cannot authenticate to an upstream proxy via --proxy-server, so an
-	// authenticated proxy needs a loopback bridge for the Turnstile mint. The TLS
-	// client itself talks to the authenticated proxy directly.
-	in.mintProxy = proxyutil.Normalize(in.Proxy)
-	if bridge, addr := maybeAuthBridge(in.Proxy); bridge != nil {
-		defer bridge.Close()
-		in.mintProxy = addr
-	}
-
-	// 立即开始并行签发 Turnstile 令牌（有效期约 5 分钟），与取码、等码完全
-	// 重叠，把这一步从关键路径上拿掉。
-	type mintOutcome struct {
-		token string
-		err   error
-	}
-	mintCh := make(chan mintOutcome, 1)
-	mintCtx, cancelMint := context.WithCancel(ctx)
-	defer cancelMint()
-	go func() {
-		tok, merr := mintTurnstileToken(mintCtx, in, scfg.SiteKey, protocol.SiteURL+"/sign-up")
-		mintCh <- mintOutcome{token: tok, err: merr}
-	}()
-
 	// 1) request email validation code, wait for the mailbox to deliver it.
 	if err := client.CreateEmailCode(in.Email); err != nil {
 		return nil, fmt.Errorf("发送邮箱验证码失败: %w", err)
@@ -183,16 +158,15 @@ func registerProtocol(ctx context.Context, in Input) (*Result, error) {
 		in.logf("ValidatePassword 跳过/失败(非致命): %v", err)
 	}
 
-	// 2) collect the token minted in parallel, then submit signup.
-	mint := <-mintCh
-	if mint.err != nil {
-		return nil, fmt.Errorf("签发 Turnstile 令牌失败: %w", mint.err)
+	in.logf("签发 Turnstile（2Captcha HTTP）")
+	token, err := mintTurnstileToken(ctx, in, scfg.SiteKey, protocol.SiteURL+"/sign-up")
+	if err != nil {
+		return nil, fmt.Errorf("签发 Turnstile 令牌失败: %w", err)
 	}
-	token := mint.token
-	in.logf("Turnstile 令牌已就绪(len=%d)，转协议注册", len(token))
-
+	in.logf("Turnstile 令牌已就绪(len=%d)，提交注册", len(token))
 	body := protocol.BuildSignupBody(in.Email, in.Password, code, token)
 	text, sso, err := client.SignupServerAction(body, scfg.ActionID, scfg.StateTree)
+	in.logf("signup 响应: err=%v sso=%t body=%s", err, sso != "", trimText(text, 800))
 	if sso == "" {
 		sso = protocol.ExtractSSOFromText(text)
 	}
@@ -224,24 +198,4 @@ func registerProtocol(ctx context.Context, in Input) (*Result, error) {
 		}},
 	}
 	return &Result{AuthJSON: auth}, nil
-}
-
-// maybeAuthBridge starts a loopback proxy bridge only when the upstream proxy
-// carries credentials (Chromium can use an unauthenticated proxy directly).
-func maybeAuthBridge(raw string) (*proxyutil.AuthBridge, string) {
-	if strings.TrimSpace(raw) == "" {
-		return nil, ""
-	}
-	u, err := url.Parse(proxyutil.Normalize(raw))
-	if err != nil || u.User == nil {
-		return nil, ""
-	}
-	if pass, hasPass := u.User.Password(); !hasPass && pass == "" && u.User.Username() == "" {
-		return nil, ""
-	}
-	bridge, addr, berr := proxyutil.StartAuthBridge(raw)
-	if berr != nil {
-		return nil, ""
-	}
-	return bridge, addr
 }

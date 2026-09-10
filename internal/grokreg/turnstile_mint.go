@@ -2,194 +2,50 @@ package grokreg
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
-	"time"
 
-	"github.com/go-rod/rod"
+	"chatgpt-register/internal/captcha"
 )
 
-// The CloakBrowser mint helper (scripts/turnstile_mint.py) renders x.ai's
-// Turnstile widget in a patched Chromium and returns a signed token. The script
-// ships with this repo; override the interpreter/script per registration via the
-// Input fields or the GROK_TURNSTILE_* environment variables.
 const (
-	defaultTurnstilePython   = "/opt/cloakbrowser-venv/bin/python"
-	defaultTurnstileMode     = "offscreen"
 	fallbackTurnstileSitekey = "0x4AAAAAAAhr9JGVDZbrZOo0"
 	turnstileSignURL         = "https://accounts.x.ai/sign-up"
 )
 
-// turnstileScriptDirs 列出仓库自带脚本的可能位置：开发时在仓库根的
-// scripts/，部署时安装到 <prefix>/share/chatgpt-register/scripts/。
-func turnstileScriptDirs() []string {
-	var dirs []string
-	if exe, err := os.Executable(); err == nil {
-		exeDir := filepath.Dir(exe)
-		dirs = append(dirs,
-			filepath.Join(exeDir, "scripts"),
-			filepath.Join(exeDir, "..", "share", "chatgpt-register", "scripts"),
-		)
-	}
-	if wd, err := os.Getwd(); err == nil {
-		dirs = append(dirs, filepath.Join(wd, "scripts"))
-	}
-	return append(dirs, "/usr/local/share/chatgpt-register/scripts")
-}
-
-// turnstileScriptPath 只认仓库自带的脚本，不再回落到其他项目装在系统目录的副本。
-func turnstileScriptPath(name string) string {
-	for _, dir := range turnstileScriptDirs() {
-		p := filepath.Join(dir, name)
-		if st, err := os.Stat(p); err == nil && !st.IsDir() {
-			return p
-		}
-	}
-	return ""
-}
-
-// turnstilePython 优先用装了 cloakbrowser + playwright 的专用 venv，
-// 缺失时回落到系统 python3（依赖见 scripts/requirements.txt）。
-func turnstilePython() string {
-	if st, err := os.Stat(defaultTurnstilePython); err == nil && !st.IsDir() {
-		return defaultTurnstilePython
-	}
-	if p, err := exec.LookPath("python3"); err == nil {
-		return p
-	}
-	return defaultTurnstilePython
-}
-
-// mintTurnstileToken shells out to the CloakBrowser mint helper and returns the
-// signed Turnstile token. It routes through the registration's loopback proxy so
-// the token's remote IP matches the account being created.
 func mintTurnstileToken(ctx context.Context, in Input, sitekey, pageURL string) (string, error) {
-	python := firstNonEmpty(in.TurnstilePython, os.Getenv("GROK_TURNSTILE_PYTHON"), turnstilePython())
-	script := firstNonEmpty(in.TurnstileScript, os.Getenv("GROK_TURNSTILE_SCRIPT"),
-		turnstileScriptPath("turnstile_mint.py"))
-	if script == "" {
-		return "", fmt.Errorf("找不到 turnstile_mint.py，已查找: %s", strings.Join(turnstileScriptDirs(), ", "))
-	}
-	mode := firstNonEmpty(in.TurnstileMode, os.Getenv("TURNSTILE_MODE"), defaultTurnstileMode)
 	if strings.TrimSpace(sitekey) == "" {
 		sitekey = fallbackTurnstileSitekey
 	}
 	if strings.TrimSpace(pageURL) == "" {
 		pageURL = turnstileSignURL
 	}
-
-	in.logf("Turnstile 签发脚本: %s (python=%s mode=%s)", script, python, mode)
-
-	cctx, cancel := context.WithTimeout(ctx, 140*time.Second)
-	defer cancel()
-
-	args := []string{
-		script,
-		"--site-key", sitekey,
-		"--url", pageURL,
-		"--timeout", "110",
-		"--mode", mode,
+	key := strings.TrimSpace(in.CaptchaKey)
+	if key == "" {
+		return "", fmt.Errorf("未配置 2Captcha key（设置 captcha_2captcha_key）")
 	}
-	if proxy := strings.TrimSpace(in.mintProxy); proxy != "" {
-		if !strings.Contains(proxy, "://") {
-			proxy = "http://" + proxy
-		}
-		args = append(args, "--proxy", proxy)
-	}
-
-	cmd := exec.CommandContext(cctx, python, args...)
-	cmd.Env = append(os.Environ(), "CLOAKBROWSER_SUPPRESS_FONT_WARNING=1")
-	if strings.TrimSpace(os.Getenv("HOME")) == "" {
-		cmd.Env = append(cmd.Env, "HOME=/root")
-	}
-
-	var stdout, stderr strings.Builder
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("%v: %s", err, tailText(stderr.String(), 200))
-	}
-
-	token := strings.TrimSpace(stdout.String())
-	if len(token) < 20 {
-		return "", fmt.Errorf("mint 返回的 token 过短(len=%d)", len(token))
-	}
-	return token, nil
-}
-
-// pageSitekey reads the Turnstile sitekey mounted on the current page so the
-// mint renders the same widget. Returns "" when none is present.
-func pageSitekey(page *rod.Page) string {
-	v, err := page.Eval(`() => {
-		const el = document.querySelector('[data-sitekey]');
-		if (el && el.getAttribute('data-sitekey')) return el.getAttribute('data-sitekey');
-		const f = document.querySelector('iframe[src*="turnstile"]');
-		if (f) {
-			const m = (f.getAttribute('src') || '').match(/[?&]sitekey=([^&]+)/);
-			if (m) { try { return decodeURIComponent(m[1]); } catch (e) { return m[1]; } }
-		}
-		return '';
-	}`)
+	in.logf("Turnstile 走 2Captcha HTTP（不开浏览器） sitekey=%s", trimText(sitekey, 18))
+	solver := &captcha.TwoCaptcha{Key: key, Log: in.Log}
+	tok, err := solver.SolveTurnstile(ctx, sitekey, pageURL, "", "")
 	if err != nil {
-		return ""
+		return "", fmt.Errorf("2Captcha Turnstile: %w", err)
 	}
-	return strings.TrimSpace(v.Value.Str())
-}
-
-// injectMintedToken delivers a signed token into the page's Turnstile state two
-// ways: it replays the token through x.ai's own render callback (captured by the
-// turnstilePatch extension via window.__cfSolve) so the React form accepts it,
-// and it also writes the token into the cf-turnstile-response field for plain
-// integrations. Returns the number of site callbacks fired (>0 means the React
-// form's state was updated) and whether the DOM field now holds the token.
-func injectMintedToken(page *rod.Page, token string) (callbacks int, fieldSet bool) {
-	v, err := page.Eval(`(token) => {
-		let input = document.querySelector('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]');
-		if (!input) {
-			input = document.createElement('input');
-			input.type = 'hidden';
-			input.name = 'cf-turnstile-response';
-			(document.forms[0] || document.body).appendChild(input);
-		}
-		const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set
-			|| Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
-		if (setter) setter.call(input, token); else input.value = token;
-		input.dispatchEvent(new Event('input', { bubbles: true }));
-		input.dispatchEvent(new Event('change', { bubbles: true }));
-		let cbs = 0;
-		try { if (typeof window.__cfSolve === 'function') cbs = window.__cfSolve(token); } catch (e) { }
-		return JSON.stringify({ cbs: cbs, len: String(input.value || '').length });
-	}`, token)
-	if err != nil {
-		return 0, false
-	}
-	var r struct {
-		Cbs int `json:"cbs"`
-		Len int `json:"len"`
-	}
-	if json.Unmarshal([]byte(v.Value.Str()), &r) != nil {
-		return 0, false
-	}
-	return r.Cbs, r.Len >= 20
+	return tok, nil
 }
 
 func firstNonEmpty(vals ...string) string {
 	for _, v := range vals {
-		if strings.TrimSpace(v) != "" {
-			return v
+		if s := strings.TrimSpace(v); s != "" {
+			return s
 		}
 	}
 	return ""
 }
 
-func tailText(s string, n int) string {
+func trimText(s string, n int) string {
 	s = strings.TrimSpace(s)
-	if len(s) <= n {
+	if n <= 0 || len(s) <= n {
 		return s
 	}
-	return s[len(s)-n:]
+	return s[:n]
 }

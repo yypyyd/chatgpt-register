@@ -486,7 +486,7 @@ func (p *Producer) run(id uint) {
 		return
 	}
 
-	// 并发闸门：并发已满时排队等待，避免多个有头浏览器同时抢 CPU 互相超时。
+	// 并发闸门：并发已满时排队等待。
 	if !p.acquireSlot(ctx, id) {
 		p.appendLog(id, "已取消（排队等待空闲注册槽位时被停止）")
 		p.db.Model(&models.GrokRegistration{}).Where("id = ?", id).Updates(map[string]any{
@@ -502,15 +502,10 @@ func (p *Producer) run(id uint) {
 	since := time.Now().Add(-30 * time.Second)
 
 	in := grokreg.Input{
-		Email:    reg.Email,
-		Password: reg.Password,
-		Proxy:    p.NextProxy(),
-		// Match the reference project: Grok registration is headed by default.
-		// A dedicated opt-in setting can still enable headless for diagnostics.
-		Headless: p.SettingOn("grok_headless"),
-		// 协议注册为默认路径：只借浏览器签发 Turnstile 令牌，拿到后立即退出、
-		// 其余全走 HTTP/gRPC。设置 grok_engine=browser 可回退到旧的全程浏览器流程。
-		Engine:              p.Setting("grok_engine"),
+		Email:               reg.Email,
+		Password:            reg.Password,
+		Proxy:               p.NextProxy(),
+		CaptchaKey:          grokCaptchaKey(p),
 		Impersonate:         p.Setting("grok_impersonate"),
 		ImpersonateFallback: p.Setting("grok_impersonate_fallback"),
 		FlareSolverrURL:     p.Setting("grok_flaresolverr_url"),
@@ -524,9 +519,6 @@ func (p *Producer) run(id uint) {
 				return p.fetchCode(ctx, id, reg.MailboxID, since)
 			}
 			return p.waitManualCode(ctx, id)
-		},
-		SaveShot: func(png []byte) {
-			p.db.Model(&models.GrokRegistration{}).Where("id = ?", id).Update("shot", png)
 		},
 	}
 
@@ -665,6 +657,10 @@ func (p *Producer) appendLog(id uint, line string) {
 	}
 	p.db.Model(&models.GrokRegistration{}).Where("id = ?", id).
 		Update("log", prodcore.AppendLogLine(reg.Log, line, maxLogBytes))
+}
+
+func grokCaptchaKey(p *Producer) string {
+	return strings.TrimSpace(p.Setting("captcha_2captcha_key"))
 }
 
 // acquireSlot 阻塞直到拿到并发槽位；ctx 取消时返回 false。

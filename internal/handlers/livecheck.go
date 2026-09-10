@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -150,12 +149,9 @@ func (h *Handler) LiveCheckStart(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true, "total": len(items)})
 }
 
-// cgLiveOptions 测活与注册走同一套代理池 / 浏览器选择：每个账号独立出口，避免所有账号从服务器同一 IP 被探测。
+// cgLiveOptions 测活与注册走同一套代理池：每个账号独立出口，避免所有账号从服务器同一 IP 被探测。
 func (h *Handler) cgLiveOptions() livecheck.CGOptions {
-	opt := livecheck.CGOptions{
-		BrowserBin: strings.TrimSpace(h.settingValue("chatgpt_browser_bin")),
-		UsePool:    h.settingValue("chatgpt_browser_pool") != "0",
-	}
+	opt := livecheck.CGOptions{}
 	if h.settingValue("proxy_enabled") != "0" {
 		opt.Proxies = proxyutil.List(h.settingValue("proxy_list"))
 	}
@@ -181,7 +177,7 @@ func (h *Handler) LiveCheckOne(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "该账号没有可测活的会话数据"})
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	res := livecheck.CheckChatGPT(ctx, []livecheck.CGItem{item}, nil, h.cgLiveOptions())
 	st := res[item.ID]
@@ -236,8 +232,7 @@ func cgItemFromAuth(id uint, authData string) (livecheck.CGItem, bool) {
 	}
 	return livecheck.CGItem{
 		ID: id, Token: session.AccessToken, Cookies: session.Cookies, Proxy: session.Proxy,
-		UserAgent: session.UserAgent, Screen: session.Screen, Timezone: session.Timezone,
-		Locale: session.Locale, Languages: session.Languages,
+		Languages: session.Languages,
 	}, true
 }
 

@@ -3,12 +3,13 @@ package grokreg
 import (
 	"context"
 	cryptorand "crypto/rand"
+	"errors"
 	"fmt"
 	"math/big"
-	"strings"
 )
 
-const userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+// ErrEmailTaken 该邮箱已有 Grok 账号，属于永久失败。
+var ErrEmailTaken = errors.New("该邮箱已注册 Grok")
 
 type Input struct {
 	Email     string
@@ -16,42 +17,16 @@ type Input struct {
 	FirstName string
 	LastName  string
 	Proxy     string
-	Headless  bool
 
-	// TurnstilePython/TurnstileScript/TurnstileMode locate the CloakBrowser mint
-	// helper that signs a Cloudflare Turnstile token for x.ai. Empty values fall
-	// back to the GROK_TURNSTILE_* environment variables and finally to the
-	// server defaults in turnstile_mint.go.
-	TurnstilePython string
-	TurnstileScript string
-	TurnstileMode   string
-
-	// Engine selects the registration path. "protocol" (default) runs the whole
-	// flow over HTTP/gRPC and only spawns a browser to mint the Turnstile token;
-	// "browser" keeps the legacy rod flow. Empty defaults to protocol.
-	Engine string
-
-	// Impersonate / ImpersonateFallback control the TLS fingerprint of the
-	// protocol client (default chrome_131, fallback chrome_124,chrome_120).
 	Impersonate         string
 	ImpersonateFallback string
-
-	// FlareSolverrURL enables a Cloudflare clearance fallback: when the protocol
-	// client is blocked, cf_clearance cookies are fetched from FlareSolverr and
-	// reused. ClearanceProxy is the egress FlareSolverr uses; ClearanceURLs is a
-	// comma-separated list of hosts to prewarm. All optional.
-	FlareSolverrURL string
-	ClearanceProxy  string
-	ClearanceURLs   string
+	FlareSolverrURL     string
+	ClearanceProxy      string
+	ClearanceURLs       string
+	CaptchaKey          string
 
 	WaitCode func(ctx context.Context) (string, error)
 	Log      func(format string, a ...any)
-	SaveShot func(png []byte)
-
-	// mintProxy is the loopback proxy Chromium uses for this registration. The
-	// mint runs through the same egress so the token's remote IP matches the
-	// submission. Set internally by registerBrowser.
-	mintProxy string
 }
 
 type Result struct {
@@ -79,9 +54,6 @@ func Register(ctx context.Context, in Input) (*Result, error) {
 	}
 	if in.LastName == "" {
 		in.LastName = lastNames[ri(len(lastNames))]
-	}
-	if strings.EqualFold(strings.TrimSpace(in.Engine), "browser") {
-		return registerBrowser(ctx, in)
 	}
 	return registerProtocol(ctx, in)
 }

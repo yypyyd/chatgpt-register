@@ -9,9 +9,6 @@ import (
 	"time"
 
 	"chatgpt-register/internal/proxyutil"
-
-	"github.com/go-rod/rod"
-	"github.com/go-rod/rod/lib/proto"
 )
 
 // geoInfo 是 ip-api.com 的地理定位结果。
@@ -27,8 +24,7 @@ type geoInfo struct {
 	Query       string  `json:"query"`
 }
 
-// lookupGeoIPViaRequest 直接发起 HTTP 请求（经由代理出口）查询当前出口 IP 的地理位置，
-// 不占用浏览器页面，从而可在创建页面前拿到地理信息、一次性注入一致指纹。
+// lookupGeoIPViaRequest 经由代理出口查询当前 IP 的地理位置，用于对齐 locale / 语言。
 func lookupGeoIPViaRequest(in Input) *geoInfo {
 	in.logf("🌍 正在通过代理查询出口 IP 地理位置...")
 
@@ -41,7 +37,6 @@ func lookupGeoIPViaRequest(in Input) *geoInfo {
 		}
 		transport.Proxy = http.ProxyURL(pu)
 	}
-	// 只是拿地区做语言/时区对齐，拿不到就回退 en-US；别让它吃掉注册预算。
 	client := &http.Client{Timeout: 12 * time.Second, Transport: transport}
 
 	req, err := http.NewRequest(http.MethodGet,
@@ -50,7 +45,6 @@ func lookupGeoIPViaRequest(in Input) *geoInfo {
 		in.logf("⚠️ GeoIP 查询失败，跳过地理位置对齐: %v", err)
 		return nil
 	}
-	// 带上正常浏览器的 UA/语言，避免被 ip-api 以空 UA 拒绝
 	req.Header.Set("User-Agent", geoLookupUserAgent)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
@@ -77,24 +71,7 @@ func lookupGeoIPViaRequest(in Input) *geoInfo {
 	return &g
 }
 
-// applyGeo 把地理信息映射到浏览器：时区、经纬度、locale。
-// UA / Accept-Language 已在 Session.NewPage 里按同一份地理信息注入。
-func applyGeo(page *rod.Page, g *geoInfo, in Input) {
-	if g.Timezone != "" {
-		_ = (proto.EmulationSetTimezoneOverride{TimezoneID: g.Timezone}).Call(page)
-	}
-	lat, lon, acc := g.Lat, g.Lon, 50.0
-	_ = (proto.EmulationSetGeolocationOverride{Latitude: &lat, Longitude: &lon, Accuracy: &acc}).Call(page)
-
-	locale, languages := localeForCountry(g.CountryCode)
-	_ = (proto.EmulationSetLocaleOverride{Locale: locale}).Call(page)
-	in.logf("✅ 已对齐时区/坐标/语言: tz=%s locale=%s lang=%s", g.Timezone, locale, languages)
-}
-
 // localeForCountry 按国家码给出 ICU locale 与语言列表，未知国家回退 en-US。
-// 语言列表不带 q 值：CDP 的 acceptLanguage 只接受语言标签列表，Chrome 自己生成
-// Accept-Language 的 q 值与 navigator.languages；带 q 值传进去会得到
-// "en-US,en;q=0.9;q=0.9" 这种畸形请求头。
 func localeForCountry(cc string) (locale, languages string) {
 	switch strings.ToUpper(strings.TrimSpace(cc)) {
 	case "US":

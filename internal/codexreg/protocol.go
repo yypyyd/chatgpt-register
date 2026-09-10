@@ -259,8 +259,21 @@ func truncateForLog(s string, n int) string {
 	return s[:n] + "..."
 }
 
-// registerProtocol 用纯 HTTP 请求完成注册，产出与浏览器流程等价的 browserResult。
-func registerProtocol(ctx context.Context, in Input) (res *browserResult, err error) {
+// protoResult 协议注册产出：accessToken、Cookie 以及本次出口/指纹信息。
+type protoResult struct {
+	AccessToken string
+	Cookies     []WebCookie
+	UserAgent   string
+	Screen      ScreenProfile
+	Locale      string
+	Languages   string
+	EgressIP    string
+	Country     string
+	Timezone    string
+}
+
+// registerProtocol 用纯 HTTP 请求完成注册。
+func registerProtocol(ctx context.Context, in Input) (res *protoResult, err error) {
 	in.logf("🚀 启动纯协议注册流程（TLS 指纹 %s）...", protocolTLSProfile)
 
 	geo := lookupGeoIPViaRequest(in)
@@ -272,7 +285,7 @@ func registerProtocol(ctx context.Context, in Input) (res *browserResult, err er
 	if err != nil {
 		return nil, err
 	}
-	res = &browserResult{UserAgent: c.ua, Screen: c.screen, Locale: locale, Languages: languages}
+	res = &protoResult{UserAgent: c.ua, Screen: c.screen, Locale: locale, Languages: languages}
 	if geo != nil {
 		res.EgressIP, res.Country, res.Timezone = geo.Query, geo.CountryCode, geo.Timezone
 	}

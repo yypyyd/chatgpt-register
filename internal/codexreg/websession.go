@@ -3,15 +3,11 @@ package codexreg
 import (
 	"encoding/json"
 	"fmt"
-	"sort"
 	"strings"
-
-	"github.com/go-rod/rod"
-	"github.com/go-rod/rod/lib/proto"
 )
 
-// WebCookie is the portable part of a Chrome cookie needed to restore a
-// ChatGPT browser session. Values are credentials and must never be logged.
+// WebCookie is the portable part of a ChatGPT web session cookie.
+// Values are credentials and must never be logged.
 type WebCookie struct {
 	Name     string  `json:"name"`
 	Value    string  `json:"value"`
@@ -25,71 +21,13 @@ type WebCookie struct {
 	Priority string  `json:"priority,omitempty"`
 }
 
-// CaptureWebCookies captures only OpenAI/ChatGPT cookies from the current
-// browser context. Keeping the domain/path/httpOnly metadata is required for
-// restoring the session; an access token alone is not a browser session.
-func CaptureWebCookies(browser *rod.Browser) ([]WebCookie, error) {
-	if browser == nil {
-		return nil, fmt.Errorf("浏览器会话为空")
-	}
-	raw, err := browser.GetCookies()
-	if err != nil {
-		return nil, fmt.Errorf("读取网页 Cookie 失败: %w", err)
-	}
-	out := make([]WebCookie, 0, len(raw))
-	for _, c := range raw {
-		if c == nil || c.Name == "" || !isChatGPTCookieDomain(c.Domain) {
-			continue
-		}
-		out = append(out, WebCookie{
-			Name: c.Name, Value: c.Value, Domain: c.Domain, Path: c.Path,
-			Expires: float64(c.Expires), HTTPOnly: c.HTTPOnly, Secure: c.Secure,
-			Session: c.Session, SameSite: string(c.SameSite), Priority: string(c.Priority),
-		})
-	}
-	if len(out) == 0 {
-		return nil, fmt.Errorf("登录成功但没有捕获到 ChatGPT 网页 Cookie")
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Domain != out[j].Domain {
-			return out[i].Domain < out[j].Domain
-		}
-		if out[i].Path != out[j].Path {
-			return out[i].Path < out[j].Path
-		}
-		return out[i].Name < out[j].Name
-	})
-	return out, nil
-}
-
 func isChatGPTCookieDomain(domain string) bool {
 	d := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(domain)), ".")
 	return d == "chatgpt.com" || strings.HasSuffix(d, ".chatgpt.com") ||
 		d == "openai.com" || strings.HasSuffix(d, ".openai.com")
 }
 
-// WebCookieParams converts persisted cookies back to CDP parameters.
-func WebCookieParams(cookies []WebCookie) []*proto.NetworkCookieParam {
-	out := make([]*proto.NetworkCookieParam, 0, len(cookies))
-	for _, c := range cookies {
-		if c.Name == "" || c.Domain == "" || !isChatGPTCookieDomain(c.Domain) {
-			continue
-		}
-		expires := proto.TimeSinceEpoch(c.Expires)
-		if c.Session && c.Expires == 0 {
-			expires = -1
-		}
-		out = append(out, &proto.NetworkCookieParam{
-			Name: c.Name, Value: c.Value, Domain: c.Domain, Path: c.Path,
-			Expires: expires, HTTPOnly: c.HTTPOnly, Secure: c.Secure,
-			SameSite: proto.NetworkCookieSameSite(c.SameSite),
-			Priority: proto.NetworkCookiePriority(c.Priority),
-		})
-	}
-	return out
-}
-
-// WebSessionData 是恢复网页登录所需的 Cookie、出口和浏览器现场。
+// WebSessionData 是恢复网页登录所需的 Cookie、出口和现场信息。
 type WebSessionData struct {
 	AccessToken string
 	Cookies     []WebCookie
