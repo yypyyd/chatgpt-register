@@ -55,7 +55,6 @@ func main() {
 		log.Fatalf("init mailbox verifier: %v", err)
 	}
 	defer h.MailboxVerifier.Stop()
-	defer h.OreateMinter.Close()
 
 	r.POST("/api/login", h.Login)
 
@@ -153,31 +152,6 @@ func main() {
 		api.GET("/leonardo/registrations/livecheck/status", h.LeonardoLiveCheckStatus)
 		api.POST("/leonardo/registrations/:id/livecheck", h.LeonardoLiveCheckOne)
 
-		api.GET("/oreate/registrations", h.OreateList)
-		api.DELETE("/oreate/registrations", h.OreateDeleteAll)
-		api.POST("/oreate/registrations", h.OreateStart)
-		api.POST("/oreate/produce", h.OreateProduce)
-		api.GET("/oreate/produce/status", h.OreateProduceStatus)
-		api.POST("/oreate/produce/stop", h.OreateProduceStop)
-		api.POST("/oreate/registrations/:id/stop", h.OreateStop)
-		api.DELETE("/oreate/registrations/:id", h.OreateDelete)
-		api.GET("/oreate/registrations/:id/logs", h.OreateLog)
-		api.POST("/oreate/download", h.OreateDownload)
-		api.POST("/oreate/jt", h.OreateMintJT)
-
-		api.GET("/higgsfield/registrations", h.HiggsfieldList)
-		api.DELETE("/higgsfield/registrations", h.HiggsfieldDeleteAll)
-		api.POST("/higgsfield/registrations", h.HiggsfieldStart)
-		api.POST("/higgsfield/produce", h.HiggsfieldProduce)
-		api.GET("/higgsfield/produce/status", h.HiggsfieldProduceStatus)
-		api.POST("/higgsfield/produce/stop", h.HiggsfieldProduceStop)
-		api.POST("/higgsfield/registrations/:id/code", h.HiggsfieldSubmitCode)
-		api.POST("/higgsfield/registrations/:id/stop", h.HiggsfieldStop)
-		api.POST("/higgsfield/registrations/:id/trial", h.HiggsfieldTrial)
-		api.DELETE("/higgsfield/registrations/:id", h.HiggsfieldDelete)
-		api.GET("/higgsfield/registrations/:id/logs", h.HiggsfieldLog)
-		api.POST("/higgsfield/download", h.HiggsfieldDownload)
-
 		api.GET("/lumina/registrations", h.LuminaList)
 		api.DELETE("/lumina/registrations", h.LuminaDeleteAll)
 		api.POST("/lumina/registrations", h.LuminaStart)
@@ -198,7 +172,7 @@ func main() {
 	}
 	httpFS := http.FS(sub)
 	r.StaticFS("/static", httpFS)
-	for _, p := range []string{"login", "dashboard", "mailboxes", "accounts", "grok", "adobe", "leonardo", "oreate", "higgsfield", "lumina", "settings"} {
+	for _, p := range []string{"login", "dashboard", "mailboxes", "accounts", "grok", "adobe", "leonardo", "lumina", "settings"} {
 		p := p
 		r.GET("/"+p, func(c *gin.Context) { c.FileFromFS(p+".html", httpFS) })
 	}

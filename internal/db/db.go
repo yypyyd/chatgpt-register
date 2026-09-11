@@ -27,7 +27,8 @@ func Init(path string) (*gorm.DB, error) {
 	sqlDB.SetMaxOpenConns(1)
 	sqlDB.SetMaxIdleConns(1)
 	sqlDB.SetConnMaxLifetime(time.Hour)
-	if err := db.AutoMigrate(&models.Registration{}, &models.GrokRegistration{}, &models.AdobeRegistration{}, &models.LeonardoRegistration{}, &models.OreateRegistration{}, &models.HiggsfieldRegistration{}, &models.LuminaRegistration{}, &models.Mailbox{}, &models.Setting{}, &models.Admin{}); err != nil {
+	dropUnusedTables(db)
+	if err := db.AutoMigrate(&models.Registration{}, &models.GrokRegistration{}, &models.AdobeRegistration{}, &models.LeonardoRegistration{}, &models.LuminaRegistration{}, &models.Mailbox{}, &models.Setting{}, &models.Admin{}); err != nil {
 		return nil, err
 	}
 	normalizeLegacyStatuses(db)
@@ -50,6 +51,23 @@ func dsn(path string) string {
 	return "file:" + path + "?" + q.Encode()
 }
 
+// dropUnusedTables 丢掉已经下线的平台表。旧库里这些表只占空间，启动时有就删。
+func dropUnusedTables(db *gorm.DB) {
+	for _, name := range []string{
+		"oreate_registrations",
+		"higgsfield_registrations",
+		"dola_registrations",
+		"gmail_producer_locks",
+		"gmail_purchase_intents",
+		"gmail_registrations",
+		"gmail_sms_orders",
+		"purchase_intents",
+		"sms_orders",
+	} {
+		_ = db.Migrator().DropTable(name)
+	}
+}
+
 // reclaimOrphanRegistering 启动时把各平台残留的 registering/waiting_code 记录标为
 // register_failed。生产任务状态只在内存里，程序重启后这些"注册中"记录不会再有人
 // 推进，置为失败后可在下次生产时被重新领取（母号+裂变补齐规则）。
@@ -63,9 +81,7 @@ func reclaimOrphanRegistering(db *gorm.DB) {
 		{&models.GrokRegistration{}, "程序重启中断，可重新注册"},
 		{&models.AdobeRegistration{}, "程序重启中断，可重新注册"},
 		{&models.LeonardoRegistration{}, "程序重启中断，可重新注册"},
-		{&models.HiggsfieldRegistration{}, "程序重启中断，可重新注册"},
 		{&models.LuminaRegistration{}, "程序重启中断，可重新注册"},
-		{&models.OreateRegistration{}, "程序重启中断，可重新注册"},
 	} {
 		db.Model(m.model).Where("status IN ?", orphanStatuses).
 			Updates(map[string]any{"status": "register_failed", "note": m.note})

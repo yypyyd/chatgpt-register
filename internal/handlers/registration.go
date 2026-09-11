@@ -8,14 +8,11 @@ import (
 	"chatgpt-register/internal/auth"
 	"chatgpt-register/internal/browserboot"
 	"chatgpt-register/internal/grokproducer"
-	"chatgpt-register/internal/higgsfieldproducer"
 	"chatgpt-register/internal/leonardoproducer"
 	"chatgpt-register/internal/luminaproducer"
 	"chatgpt-register/internal/mailfetch"
 	"chatgpt-register/internal/mailverify"
 	"chatgpt-register/internal/models"
-	"chatgpt-register/internal/oreateproducer"
-	"chatgpt-register/internal/oreatereg"
 	"chatgpt-register/internal/producer"
 
 	"github.com/gin-gonic/gin"
@@ -30,13 +27,8 @@ type Handler struct {
 	GrokProducer     *grokproducer.Producer
 	AdobeProducer    *adobeproducer.Producer
 	LeonardoProducer *leonardoproducer.Producer
-	OreateProducer   *oreateproducer.Producer
 	// LuminaProducer 用浏览器注册 BytePlus Lumina（ai.byteplus.com/lumina）。
-	LuminaProducer *luminaproducer.Producer
-	// HiggsfieldProducer 走 Clerk 协议注册 higgsfield.ai，并按需跑 pricing 绑卡优惠。
-	HiggsfieldProducer *higgsfieldproducer.Producer
-	// OreateMinter 常驻浏览器会话，按需给 2api 铸造 Oreate 的一次性反爬 token。
-	OreateMinter    *oreatereg.Minter
+	LuminaProducer  *luminaproducer.Producer
 	Browser         *browserboot.Manager
 	MailboxVerifier *mailverify.Service
 	// Live 保存各平台的批量测活进度（仅内存），键：chatgpt / grok / adobe / leonardo。
@@ -49,7 +41,7 @@ func New(db *gorm.DB, authSvc *auth.Service, browser *browserboot.Manager) (*Han
 	if err := verifier.Start(); err != nil {
 		return nil, err
 	}
-	return &Handler{DB: db, Mail: mail, Auth: authSvc, Producer: producer.New(db, mail), GrokProducer: grokproducer.New(db, mail), AdobeProducer: adobeproducer.New(db, mail), LeonardoProducer: leonardoproducer.New(db, mail), OreateProducer: oreateproducer.New(db, mail), LuminaProducer: luminaproducer.New(db, mail), HiggsfieldProducer: higgsfieldproducer.New(db, mail), OreateMinter: oreatereg.NewMinter(), Browser: browser, MailboxVerifier: verifier, Live: newLiveRunners()}, nil
+	return &Handler{DB: db, Mail: mail, Auth: authSvc, Producer: producer.New(db, mail), GrokProducer: grokproducer.New(db, mail), AdobeProducer: adobeproducer.New(db, mail), LeonardoProducer: leonardoproducer.New(db, mail), LuminaProducer: luminaproducer.New(db, mail), Browser: browser, MailboxVerifier: verifier, Live: newLiveRunners()}, nil
 }
 
 type registrationInput struct {

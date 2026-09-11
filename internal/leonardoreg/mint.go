@@ -23,7 +23,7 @@ type MintOptions struct {
 
 // MintTurnstile 打开目标站点页面、在页面里显式渲染一个 Turnstile 组件并真实点选，
 // 返回 Cloudflare 签发的 token。整套点选逻辑与 Leonardo 注册共用（含反自动化补丁
-// 扩展、真光标点击），其它平台（如 higgsfield 的 Clerk 注册）走协议时借它拿 token。
+// 扩展、真光标点击），其它走协议的平台也可以借它拿 token。
 // 不做任何绕过：拿不到 token 就按失败返回。
 func MintTurnstile(ctx context.Context, opt MintOptions) (token string, err error) {
 	if opt.PageURL == "" || opt.Sitekey == "" {
