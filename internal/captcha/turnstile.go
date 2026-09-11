@@ -31,6 +31,17 @@ func (t *TwoCaptcha) SolveTurnstile(ctx context.Context, sitekey, pageURL, actio
 	if cdata != "" {
 		form.Set("data", cdata)
 	}
+	if ua := strings.TrimSpace(t.UserAgent); ua != "" {
+		form.Set("userAgent", ua)
+	}
+	if p := strings.TrimSpace(t.Proxy); p != "" {
+		form.Set("proxy", p)
+		pt := strings.ToUpper(strings.TrimSpace(t.ProxyType))
+		if pt == "" {
+			pt = "HTTP"
+		}
+		form.Set("proxytype", pt)
+	}
 	id, err := t.post(ctx, twoCaptchaIn, form)
 	if err != nil {
 		return "", err

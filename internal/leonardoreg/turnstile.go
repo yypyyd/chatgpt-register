@@ -111,6 +111,12 @@ func turnstileTokenLen(page *rod.Page) int {
 func resetTurnstile(page *rod.Page) {
 	_, _ = page.Eval(`() => {
 		try { if (window.turnstile && typeof window.turnstile.reset === 'function') window.turnstile.reset(); } catch (e) {}
+		try { window.__mintedTurnstileToken = ''; } catch (e) {}
+		document.querySelectorAll('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]').forEach(el => {
+			const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set
+				|| Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+			if (setter) setter.call(el, ''); else el.value = '';
+		});
 	}`)
 }
 

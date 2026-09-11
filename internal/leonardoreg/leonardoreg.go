@@ -1,5 +1,6 @@
-// Package leonardoreg 用浏览器完成 leonardo.ai 的邮箱注册，并采集站点 Cookie
-// （含 better-auth 会话 cookie）供导出。
+// Package leonardoreg 用 HTTP 协议完成 leonardo.ai 的邮箱注册，并采集站点 Cookie
+// （含 better-auth 会话 cookie）供导出。先用页面过 Vercel BotID，再 fetch 同一套
+// 接口（不填注册表单）。MintTurnstile 仍供其它平台借用浏览器点选。
 package leonardoreg
 
 import (
@@ -16,6 +17,9 @@ type Input struct {
 	Password string
 	Proxy    string
 	Headless bool
+
+	// CaptchaKey 是 2Captcha 的 client key，协议注册解 Turnstile 用。
+	CaptchaKey string
 
 	// EgressCheck 为 true 时先打开 api.ipify.org 打印 Chromium 实际出口 IP（排障用）。
 	EgressCheck bool
@@ -36,8 +40,8 @@ func (in Input) logf(format string, a ...any) {
 	}
 }
 
-// Register 走 Leonardo.Ai 的邮箱注册流程：
-// 邮箱 + Turnstile → 创建密码 → 邮箱验证码 → 自动登录 → 采集站点 Cookie。
+// Register 走 Leonardo.Ai 的邮箱协议注册：
+// 2Captcha Turnstile → /api/auth/signup → 邮箱验证码 → confirm-signup → sign-in/email。
 func Register(ctx context.Context, in Input) (*Result, error) {
 	if in.WaitCode == nil {
 		return nil, fmt.Errorf("缺少验证码回调")
@@ -48,7 +52,7 @@ func Register(ctx context.Context, in Input) (*Result, error) {
 	if in.Password == "" {
 		in.Password = GenPassword(16)
 	}
-	return registerBrowser(ctx, in)
+	return registerProtocol(ctx, in)
 }
 
 func ri(n int) int {

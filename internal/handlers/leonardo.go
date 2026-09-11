@@ -69,10 +69,6 @@ func (h *Handler) LeonardoStart(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if h.Browser == nil || !h.Browser.Ready() {
-		c.JSON(http.StatusConflict, gin.H{"error": "缺少浏览器，无法注册：浏览器正在下载或下载失败"})
-		return
-	}
 	reg, err := h.LeonardoProducer.Start(in.Email, in.Note)
 	if err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
@@ -85,10 +81,6 @@ func (h *Handler) LeonardoProduce(c *gin.Context) {
 	var in leonardoProduceInput
 	if err := c.ShouldBindJSON(&in); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	if h.Browser == nil || !h.Browser.Ready() {
-		c.JSON(http.StatusConflict, gin.H{"error": "缺少浏览器，无法注册：浏览器正在下载或下载失败"})
 		return
 	}
 	regs, err := h.LeonardoProducer.StartFromAccounts(in.Count)

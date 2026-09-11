@@ -26,6 +26,11 @@ type TwoCaptcha struct {
 	Key    string
 	Client *http.Client
 	Log    func(format string, a ...any)
+	// Proxy 可选，格式 user:pass@host:port。Turnstile 站点校验会核对出口 IP 时，
+	// 让打码工人走与注册相同的代理，token 才过得了 siteverify。
+	Proxy     string
+	ProxyType string
+	UserAgent string
 }
 
 func (t *TwoCaptcha) logf(format string, a ...any) {

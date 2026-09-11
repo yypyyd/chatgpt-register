@@ -79,7 +79,7 @@
 <div class="modal-mask" id="produce-modal" style="display:none">
   <div class="modal px-panel" style="width:420px">
     <h2>生产 Leonardo 账号</h2>
-    <div class="import-sub">填写要生产的账号数量，后台会从「账号管理 / 邮箱管理」取号自动注册 Leonardo.Ai，需过 Cloudflare Turnstile，邮箱验证码自动读取提交。</div>
+    <div class="import-sub">填写要生产的账号数量，后台会从「账号管理 / 邮箱管理」取号走 HTTP 协议注册 Leonardo.Ai。Turnstile 由 2Captcha 签发，邮箱验证码自动读取提交。</div>
     <label class="produce-field">
       <span>生产数量</span>
       <input id="produce-count" class="px-input" type="number" min="1" value="10">
@@ -118,6 +118,6 @@
 
 <div id="toast" class="toast" style="display:none"></div>
 <script src="/static/layout.js?v=4"></script>
-<script src="/static/leonardo.js?v=1"></script>
+<script src="/static/leonardo.js?v=2"></script>
 </body>
 </html>

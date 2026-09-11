@@ -451,14 +451,15 @@ func (p *Producer) run(id uint) {
 	}
 	defer p.ReleaseSlot()
 
-	p.appendLog(id, "开始 Leonardo 邮箱注册")
+	p.appendLog(id, "开始 Leonardo 协议注册")
 	since := time.Now().Add(-30 * time.Second)
 
 	in := leonardoreg.Input{
-		Email:    reg.Email,
-		Password: reg.Password,
-		Proxy:    p.NextProxy(),
-		Headless: p.SettingOn("leonardo_headless"),
+		Email:      reg.Email,
+		Password:   reg.Password,
+		Proxy:      p.NextProxy(),
+		Headless:   p.SettingOn("leonardo_headless"),
+		CaptchaKey: strings.TrimSpace(p.Setting("captcha_2captcha_key")),
 		// 出口 IP 探测默认关闭以提速；需排障时置 leonardo_egress_check=1。
 		EgressCheck: p.SettingOn("leonardo_egress_check"),
 		Log: func(f string, a ...any) {
