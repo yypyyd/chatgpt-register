@@ -7,6 +7,7 @@ import (
 	"chatgpt-register/internal/adobeproducer"
 	"chatgpt-register/internal/auth"
 	"chatgpt-register/internal/browserboot"
+	"chatgpt-register/internal/chatgptauth"
 	"chatgpt-register/internal/grokproducer"
 	"chatgpt-register/internal/leonardoproducer"
 	"chatgpt-register/internal/luminaproducer"
@@ -31,6 +32,7 @@ type Handler struct {
 	LuminaProducer  *luminaproducer.Producer
 	Browser         *browserboot.Manager
 	MailboxVerifier *mailverify.Service
+	GPTCredentials  *chatgptauth.Service
 	// Live 保存各平台的批量测活进度（仅内存），键：chatgpt / grok / adobe / leonardo。
 	Live map[string]*liveRunner
 }
@@ -41,7 +43,9 @@ func New(db *gorm.DB, authSvc *auth.Service, browser *browserboot.Manager) (*Han
 	if err := verifier.Start(); err != nil {
 		return nil, err
 	}
-	return &Handler{DB: db, Mail: mail, Auth: authSvc, Producer: producer.New(db, mail), GrokProducer: grokproducer.New(db, mail), AdobeProducer: adobeproducer.New(db, mail), LeonardoProducer: leonardoproducer.New(db, mail), LuminaProducer: luminaproducer.New(db, mail), Browser: browser, MailboxVerifier: verifier, Live: newLiveRunners()}, nil
+	h := &Handler{DB: db, Mail: mail, Auth: authSvc, Producer: producer.New(db, mail), GrokProducer: grokproducer.New(db, mail), AdobeProducer: adobeproducer.New(db, mail), LeonardoProducer: leonardoproducer.New(db, mail), LuminaProducer: luminaproducer.New(db, mail), Browser: browser, MailboxVerifier: verifier, Live: newLiveRunners(), GPTCredentials: chatgptauth.New(db)}
+	h.startGPTCredentialMigration()
+	return h, nil
 }
 
 type registrationInput struct {
@@ -88,6 +92,7 @@ func (h *Handler) List(c *gin.Context) {
 	for i := range regs {
 		regs[i].AuthData = ""
 		regs[i].Log = ""
+		regs[i].Password = ""
 	}
 	c.JSON(http.StatusOK, gin.H{"data": regs, "total": total, "page": page, "size": size})
 }
@@ -100,6 +105,8 @@ func (h *Handler) Get(c *gin.Context) {
 	}
 	// 不在通用接口返回私钥/完整 auth，仅下载接口按需返回
 	reg.AuthData = ""
+	reg.Password = ""
+	reg.Log = ""
 	c.JSON(http.StatusOK, reg)
 }
 
@@ -127,6 +134,7 @@ func (h *Handler) Create(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
 	}
+	reg.Password = ""
 	c.JSON(http.StatusCreated, reg)
 }
 
@@ -156,6 +164,9 @@ func (h *Handler) Update(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
 	}
+	reg.Password = ""
+	reg.AuthData = ""
+	reg.Log = ""
 	c.JSON(http.StatusOK, reg)
 }
 

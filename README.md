@@ -1,6 +1,6 @@
 # chatgpt-register
 
-> **ChatGPT 账号全自动批量注册管理台** · 纯协议注册（默认，不开浏览器） · 20 秒极速注册 · 一键裂变子号
+> **ChatGPT 账号自动注册管理台** · 协议主流程 + 官方 Sentinel SDK · 凭据真实验证后出库
 
 ---
 
@@ -14,9 +14,9 @@
 
 ## ✨ 核心优势
 
-| 🚀 20 秒极速注册 | ✅ 全自动零干预 | 🔁 母号裂变子号 |
+| 🔐 真实授权验证 | ✅ 全自动零干预 | 🔁 母号裂变子号 |
 |:---:|:---:|:---:|
-| 纯协议直连 `auth.openai.com`（Chrome 146 TLS 指纹），默认不开浏览器；风控时一键切回浏览器引擎 | 验证码自动从邮箱读取，全流程零手动操作 | 每个邮箱注册 1 个母号 + N 个别名子号，账号数量指数级增长 |
+| 注册关键动作使用 OpenAI 官方 Sentinel SDK，注册和导出均以真实 backend-api 探针为准 | 验证码自动从邮箱读取，全流程零手动操作 | 每个邮箱注册 1 个母号 + N 个别名子号；别名天然有关联风险，默认应保守使用 |
 
 | 🌐 代理池轮转 | 📊 可视化管理台 | 📦 零依赖部署 |
 |:---:|:---:|:---:|
@@ -26,19 +26,19 @@
 
 ## 🤖 纯协议注册——技术亮点
 
-> 默认引擎为**纯协议注册**：用 Chrome 146 的 TLS/HTTP2 指纹（bogdanfinn tls-client）直连 `chatgpt.com` / `auth.openai.com`，不发 Sentinel 头、不启动浏览器，单号约 15~20 秒；出口 IP 归属地决定语言/时区，Cookie 会话与 access token 完整保存。
->
-> 若 OpenAI 收紧风控（例如开始强制 Sentinel 头），设置项 `chatgpt_engine=browser` 一键切回浏览器引擎：基于 **go-rod** 驱动本机真实 Chrome（new headless），真实 UA + Client Hints、随机屏幕规格、逐键输入和轨迹点击（`isTrusted=true`）。
+> 注册以 Chrome 146 PSK TLS/HTTP2 客户端完成 HTTP 主流程；官方 Sentinel SDK 在 Node 假浏览器里执行，fetch 走同一条协议 TLS，不开 Chrome。失败即中止，不会本地伪造。假浏览器会在页面加载时启动官方的 Session Observer 收集器，并按真人节奏合成鼠标/键盘事件，环境字段（navigator / localStorage / 文本盒模型 / 屏幕 DPR）与真实 Chrome 逐项对齐——否则账号会在注册后 6~16 分钟被异步撤销 access token（`token_revoked`）。出口 IP 归属地决定语言/时区，完整 Cookie 会话与 access token 会保存。导出直接使用库存凭据，不在下载时走代理；测活仍单独检查。
 
 ### 注册全流程（全自动，无需人工）
 
 ```
 查出口 IP 归属地 → 按地区决定语言 / 时区
     ↓
-[默认·纯协议] Chrome 146 TLS 指纹直连 chatgpt.com → 取 CSRF → authorize（自动发出邮箱验证码）
-[可切换·浏览器] 启动本机 Chrome（new headless，去自动化参数，随机屏幕规格，真实 UA + Client Hints）→ 打开注册页逐键输入邮箱
+Chrome TLS 指纹直连 chatgpt.com → 首页 → /auth/login_with → providers / csrf → signin → authorize（自动发出邮箱验证码）
+验证码页 / 资料页加载时，Node 假浏览器调用官方 Sentinel SDK 的 init(flow)，Session Observer 开始观察，
+等待期间做稀疏的鼠标漂移（Windows Chrome 146 环境，网络走协议 TLS）
     ↓
-实时监听邮箱，自动读取 6 位验证码并提交（最长等待 3 分钟，协议引擎自动重发一次）
+实时监听邮箱，自动读取 6 位验证码；在页面上停留 14~32 秒后，按真人节奏点输入框、逐位输入、点提交并签发 token
+（最长等待 3 分钟，协议引擎自动重发一次）
     ↓
 补全资料（姓名/生日）→ 回调换取会话 → 取 accessToken
     ↓
@@ -53,21 +53,18 @@
 
 | 特性 | 说明 |
 |------|------|
-| **纯协议引擎（默认）** | `internal/codexreg/protocol.go`：bogdanfinn tls-client 以 Chrome 146 TLS/HTTP2 指纹直连，完成 CSRF→authorize→邮箱 OTP→create_account→callback→session 全链路；无浏览器、无 Sentinel 头，单号约 15~20 秒。CF 若返回 `cf-mitigated: challenge` 会映射为 IP 风控错误，自动换 IP 重试 |
-| **浏览器引擎（回退）** | 设置 `chatgpt_engine=browser` 切回 rod + 真实 Chrome + 共享进程池路径，支持注册后预热对话；OpenAI 若开始强制 Sentinel 头时切此模式 |
-| **真人交互**（浏览器引擎） | 键盘逐键 keydown/keyup（Shift 字符带修饰键）、鼠标带轨迹移动后再点击（`isTrusted=true`）、步骤间随机停顿；不用 `insertText` 和 `element.click()` |
-| **屏幕随机化** | 每次注册随机一套常见桌面分辨率，并还原"屏幕 > 窗口 > 视口"的层次，账号之间不共用同一屏幕指纹 |
-| **注册后预热**（浏览器引擎） | 注册成功先在同一浏览器、同一出口 IP 里发一条普通问题并等回复；开启时预热是成功关卡，不能完成网页对话的账号不会进入可用库存 |
+| **协议主流程** | `internal/codexreg/protocol.go`：bogdanfinn tls-client 完成 CSRF→authorize→邮箱 OTP→create_account→callback→session；官方 Sentinel 由 Node 假浏览器执行 SDK 签发，识别到旧伪 token 立即失败。CF challenge 会映射为临时/IP 风控错误 |
+| **屏幕随机化** | 每次注册随机一套常见桌面分辨率写入会话画像，账号之间不共用同一屏幕指纹 |
 | **网页会话持久化** | 保存 ChatGPT/OpenAI 域的完整 Cookie（含 domain/path/httpOnly/secure/expiry），可导出并恢复真正的 `chatgpt.com` 登录会话；access token 仅作为会话派生凭据保存 |
 | **验证码自动读取** | 直接对接邮箱 API（Outlook/Gmail），每 5 秒轮询一次，无需人工复制粘贴 |
 | **GeoIP 自动对齐** | 注册前检测代理 IP 归属地，自动设置匹配的语言 / 时区 / 坐标；注册 UA、出口 IP、地区、代理写入 `auth_data`，下游用号时可沿用 |
-| **测活不串号** | 测活为每个账号单独一个浏览器上下文、单独走代理出口，恢复该账号 Cookie 后验证 `/api/auth/session`；不再把 token 塞进无 Cookie 的新浏览器请求 `/backend-api/me` 造成 401 误判 |
-| **共享进程池**（浏览器引擎） | 多个账号共用一个 Chrome 进程、各自独立 BrowserContext（cookie / 代理出口 / 窗口尺寸 / 屏幕 / 语言互相隔离），每号省 150~300MB 内存与 1~3 秒启动，上下文分配约 2ms；进程按时长 / 累计账号数自动退役重启 |
-| **IP 拦截识别** | Cloudflare 整页人机验证、提交邮箱后服务端无响应都识别为「出口 IP 被拦」，自动换住宅 IP 重试，不再当成邮箱失败白等 60 秒进冷却 |
-| **浏览器选择** | 默认优先本机安装的 Chrome/Edge（最新版、真实品牌）；没有则回退到自动下载的 Chromium |
-| **无头模式** | 生产环境开启无头模式，无需显示器，支持服务器 / VPS 部署 |
-| **截图存证** | 注册每个关键步骤自动截图，失败时可直接在管理台查看现场图，快速定位问题 |
-| **并发安全** | 多个注册任务并发执行，每个任务独立浏览器上下文，互不干扰 |
+| **会话与 AT 双状态** | 页面分别显示“账号/长期凭据”与“当前 access token”；绿色 AT 只能来自真实 `/backend-api/conversation/init` 授权探针，Cookie 会话存在、JWT `exp` 未到或注册成功都不等于 AT 有效 |
+| **IP 拦截识别** | Cloudflare challenge、auth 限流都识别为「出口 IP 被拦」，自动换住宅 IP 重试 |
+| **官方 Sentinel** | Node 假浏览器执行官方 SDK；拿不到真实 token 或识别到旧伪 token 都会让注册失败 |
+| **会话观察器（so）** | 官方 SDK 的收集器监听 keydown / pointermove / click / scroll / paste / input / wheel。假浏览器在页面就绪时启动它，并合成真人的输入事件；日志里会打印 `Session Observer so_window=… keydown=… pointermove=…`，零交互的快照会直接拒绝提交 |
+| **环境指纹对齐** | dx 程序会量隐藏 div 的文字盒子、枚举 `localStorage` 键、读 `navigator` 原型等；假环境按真实 Chrome 实测数据补齐（`scripts/font_metrics.js`、`scripts/nav_keys.js`）。`t` 若只剩一条报错文本会直接失败，不提交 |
+| **请求头对齐** | sec-ch-ua 的 GREASE 品牌按 Chrome 算法生成，只发 3 个低熵 Client Hints，HTTP/2 线上头的集合、取值与顺序逐项对齐真实 Chrome |
+| **并发安全** | GPT 并发跟随设置里的「最大并发数」，默认 45 秒错峰启动，每个任务独立 TLS 会话和 Node Sentinel 进程 |
 
 ---
 
@@ -94,13 +91,15 @@ chatgpt-register/
 ├── main.go                  # 入口：Gin 路由注册 + 静态文件嵌入
 ├── internal/
 │   ├── auth/                # JWT 鉴权服务（单 token、自动续期、落库）
-│   ├── browserboot/         # Rod 浏览器生命周期管理（启动时自动下载 Chromium）
-│   ├── codexreg/            # ChatGPT 注册核心逻辑（纯协议 + 浏览器双引擎）
-│   │   ├── protocol.go      # 纯协议注册（Chrome TLS 指纹直连 auth.openai.com，默认）
-│   │   ├── browser.go       # 浏览器注册流程（回退引擎，rod + 真实 Chrome）
+│   ├── browserboot/         # Rod 浏览器生命周期（Adobe / Grok / Lumina 用，GPT 注册不启动浏览器）
+│   ├── chatgptauth/         # ChatGPT 凭据刷新、真实探针与安全出库
+│   ├── codexreg/            # ChatGPT 纯协议注册
+│   │   ├── protocol.go      # 协议注册（Chrome TLS 指纹直连 auth.openai.com）
+│   │   ├── sentinel_browser.go # 官方 Sentinel 签发入口（只走 Node 假浏览器）
+│   │   ├── access_token.go  # Web Session / OAuth 刷新与 backend-api 探针
 │   │   ├── codex.go         # accessToken 元数据解析
 │   │   ├── geoip.go         # IP 归属地检测（代理验证）
-│   │   └── codexreg.go      # 注册任务入口（按 chatgpt_engine 分发引擎）
+│   │   └── codexreg.go      # 注册任务入口（只走协议引擎）
 │   ├── adobereg/            # Adobe(Firefly) 注册核心逻辑（独立浏览器自动化）
 │   ├── adobeproducer/       # Adobe 批量注册调度器（复用邮箱池自动取码）
 │   ├── db/                  # SQLite 数据库初始化（纯 Go 驱动，无需 CGO）
@@ -246,15 +245,10 @@ ADDR=8080 ./chatgpt-register.exe
 
 | 参数 | 说明 | 建议值 |
 |------|------|--------|
-| 并发数 | 同时注册的账号数量 | 3 ~ 5 |
+| 并发数 | 同时注册的账号数量，GPT 按这个数字执行 | 4～6 |
 | 裂变数量 | 每个邮箱注册的子号数 | 5（即 1母 + 5子 = 6个账号）；`+别名` 子号与母号天然可被关联，追求存活率时建议调低甚至设为 0 |
-| 无头模式 | 是否隐藏浏览器窗口 | 生产环境建议开启 |
+| 注册错峰间隔 | 相邻两个 GPT 任务实际启动的最小间隔 | 45 秒 |
 | 代理池 | 每行一个代理，格式见下方 | 建议动态住宅代理，每号独立出口 |
-| GPT 注册引擎 | `protocol` 纯协议（默认）/ `browser` 浏览器自动化（`chatgpt_engine`） | protocol |
-| GPT 注册后预热对话 | 注册成功后先发一条普通对话再取 token（`chatgpt_warmup`，仅浏览器引擎生效） | 开启 |
-| GPT 注册浏览器 | 留空优先本机 Chrome；`rod` 用内置 Chromium；或填路径（`chatgpt_browser_bin`） | 留空 |
-| GPT 共享浏览器进程池 | 多账号共用 Chrome 进程、独立上下文（`chatgpt_browser_pool`） | 开启 |
-| 每进程账号数 | 一个 Chrome 进程同时承载的账号数（`chatgpt_contexts_per_host`） | 4；16 核 16G 机器并发 8 时可设 4~8 |
 
 **代理格式：**
 ```
@@ -279,7 +273,7 @@ http://ip:port
 - 进入「GPT 注册」点击任意账号可查看**实时执行日志**（步骤级别，精确到秒）
 - 点击「截图」可查看注册过程中的**浏览器截图**，方便排查失败原因
 - 支持按状态筛选：待注册 / 注册中 / 已注册 / 注册失败
-- 支持导出 ChatGPT 网页 Cookie 会话、Sub2API 聚合 JSON，或 CLIProxyAPI（CPA）auth-dir 格式；网页会话和 CPA 多账号导出均为 ZIP
+- 支持导出 ChatGPT 网页 Cookie 会话、Sub2API 聚合 JSON，或 CLIProxyAPI（CPA）auth-dir 格式。导出直接使用库存里的 access token 和网页 Cookie，不在下载时刷新或探针。已撤销、需重新登录、JWT 已过期的号不进文件
 
 ---
 
@@ -294,21 +288,22 @@ http://ip:port
 **Q：不配置代理可以用吗？**
 > A：可以，留空即直连。但大量并发注册建议配置代理池，避免 IP 被限流。
 
-**Q：能不能做成纯协议注册（不开浏览器）？**
-> A：**ChatGPT 注册默认已是纯协议**（设置项 `chatgpt_engine`，默认 `protocol`）。我们用 Chrome 146 的 TLS/HTTP2 指纹（bogdanfinn tls-client）直连 `chatgpt.com` / `auth.openai.com` 走完整个注册流程：CSRF → authorize → 邮箱 OTP → create_account → callback → `/api/auth/session` 取 access token → 保存 ChatGPT/OpenAI 域完整 Cookie。整条链路不启动任何浏览器，单号约 15~20 秒。
->
-> 截至 2026-09 实测：服务端**不强制** OpenAI Sentinel 头（VM 指纹 + PoW + Turnstile），Cloudflare 只校验 TLS/HTTP2 指纹与 UA/Client Hints 自洽——Chrome 131 指纹会被 CF 拦截（`cf-mitigated: challenge`），Chrome 133/146 直接放行。如果哪天 OpenAI 开始强制 Sentinel，把 `chatgpt_engine` 切到 `browser` 即可回退到真实 Chrome + 共享进程池的旧路径。
+**Q：能不能完全不开浏览器做纯协议注册？**
+> A：主流程始终是 HTTP 客户端。Sentinel 不再本地拼接，也不再启动 Chromium：用 Node 假 Windows Chrome 146 环境执行官方 SDK，网络回调到同一条 TLS。无法取得真实 token 时注册失败，不会用伪 token 降级。
+
+**Q：注册成功的号几分钟后就 401 `token_revoked`，网页 Cookie 却还能换出 session？**
+> A：这是注册时上报的浏览器画像被异步风控判为“无人操作/非真实浏览器”，约 6~16 分钟后整张 AT 被撤（`me` / `accounts/check` / `conversation/init` 同时 401），网页会话仍会把同一张已撤 AT 再吐一遍。真实 Chrome 对照实验证明决定因素是官方 Sentinel 的 Session Observer 里有没有真实用户交互，以及 `t`（dx 环境指纹）是否完整；RUM / Cloudflare JSD / ces 遥测和登录后的页面心跳都不是必需项。当前版本已在假浏览器里补齐这两项，并用 `keydown` / `pointermove` 数量与 `t` 长度做失败即关闭校验。若日志出现 `sentinel_so_empty` / `sentinel_t_error`，说明官方 SDK 改版后假环境又缺了 API，用 `scripts/lab/lab_driver.js` 复现并补齐。
 
 **Q：注册出来的号一用（生图）就被封 / 还没用就死了？**
 > A：封号几乎都是"关联"问题，而不是单个号的行为。请逐项对照：
-> 1. **注册指纹**：默认协议引擎用 Chrome 146 TLS/HTTP2 指纹 + 对应 UA/Client Hints；切到浏览器引擎时才是本机真实 Chrome + 真人输入事件。
+> 1. **注册指纹**：协议引擎用 Chrome 146 PSK TLS/HTTP2 指纹；HTTP UA/Client Hints 与该指纹对齐；关键动作的 token 来自 Node 里执行的官方 SDK，不是本地拼接。
 > 2. **测活**：旧版测活用无 Cookie 的新浏览器请求 `/backend-api/me`，会制造假 401；本版本恢复账号 Cookie、注册 UA、屏幕、时区和原粘性代理 session，并由网页自身验证 `/api/auth/session`。
 > 3. **用号方式**：`auth_data` 里带有注册时的 `user_agent` / `screen` / `registered_ip` / `registered_country` / `registered_timezone` / `proxy`。下游网关应沿用同一地区和代理线路，不要用一台服务器的固定 IP 集中调用大量账号。
 > 4. **裂变子号**：`a+001@…`、`a+002@…` 与母号是同一个邮箱，OpenAI 一眼就能关联；母号被封时子号大概率跟着走。看重存活率就把裂变数量调低。
 > 5. **节奏**：免费号有很低的生图配额，新号第一天就高频生图会立刻触发风控；建议养号（先正常聊几轮）、分散使用时间、单号限速。
 
 **Q：账号导出格式是什么？**
-> A：在「GPT 注册」勾选账号后可选择“导出网页会话”“导出 Sub2API”或“导出 CPA”。网页会话包含可恢复到 `chatgpt.com` 的 Cookie、Cookie Header、注册 UA、屏幕、时区和代理信息；单账号为 JSON，多账号为 ZIP。2026-09-06 以前的旧记录只保存了 access token，没有 Cookie，需重新登录或重新注册才能恢复网页会话。用于网页生图时请使用网页会话导出，并恢复结构化 Cookie 与注册现场，不要把 access token 直接请求 `api.openai.com/v1`。
+> A：在「GPT 注册」勾选账号后可选择“导出网页会话”“导出 Sub2API”或“导出 CPA”。网页会话包含可恢复到 `chatgpt.com` 的 Cookie、Cookie Header、注册 UA、屏幕、时区和代理信息；单账号为 JSON，多账号为 ZIP。导出直接写入库存凭据，不走代理。已撤销、需重新登录、JWT 已过期的号不进文件。要确认号是否还能用，用账号页的测活。
 
 ---
 

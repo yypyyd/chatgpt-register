@@ -1,10 +1,12 @@
 package db
 
 import (
+	"encoding/json"
 	"net/url"
 	"strings"
 	"time"
 
+	"chatgpt-register/internal/codexreg"
 	"chatgpt-register/internal/emailalias"
 	"chatgpt-register/internal/models"
 
@@ -34,7 +36,39 @@ func Init(path string) (*gorm.DB, error) {
 	normalizeLegacyStatuses(db)
 	reclaimOrphanRegistering(db)
 	backfillRegistrationMailboxIDs(db)
+	backfillChatGPTCredentialMetadata(db)
+	repairVerifiedCredentialStatus(db)
 	return db, nil
+}
+
+// repairVerifiedCredentialStatus repairs records downgraded by the previous
+// temporary-error policy. A real probe already proved the AT and a renewable
+// RT/Web Session is still stored, so a later 403/429/timeout must not erase the
+// last-known credential status. The latest error remains available separately.
+func repairVerifiedCredentialStatus(db *gorm.DB) {
+	var regs []models.Registration
+	if err := db.Select("id", "auth_data", "account_credential_status", "access_token_status", "token_last_verified_at", "needs_relogin").
+		Where("status = ? AND account_credential_status = ? AND access_token_status = ? AND needs_relogin = ? AND token_last_verified_at IS NOT NULL",
+			"registered", "unknown", "valid", false).
+		Find(&regs).Error; err != nil {
+		return
+	}
+	for _, reg := range regs {
+		if !hasStoredLongLivedCredential(reg.AuthData) {
+			continue
+		}
+		db.Model(&models.Registration{}).Where("id = ?", reg.ID).
+			Update("account_credential_status", "valid")
+	}
+}
+
+func hasStoredLongLivedCredential(raw string) bool {
+	var auth struct {
+		RefreshToken string            `json:"refresh_token"`
+		Cookies      []json.RawMessage `json:"cookies"`
+	}
+	return json.Unmarshal([]byte(raw), &auth) == nil &&
+		(strings.TrimSpace(auth.RefreshToken) != "" || len(auth.Cookies) > 0)
 }
 
 // dsn 给数据库路径补上 WAL / busy_timeout 等 pragma：
@@ -113,5 +147,44 @@ func backfillRegistrationMailboxIDs(db *gorm.DB) {
 		if err := db.Where("email = ?", baseEmail).First(&mb).Error; err == nil {
 			db.Model(&models.Registration{}).Where("id = ?", reg.ID).Update("mailbox_id", mb.ID)
 		}
+	}
+}
+
+// backfillChatGPTCredentialMetadata is a local, non-network migration. It
+// records only the JWT fingerprint and non-secret claims, and deliberately
+// leaves every legacy token unchecked until the one-time real upstream
+// revalidation runs from the handler layer.
+func backfillChatGPTCredentialMetadata(db *gorm.DB) {
+	var regs []models.Registration
+	if err := db.Select("id", "auth_data", "access_token_fingerprint", "access_token_status", "account_credential_status", "credential_version").
+		Where("status = ?", "registered").Find(&regs).Error; err != nil {
+		return
+	}
+	for _, reg := range regs {
+		if reg.AccessTokenFingerprint != "" {
+			continue
+		}
+		var auth map[string]any
+		if json.Unmarshal([]byte(reg.AuthData), &auth) != nil {
+			continue
+		}
+		token, _ := auth["access_token"].(string)
+		refresh, _ := auth["refresh_token"].(string)
+		cookies, _ := auth["cookies"].([]any)
+		fields := map[string]any{
+			"access_token_status":       "unchecked",
+			"account_credential_status": "unknown",
+			"access_token_fingerprint":  codexreg.AccessTokenFingerprint(strings.TrimSpace(token)),
+		}
+		if strings.TrimSpace(refresh) == "" && len(cookies) == 0 {
+			fields["needs_relogin"] = true
+			fields["account_credential_status"] = "needs_relogin"
+		}
+		if meta, err := codexreg.ParseAccessTokenMetadata(token); err == nil {
+			fields["token_issued_at"] = meta.IssuedAt
+			fields["token_expires_at"] = meta.ExpiresAt
+			fields["access_token_jti"] = meta.JTI
+		}
+		db.Model(&models.Registration{}).Where("id = ?", reg.ID).Updates(fields)
 	}
 }

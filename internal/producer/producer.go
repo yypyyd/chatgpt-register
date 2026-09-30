@@ -32,7 +32,7 @@ import (
 )
 
 const (
-	defaultMaxConcurrency = 3
+	defaultMaxConcurrency = 2
 	defaultFissionCount   = 5
 	// 注册失败后的重试冷却（分钟），避免短时间内反复重试触发风控。
 	// 可在系统设置 retry_cooldown_min 覆盖，0 = 不冷却。
@@ -41,8 +41,10 @@ const (
 	// 两封验证码邮件挤在一起容易读错/读不到。可在系统设置 mailbox_interval_min
 	// 覆盖，0 = 不限。
 	defaultMailboxIntervalMin = 5
+	defaultLaunchStaggerSec   = 45
 	// registerAttemptTimeout 单次协议注册的墙钟上限。
-	registerAttemptTimeout = 4 * time.Minute
+	// 需覆盖：Node 伪浏览器执行官方 Sentinel SDK + 页面停留/真人交互合成 + 收码 3 分钟 + 建号探针。
+	registerAttemptTimeout = 8 * time.Minute
 	codePollTimeout        = 3 * time.Minute
 	codePollInterval       = 5 * time.Second
 	// 邮箱服务（Graph）连续 503 等临时错误达到该时长即放弃并自动停用该邮箱。
@@ -61,6 +63,8 @@ type Config struct {
 	RetryCooldown  time.Duration // 失败地址的重试冷却时间
 	// MailboxInterval 同一邮箱两次注册之间的最小间隔，避免验证码邮件互相干扰
 	MailboxInterval time.Duration
+	// LaunchStagger 是两个 GPT 注册任务实际启动之间的最小间隔。
+	LaunchStagger time.Duration
 }
 
 // Progress 生产进度快照，供 /api/produce/status 展示。
@@ -90,9 +94,11 @@ type Producer struct {
 	inflight map[string]uint // email -> mailboxID，正在处理中的任务
 	// failed 记录当前仍处于失败态的邮箱（重试成功后会移除）。
 	// 只有最终没能注册成功的邮箱才计入失败数——中途重试失败不算。
-	failed map[string]struct{}
-	pxMu   sync.Mutex
-	pxIdx  int
+	failed     map[string]struct{}
+	pxMu       sync.Mutex
+	pxIdx      int
+	launchMu   sync.Mutex
+	lastLaunch time.Time
 }
 
 func New(db *gorm.DB, mail *mailfetch.Client) *Producer {
@@ -146,7 +152,7 @@ func (p *Producer) run(ctx context.Context, target int) {
 	}()
 
 	cfg := p.loadConfig()
-	p.logf("开始生产，目标 %d 个账号（每邮箱母号+%d 裂变，并发 %d，引擎=纯协议，跳过 hotmail.com）",
+	p.logf("开始生产，目标 %d 个账号（每邮箱母号+%d 裂变，并发 %d，引擎=纯协议）",
 		target, cfg.FissionCount, cfg.MaxConcurrency)
 
 	sem := make(chan struct{}, cfg.MaxConcurrency)
@@ -189,6 +195,10 @@ func (p *Producer) run(ctx context.Context, target int) {
 			continue
 		}
 
+		if !p.waitLaunchSlot(ctx, cfg.LaunchStagger) {
+			p.releaseInflight(email)
+			break
+		}
 		sem <- struct{}{}
 		wg.Add(1)
 		go func(mb models.Mailbox, email string, isMother bool) {
@@ -256,9 +266,6 @@ func (p *Producer) nextJob(cfg Config) (models.Mailbox, string, bool, bool, bool
 
 	// Pass 1：母号（邮箱本身地址）未注册成功且该邮箱空闲 → 注册母号
 	for _, mb := range mailboxes {
-		if skipHotmailMailbox(mb.Email) {
-			continue
-		}
 		if p.mailboxBusy(mb.ID) {
 			continue
 		}
@@ -278,9 +285,6 @@ func (p *Producer) nextJob(cfg Config) (models.Mailbox, string, bool, bool, bool
 
 	// Pass 2：母号已成功、该邮箱空闲、裂变未满 → 注册一个新的别名子号
 	for _, mb := range mailboxes {
-		if skipHotmailMailbox(mb.Email) {
-			continue
-		}
 		if p.mailboxBusy(mb.ID) {
 			continue
 		}
@@ -430,12 +434,23 @@ func (p *Producer) produceOne(ctx context.Context, cfg Config, mb models.Mailbox
 
 	appendLog("✓ ChatGPT 注册成功（未执行 Agent Identity）")
 	authBytes, _ := json.MarshalIndent(res.AuthJSON, "", "  ")
-	p.upsert(models.Registration{
+	verifiedAt := time.Now().UTC()
+	registered := models.Registration{
 		Email: email, MailboxID: mb.ID, Password: password,
 		Status: "registered", IsMother: isMother, Note: note,
 		AuthData: string(authBytes), AccountID: res.AccountID,
 		UserID: res.UserID, PlanType: res.PlanType, Log: logBuf.String(),
-	})
+		AccountCredentialStatus: "valid", AccessTokenStatus: "valid",
+		TokenLastVerifiedAt: &verifiedAt, RefreshLastSuccessAt: &verifiedAt,
+		NeedsRelogin: false, Alive: "alive", AliveCheckedAt: &verifiedAt,
+		AccessTokenFingerprint: codexreg.AccessTokenFingerprint(res.AccessToken),
+	}
+	if meta, metaErr := codexreg.ParseAccessTokenMetadata(res.AccessToken); metaErr == nil {
+		registered.TokenIssuedAt = &meta.IssuedAt
+		registered.TokenExpiresAt = &meta.ExpiresAt
+		registered.AccessTokenJTI = meta.JTI
+	}
+	p.upsert(registered)
 	return nil
 }
 
@@ -695,6 +710,11 @@ func (p *Producer) loadConfig() Config {
 		intervalMin = 0
 	}
 	cfg.MailboxInterval = time.Duration(intervalMin) * time.Minute
+	staggerSec := atoiDefault(p.getSetting("launch_stagger_sec"), defaultLaunchStaggerSec)
+	if staggerSec < 0 {
+		staggerSec = 0
+	}
+	cfg.LaunchStagger = time.Duration(staggerSec) * time.Second
 	// 代理默认开：未设置(空)视为开，仅显式 "0" 才关闭(直连)。可在设置页开关/编辑。
 	if p.getSetting("proxy_enabled") != "0" {
 		cfg.Proxies = proxyutil.List(p.getSetting("proxy_list"))
@@ -714,6 +734,26 @@ func (p *Producer) nextProxy(cfg Config) string {
 	return proxy
 }
 
+func (p *Producer) waitLaunchSlot(ctx context.Context, interval time.Duration) bool {
+	if interval <= 0 {
+		return ctx.Err() == nil
+	}
+	p.launchMu.Lock()
+	defer p.launchMu.Unlock()
+	wait := time.Until(p.lastLaunch.Add(interval))
+	if wait > 0 {
+		t := time.NewTimer(wait)
+		defer t.Stop()
+		select {
+		case <-ctx.Done():
+			return false
+		case <-t.C:
+		}
+	}
+	p.lastLaunch = time.Now()
+	return true
+}
+
 func (p *Producer) upsert(reg models.Registration) {
 	var existing models.Registration
 	if err := p.db.Where("email = ?", reg.Email).First(&existing).Error; err == nil {
@@ -726,6 +766,20 @@ func (p *Producer) upsert(reg models.Registration) {
 			updates["account_id"] = reg.AccountID
 			updates["user_id"] = reg.UserID
 			updates["plan_type"] = reg.PlanType
+			updates["account_credential_status"] = reg.AccountCredentialStatus
+			updates["access_token_status"] = reg.AccessTokenStatus
+			updates["token_issued_at"] = reg.TokenIssuedAt
+			updates["token_expires_at"] = reg.TokenExpiresAt
+			updates["token_last_verified_at"] = reg.TokenLastVerifiedAt
+			updates["token_last_error_code"] = ""
+			updates["refresh_last_success_at"] = reg.RefreshLastSuccessAt
+			updates["refresh_last_error"] = ""
+			updates["needs_relogin"] = reg.NeedsRelogin
+			updates["access_token_fingerprint"] = reg.AccessTokenFingerprint
+			updates["access_token_jti"] = reg.AccessTokenJTI
+			updates["alive"] = reg.Alive
+			updates["alive_checked_at"] = reg.AliveCheckedAt
+			updates["credential_version"] = gorm.Expr("credential_version + 1")
 		}
 		if reg.Log != "" {
 			updates["log"] = reg.Log
@@ -814,9 +868,4 @@ func (p *Producer) setMessage(msg string) {
 	p.prog.Message = msg
 	p.prog.UpdatedAt = time.Now()
 	p.mu.Unlock()
-}
-
-func skipHotmailMailbox(email string) bool {
-	_, domain, ok := strings.Cut(strings.ToLower(strings.TrimSpace(email)), "@")
-	return ok && domain == "hotmail.com"
 }

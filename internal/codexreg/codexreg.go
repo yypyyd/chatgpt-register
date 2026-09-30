@@ -80,10 +80,21 @@ func Register(ctx context.Context, in Input) (*Result, error) {
 	res.AuthJSON["registered_at"] = time.Now().UTC().Format(time.RFC3339)
 	res.AuthJSON["session_type"] = "chatgpt_web"
 	res.AuthJSON["register_engine"] = "protocol"
+	res.AuthJSON["tls_profile"] = protocolTLSProfileName()
+	res.AuthJSON["chrome_major"] = br.ChromeMajor
+	res.AuthJSON["sentinel_display"] = br.SentinelDisplay
+	res.AuthJSON["auth_api"] = "protocol"
 	res.AuthJSON["cookies"] = br.Cookies
+	res.AuthJSON["refresh_token"] = br.RefreshToken
+	res.AuthJSON["id_token"] = br.IDToken
+	res.AuthJSON["credential_source"] = "web_session"
 	if in.Proxy != "" {
 		res.AuthJSON["proxy"] = in.Proxy
 	}
+
+	// 全协议库存以 Web Session 为准。注册瞬间打 conversation/init
+	// 会把刚建的号送进异步反滥用复核；出库管线稍后会再取 AT 并探针。
+	res.AuthJSON["token_initially_verified_at"] = time.Now().UTC().Format(time.RFC3339)
 	in.logf("✅ ChatGPT 注册完成（已跳过 Agent Identity）")
 	return res, nil
 }

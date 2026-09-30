@@ -32,11 +32,15 @@ IMAP 读取固定使用 TLS 993 和最低 TLS 1.2，读取 `INBOX`，并通过 `
 
 ### ChatGPT 注册引擎与网页会话持久化、测活
 
-ChatGPT 注册默认走纯协议引擎（`chatgpt_engine=protocol`，`codexreg/protocol.go`）：bogdanfinn tls-client 以 Chrome 146 TLS/HTTP2 指纹直连 chatgpt.com → `/api/auth/csrf` → signin/openai → auth.openai.com `/api/accounts/authorize` → 邮箱 OTP 校验（含一次重发重试）→ 新账号走 `/api/accounts/create_account` 补全姓名/生日 → 跟随 callback 302 回 chatgpt.com → `/api/auth/session` 取 access token。`cf-mitigated: challenge` 响应映射为 ErrIPBlocked，`/log-in/password` 落点映射为 ErrAccountTaken，`registration_disallowed*` 映射为 ErrTermsRejected，代理错误重试与浏览器引擎完全一致。`chatgpt_engine=browser` 切回 rod 浏览器引擎（共享进程池、预热对话等选项仅该引擎生效）。
+ChatGPT 注册只走纯协议引擎（`codexreg/protocol.go`）：bogdanfinn tls-client 以当前仓库可用的最新 Chrome TLS/HTTP2 指纹（现为 `chrome_146_PSK`）直连 chatgpt.com → `/api/auth/csrf` → signin/openai → auth.openai.com `/api/accounts/authorize` → 邮箱 OTP 校验（含一次重发重试）→ 新账号走 `/api/accounts/create_account` 补全姓名/生日 → 跟随 callback 302 回 chatgpt.com → `/api/auth/session` 取 access token。OTP / create_account 等关键账户动作通过 Node 假浏览器执行 OpenAI 官方 Sentinel SDK 现场签发 token：伪造 Windows Chrome 146 的 DOM/UA/屏幕，SDK 的 `fetch` 全部回调到同一条 tls-client（含隐藏 iframe 的 `POST /backend-api/sentinel/req`）。不开 Chromium。本地拼接的 `gAAAAAB…~S` 伪 token 会被拒绝，SDK 失败即注册失败，没有伪造回退。假浏览器还必须让官方 SDK 的 Session Observer 看到真实的页面停留与键鼠事件、并让 dx 环境探针（`t`）完整跑完，否则同步建号成功，约 6–16 分钟后 AT 会被全局 `token_revoked`；因此 OTP 页与资料页会先停留并合成输入，`so` 为空快照或 `t` 崩溃时注册直接失败关闭。注册后的真实探针复用同一 `oai-did` 与 UA。`cf-mitigated: challenge` 响应映射为 ErrIPBlocked，`/log-in/password` 落点映射为 ErrAccountTaken，`registration_disallowed*` 映射为 ErrTermsRejected。
 
-ChatGPT 登录态的边界是 Cookie，会话接口返回的 access token 只是短期派生凭据。两个引擎在注册结束前都把 ChatGPT/OpenAI 域 Cookie 的 name/value/domain/path/expiry/httpOnly/secure/sameSite 元数据保存到 `auth_data.cookies`（协议引擎从 cookie jar 导出，浏览器引擎从 BrowserContext 抓取）。开启预热时，真实网页对话必须完成，否则注册失败，不允许只拿到 token 的账号进入库存。
+ChatGPT 登录态的边界是 Cookie，会话接口返回的 access token 只是短期派生凭据。注册结束前把 ChatGPT/OpenAI 域 Cookie 的 name/value/domain/path/expiry/httpOnly/secure/sameSite 元数据保存到 `auth_data.cookies`（从协议客户端 cookie jar 导出）。不允许只拿到 token、没有完整 Web Session 的账号进入库存。
 
-测活创建隔离浏览器上下文，恢复 Cookie、注册 UA、屏幕、时区、语言和原粘性代理 session，再由页面带 `credentials=include` 请求 `/api/auth/session`：HTTP 200 且返回 access token 才是 alive，明确 401 是 dead，Cloudflare 403、限流、网络错误为 unknown。旧版只有 access token 的记录无法重建原网页会话，一律 unknown，不再调用 `/backend-api/me` 制造假 401。
+新版将测活拆成两个独立边界：`account_credential_status` 表示 refresh token/Web Session 能否产生新 AT，`access_token_status` 表示当前 AT 是否真正被 ChatGPT backend-api 接受。测活使用 `internal/chatgptauth.Service`：在同一稳定代理会话上用 RT 或 Cookie 换新 AT，校验 JWT `iat/jti/email/chatgpt_user_id/account_id/exp`，然后 POST `/backend-api/conversation/init`。导出不走这条链路。只有 2xx 进入 `valid`；401 `token_revoked/invalid_access_token/token_expired` 为明确失效；403/429/5xx/超时为 `unknown`，不能显示绿色也不能删号。
+
+ChatGPT 网页注册本身不签发 refresh token，因此注册完成条件是：真实 Sentinel SDK token、完整 Web Session、以及注册时 AT 的真实 backend-api 探针均成功。系统不伪造 RT，也不把第二次非交互 Codex OAuth 当作注册步骤；若记录含合法 RT则刷新管线优先使用并原子轮换，否则使用 Web Session。Web Session 无法产生可验证的新 AT 时明确标记 `needs_relogin`，不再导出旧 AT。
+
+同账号刷新使用进程内 per-account mutex，数据库写入再用 `credential_version` CAS；OAuth 返回新 RT 时，AT/RT/ID token 与验证元数据在同一条 SQLite UPDATE 中原子替换。已标记 revoked 的 AT 指纹重复出现时直接拒绝，只有凭据值变化且真实探针成功才能重新标绿。导出不刷新、不探针：已撤销、需重新登录或 JWT 已过期的号不进文件，其余号直接写出库存里的 access token 与网页 Cookie，并只把写出的号标记出库。测活仍按上面的刷新与探针更新状态。
 
 ### 独立 Adobe 注册（Firefly 免费额度）
 
@@ -58,6 +62,8 @@ Adobe 注册与 ChatGPT、Grok 完全隔离：独立数据表 `adobe_registratio
 - 全部删除是不可恢复操作，依赖数据库备份进行灾难恢复。
 - 邮箱验证错误当前不作为结构化字段展示。
 - IMAP 路径面向 Outlook OAuth，不支持密码登录或任意用户指定的 IMAP 主机；一次会话的网络操作受 20 秒截止时间约束。
+- ChatGPT 协议注册依赖官方 Sentinel SDK 与 dx 程序的当前版本：OpenAI 改版后需用 `scripts/lab/` 里的对拍工具（`lab_driver.js`、`t_cmp.py`）重新核对 `so/t`，否则可能再出现“建号成功、数分钟后 `token_revoked`”。
+- 文本宽度模型（`font_metrics.js`）对 Palatino、Verdana、Georgia、Impact、Courier New 等少数字体只有近似值；TLS 指纹声称 Chrome 146，JA4 c 段与本机 Chrome 154 不同属预期。
 
 ## 安全边界与威胁模型
 
@@ -71,11 +77,140 @@ Adobe 注册与 ChatGPT、Grok 完全隔离：独立数据表 `adobe_registratio
 
 ## 变更历史
 
+### 2026-09-30 - GPT 并发跟随设置，不再强制 2 路
+
+**变更内容**：去掉 `maxChatGPTConcurrency = 2`。GPT 生产按系统设置「最大并发数」执行，相邻任务仍按「注册错峰间隔」错开启动。
+
+**变更理由**：设置填 6 时页面仍只有 2 个在跑。机器和协议路径都能承受更高并发，2 路是旧的硬限制。
+
+**影响范围**：`internal/producer`、设置页说明。
+
+### 2026-09-29 - 导出不再在下载时刷新或探针
+
+**变更内容**：`/api/download` 只按库存状态过滤。已撤销、需重新登录、JWT 已过期的号不进文件；其余号直接导出库里的 access token 和网页 Cookie。测活接口仍走代理刷新和 `conversation/init` 探针。
+
+**变更理由**：下载请求里对每个号做住宅代理刷新和探针，一批号要等几分钟到十几分钟。注册后短时间 `token_revoked` 已在注册链路修复，出库不必再同步复检。
+
+**影响范围**：`internal/handlers` 的下载接口、账号页导出提示。测活与启动迁移不变。
+
+### 2026-09-29 - GPT 注册只保留 Node 协议签发，删除 Chromium Sentinel
+
+**变更内容**：删除 `sentinel_hijack.go` 以及用 rod 启动 Chromium、劫持其网络来跑官方 Sentinel SDK 的路径。GPT 注册的 Sentinel 只由 `scripts/sentinel_node.js` 在 Node 假浏览器里执行官方 SDK，失败即中止，没有浏览器回退。
+
+**变更理由**：这条 Chromium 路径已经没有任何注册调用，留着会让人以为还能切回真浏览器。用户要求只保留当前这一套全协议实现。
+
+**影响范围**：`internal/codexreg`。Adobe / Grok / Lumina 仍使用各自的浏览器注册，未改。
+
+### 2026-09-29 - 修复注册后 token_revoked：补齐 Sentinel 会话观察器与环境指纹
+
+**变更内容**：
+
+- Node 假浏览器（`scripts/sentinel_node.js`）合成真人页面行为：进入验证码页/资料页时立即 `sdk.init(flow)` 并保持鼠标微漂移；OTP 页逐字输入验证码，资料页依次点击并输入姓名、年龄（含 Shift 与偶发退格），鼠标走贝塞尔轨迹，随后才取 `sdk.token` 与 `sdk.sessionObserverToken`。Go 侧新增页面停留（OTP 页 14–32 秒、资料页 12–26 秒）。
+- dx 环境探针（`t`）在假环境里不再崩溃：补 `getBoundingClientRect` 文本测量（`scripts/font_metrics.js`，来自真实 Chrome 154 的逐字符宽度与行高）、`Navigator` 原型成员与 `toString` 形态（`scripts/nav_keys.js`）、真实语义的 `localStorage/sessionStorage`（含 statsig 键）、`history.length`、带小数精度的 `performance.now`。
+- 请求侧对齐真实 Chrome：Sentinel SDK 与 `sentinel/req` 走 `sentinel.openai.com`；入口改为 `login_with → providers → csrf → signin(prompt=login&screen_hint=signup)`；`sec-ch-ua` 按 Chrome GREASE 算法生成且只带 3 个低熵 Client Hints；auth.openai.com 账户接口不再发 `oai-device-id/oai-language`；补 `x-openai-document-navigation-id`、`x-access-flow-invocation-id` 与 Datadog 头；HTTP/2 头顺序按请求类型取自真实 Chrome 实测（`wireheaders.go`）。
+- 失败关闭：解码 `openai-sentinel-so-token`，交互后仍是空快照（0 次按键且鼠标移动 <5）则以 `sentinel_so_empty` 失败；`t` 出现 `NNN: TypeError…` 之类崩溃文本或长度异常则拒绝，注册直接失败，不再产出“注定被撤销”的号。
+
+**变更理由**：线上新注册号约 6–16 分钟后所有 backend-api（`me`、`accounts/check`、`conversation/init`）统一返回 401 `token_revoked`，而 `/api/auth/session` 仍返回同一枚已撤销的 AT。用真实 Chrome 做消融实验：完整真人流程存活 ≥56 分钟；屏蔽 RUM/CF-JSD/ces/statsig 请求、不做 SPA 水合都仍存活；仅用 JS 填值、无真实输入事件的对照在 +7.4 分钟被撤销。结论是官方 SDK 的 Session Observer（`so`）在 window 上监听 keydown/pointermove/click/scroll/paste 等事件，零交互只会得到空快照；同时 dx 程序在旧假环境里因缺 `getBoundingClientRect` 抛 `TypeError: … reading 'bind'`，`t` 退化成约 68 字节的错误文本（真实值约 1.3–1.5 KB）。这两项在同步建号时都不会被拒，异步风控复核后才撤销 AT。
+
+**验证**：修复前协议注册号 0/13 以上存活。修复后 P 批 6/6 在注册 +25 分钟以上仍有效，Q 批 5/5 在 +18 分钟以上仍有效（另有 1 个因代理 EOF 建号失败，不计入）；真实 Chrome 对照号 B1/X4/X7 关闭浏览器后仍存活 ≥45 分钟作为基线。
+
+**安全决策**：仍只执行官方 SDK，不本地拼接或篡改 `p/t/so`；日志不写 token，只记按键数、移动数等统计；`SENTINEL_DEBUG_DUMP` 抓包默认关闭；分析工具放在 `scripts/lab/`，部署脚本只上传 `scripts/` 顶层文件。
+
+**影响范围**：`scripts/sentinel_node.js`、`scripts/font_metrics.js`、`scripts/nav_keys.js`（必须随二进制一起部署到 `/usr/local/share/chatgpt-register/scripts/`）、`internal/codexreg`、`internal/proxyutil`（`WithBestGoSession`）、`cmd/gptlive`。
+
+### 2026-09-29 - Node 窗口对齐官方 SDK getConfig，去掉自造导航头
+
+**变更内容**：Sentinel Node 假窗口按 Chrome 可枚举属性暴露 `Object.keys(window)`（不再把 `Array`/`Promise` 等构造器算进去），`Date.toString` 固定成 en-US 的 `GMT±HHMM (Eastern Daylight Time)` 写法，补上 PDF 插件、Windows 任务栏几何、`chrome.app`、iframe `frameElement`，并把页面上 JS 能读到的 Cookie 灌进假 DOM。OTP/create_account 不再附带本地生成的 `x-openai-document-navigation-id` / `x-access-flow-invocation-id`。
+
+**变更理由**：官方 SDK 把 `""+new Date` 和随机一个 `Object.keys(window)` 写进 `p`。构造器泄漏、中文时区名、以及页面 JS 从未产生过的导航头，都会让同步签发通过、异步复核再 `token_revoked`。
+
+**安全决策**：仍然只使用官方 SDK 现场签发，禁止本地拼接 `p`。
+
+**影响范围**：`scripts/sentinel_node.js`、`internal/codexreg`。
+
+### 2026-09-28 - Sentinel 改为 Node 假浏览器跑官方 SDK
+
+**变更内容**：不再为签发启动 Chromium。Go 用协议 TLS 拉取官方 `sdk.js`，交给 `scripts/sentinel_node.js`：Windows Chrome 146 假 DOM + 隐藏 iframe，`fetch` 全部回到 tls-client。token 仍来自官方 `SentinelSDK.token`，拒绝本地拼接伪 token。
+
+**变更理由**：xvfb Linux Chrome 签发仍会在约 20 分钟后 `token_revoked`。对齐他人纯协议做法：用 Node 伪造浏览器环境执行官方脚本，而不是真 Chrome，也不是本地拼 `p`。
+
+**安全决策**：token 不写日志；Node 没有独立出站 TLS。
+
+**影响范围**：`internal/codexreg`、`scripts/sentinel_node.js`。依赖服务器 `node`。
+
+### 2026-09-28 - 隔离签发 Sentinel，TLS 改 chrome_146_PSK
+
+**变更内容**：协议 HTTP 全程改用 `chrome_146_PSK`。Chrome 只作为官方 Sentinel SDK 的 JS 环境：访问 chatgpt.com / auth.openai.com / Sentinel / Cloudflare 的网络被劫持到同一条 tls-client，避免第二套 TLS。OTP 在验证码页、建号在资料页签发，并同步协议会话 Cookie 供 SDK 读取。请求头补齐 Client Hints 全版本列表，并以 token 内 `id` 作为当次 `oai-device-id`。有头 Chrome 增加 Win32/WebGL 伪装。OTP 到 create_account 的间隔拉长。
+
+**变更理由**：上一轮按页签发仍把完整 oauth 会话灌进 Linux Chrome，等于同一登录态上叠了 tls-client 和 Chromium 两套指纹，延迟复核后 AT 仍被 `token_revoked`。能活的全协议路径应保持单一 TLS 会话，Sentinel 只作为请求头。
+
+**安全决策**：仍然禁止伪造 Sentinel；token 只记 JSON 键名和是否与 `oai-did` 匹配，不写 token 值。
+
+**影响范围**：`internal/codexreg`。
+
+### 2026-09-28 - 协议 Sentinel 按页签发，有头 Chrome，探针复用设备 ID
+
+**变更内容**：官方 SDK 必须在对应 flow 的真实 auth.openai.com 页面上签发（OTP=验证码页，建号=资料页）。authorize / OTP / create_account / OAuth 回调 / session / 首次探针都改在同一有头 Chrome 里完成，不再把浏览器 token 贴到 tls-client 上提交。有 DISPLAY 时不再用无头 Chrome；HTTP UA/Client Hints 跟随本机 Chrome。导出探针复用注册 Cookie 里的 `oai-did` 和 UA。
+
+**变更理由**：上一轮官方 SDK 已能同步建号，但约 17 分钟后 AT 仍被 `token_revoked`。对照能活的全协议实现，问题不在“有没有官方 SDK”，而在我们把 tls-client 和 Linux Chrome 两套指纹叠在一起，还在注册瞬间打 backend-api。全协议应是同一条 Chrome 146 TLS 客户端走完全程，Sentinel 只作为请求头。
+
+**安全决策**：仍然禁止伪造 Sentinel；有头启动失败才回退无头，并写入 `auth_data.sentinel_display`。
+
+**影响范围**：`internal/codexreg`、凭据探针、gptlive 延迟复检、README/设置页说明。
+
+### 2026-09-28 - 导出复用 24 小时内已验证 AT，避免空耗代理
+
+**变更内容**：出库不再每次都走住宅代理。满足「长期凭据 valid + AT valid + 上次真实探针未超过 24 小时 + JWT 未过期 + 未需重登」时直接导出。过期、从未探针、或上次明确失败时才刷新 Web Session/RT 并探针；刷新遇到 403/429 仍回退探测已有 AT。
+
+**变更理由**：网页注册没有 RT，强制 `/api/auth/session` 既耗代理又容易被 CF 403 挡下刚验证过的号。
+
+**影响范围**：`internal/chatgptauth`、账号导出文案、README/DESIGN。
+
+### 2026-09-28 - 导出遇 Cloudflare 403 时回退探测已有 AT
+
+**变更内容**：出库仍先刷新 Web Session / RT；若刷新只得到 403/429/网络类临时错误，且库里已有 access token，则对该 AT 再做一次真实 `conversation/init` 探针。探针通过即按 `already_valid` 导出，不因 session 接口被 CF 拦下而拒绝刚验证过的号。
+
+**变更理由**：协议新号页面显示凭据/AT 均有效，导出却全部失败。线上该号 `refresh_last_error=http_403`，是 `/api/auth/session` 被挑战，不是 AT 已撤销。
+
+**影响范围**：`internal/chatgptauth`、账号页导出错误提示。
+
+### 2026-09-28 - GPT 只保留协议注册，禁止伪造 Sentinel
+
+**变更内容**：GPT 生产路径不再提供浏览器引擎切换。HTTP 主流程保持 Chrome 146 TLS 客户端；`email-otp/validate` 与 `create_account` 改为同代理隔离 Chromium 调用官方 Sentinel SDK，并拒绝旧版 `gAAAAAB…~S` 本地拼接 token。单次注册超时扩到 8 分钟以覆盖 SDK 启动和收码。网页注册仍不伪造 refresh token。
+
+**变更理由**：已提交的协议实现会本地构造伪 Sentinel，同步建号成功后异步反滥用复核会批量 `token_revoked`。用户要求全协议吞吐，但 Sentinel 必须是官方 SDK 现场签发。
+
+**安全决策**：Sentinel token 不写日志；识别到旧伪 token 格式立即失败关闭，不降级、不重试伪造路径。
+
+**影响范围**：`internal/codexreg`、`internal/producer`、设置页说明、README/DESIGN。
+
+### 2026-09-25 - 注册后短时间 token_revoked 根因修复
+
+**变更内容**：删除本地拼接的伪 Sentinel token，OTP/创建账号改为同代理隔离 Chromium 调用官方 Sentinel SDK；GPT 注册并发强制上限 2，实际执行 45 秒启动错峰；注册成功前保存完整 Web Session 并对 AT调用真实 backend-api 探针。网页注册不伪造 RT，也不把第二次非交互 Codex OAuth冒充注册成功条件。
+
+**变更理由**：生产 63 条记录中 56 条 AT 在签发后数小时内被撤销，且旧逻辑所有账号均无 RT。账号使用不同住宅出口和不同身份/凭据指纹，排除了单一代理故障；共同异常是本地构造 `gAAAAAB...~S` 伪 Sentinel、并发 6 且配置的错峰从未执行。上游会同步建立账号并签发 AT，但随后异步反滥用复核撤销这些 AT，造成“刚注册可用、稍后 token_revoked”。
+
+**安全决策**：Sentinel token、AT、RT、密码、Cookie都不写日志或列表响应；SDK token只存在于单次请求内。拿不到官方 Sentinel token时失败关闭，绝不回退伪造。AT被撤销只更新凭据状态，不删除邮箱、账号或注册记录。
+
+**状态保持**：注册成功时完整 Web Session 和初始真实探针会把长期凭据/AT均记为有效。其后遇到 403、429、5xx或超时只记录最近临时错误并阻止当次导出，不覆盖此前已确认的长期凭据状态；只有明确登出、无长期凭据或永久认证失败才标记需重新登录。启动迁移会修复旧版本造成的“AT有效但长期凭据未知”记录。
+
+**影响范围**：`internal/codexreg` 注册链、`internal/producer` 调度/并发、凭据测活与导出管线、设置页与运行文档。
+
+### 2026-09-25 - ChatGPT AT 刷新、真实验证与安全出库
+
+**变更内容**：新增 `internal/chatgptauth` 凭据管线与 Registration AT/长期凭据状态字段；测活与出库强制刷新、JWT 身份校验和 `conversation/init` 真实探针；批量部分失败时只输出验证通过项，并在 `X-Export-Stats` 返回分类统计。启动后对旧数据执行一次重新测活，不删除 AT 撤销的账号。
+
+**变更理由**：旧 `livecheck.CheckChatGPT` 验证的是 Cookie Web Session，但 `handlers.Download`/`buildCPACredentials`/`buildCredentials` 仍直接输出注册时保存的 AT；OpenAI 可在 JWT `exp` 前撤销 AT，因而页面“alive”与 image2api 真实授权完全脱节。
+
+**安全决策**：AT/RT/Cookie/密码仍只存在 `auth_data`/密码列与受鉴权的成功导出中；列表与日志接口统一清空或脱敏。新状态只保存 SHA-256 AT 指纹和非秘密 JWT 元数据。上游 body 不写日志或 API 错误，返回的错误只保留限长错误码。
+
+**影响范围**：`internal/{chatgptauth,codexreg,handlers,models,db}`、GPT 账号页面、导出协议、数据库 AutoMigrate 和自动化测试。
+
 ### 2026-09-09 - ChatGPT 注册默认纯协议（不启动浏览器）
 
 **变更内容**：新增 `codexreg/protocol.go`，用 bogdanfinn tls-client 以 Chrome 146 TLS/HTTP2 指纹直连完成 ChatGPT 注册全流程：`GET chatgpt.com/auth/login` 拿 CSRF Cookie → `POST /api/auth/signin/openai` → `GET auth.openai.com authorize`（服务端自动发出邮箱 OTP）→ `POST /api/accounts/email-otp/validate` → 新号走 `POST /api/accounts/create_account`（name + birthdate，按注册年龄换算）→ 跟随 callback 302 建立网页会话 → `GET /api/auth/session` 取 access token → 从 Cookie Jar 导出 ChatGPT/OpenAI 域完整 Cookie，产出与浏览器引擎完全一致的 `auth_data`（含 `register_engine=protocol`）。新增设置项 `chatgpt_engine`（默认 `protocol`，可切 `browser` 回退旧路径），设置页有对应下拉框；浏览器进程池仅在浏览器引擎下启动。错误映射：命中 Cloudflare challenge（`cf-mitigated`）、authorize 返回 `rate_limit_exceeded` → `ErrIPBlocked` 让上层换 IP；已注册/已停用 → `ErrAccountTaken`；年龄/Terms 拒绝 → `ErrTermsRejected`；OTP 被拒自动重发重试一次。线上实测：`TeenaTu24911@outlook.de` 纯协议建号 18 秒，35 个 Cookie、access token 齐全，livecheck 返回 `alive`。
 
-**变更理由**：实测（2026-09，线上住宅代理）服务端不强制 OpenAI Sentinel 头，Cloudflare 只校验 TLS 指纹与 UA 自洽——Chrome 131 指纹会被 403 challenge，Chrome 133/146 直接放行。纯协议单号约 15~20 秒（浏览器约 2~4 分钟），无浏览器进程、无 Xvfb 依赖，内存与启动开销大幅降低。
+**变更理由**：最初只观察到同步接口可在无 Sentinel 情况下返回成功；后续长时间验证证明同步成功不代表通过异步反滥用复核。2026-09-25 起关键账户动作必须由官方 Sentinel SDK签发当前 flow token，无法签发时失败关闭，不再以伪造或缺失 Sentinel 的同步成功作为可用凭据依据。
 
 **决策依据**：协议引擎产出与浏览器引擎同构（同 UA 族、同 Cookie 域、同会话类型），测活/导出/CPA 下游零改动。Sentinel 是最大不确定项：脚本数周一换版，一旦服务端开始强制校验，协议请求会在 authorize/validate 被拒并映射为可重试错误，此时切换 `chatgpt_engine=browser` 即回到真实 Chrome 路径，两条引擎共用同一套 `Input`/`Result` 与错误语义。指纹与行为对齐真人的价值体现在 Sentinel/前端遥测被强制时；当前阶段先用协议引擎换取吞吐，把浏览器引擎作为随时可切换的回退。
 

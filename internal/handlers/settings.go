@@ -12,6 +12,7 @@ import (
 // 内部保留 key（如 JWT 密钥），不允许通过设置接口读取或修改
 var reservedSettingKeys = map[string]bool{
 	"jwt_secret": true,
+	"internal_chatgpt_credential_migration_v2": true,
 }
 
 func (h *Handler) SettingsGet(c *gin.Context) {

@@ -10,6 +10,7 @@ import (
 	"time"
 	"unicode"
 
+	"chatgpt-register/internal/chatgptauth"
 	"chatgpt-register/internal/codexreg"
 	"chatgpt-register/internal/models"
 
@@ -44,6 +45,10 @@ func buildCPACredentials(authData, email string, now time.Time) map[string]any {
 		em = email
 	}
 	expired := tokenExpiryRFC3339(accessToken)
+	lastRefresh := tokenClaimRFC3339(accessToken, "iat")
+	if lastRefresh == "" {
+		lastRefresh = now.UTC().Format(time.RFC3339)
+	}
 
 	return map[string]any{
 		"type":          "codex",
@@ -51,13 +56,17 @@ func buildCPACredentials(authData, email string, now time.Time) map[string]any {
 		"access_token":  accessToken,
 		"refresh_token": str("refresh_token"),
 		"account_id":    str("account_id"),
-		"last_refresh":  now.UTC().Format(time.RFC3339),
+		"last_refresh":  lastRefresh,
 		"email":         em,
 		"expired":       expired,
 	}
 }
 
 func tokenExpiryRFC3339(token string) string {
+	return tokenClaimRFC3339(token, "exp")
+}
+
+func tokenClaimRFC3339(token, claim string) string {
 	parts := strings.Split(token, ".")
 	if len(parts) < 2 {
 		return ""
@@ -67,16 +76,21 @@ func tokenExpiryRFC3339(token string) string {
 		return ""
 	}
 	var claims struct {
+		IAT json.Number `json:"iat"`
 		Exp json.Number `json:"exp"`
 	}
 	if err = json.Unmarshal(payload, &claims); err != nil {
 		return ""
 	}
-	exp, err := claims.Exp.Int64()
-	if err != nil || exp <= 0 {
+	value := claims.Exp
+	if claim == "iat" {
+		value = claims.IAT
+	}
+	stamp, err := value.Int64()
+	if err != nil || stamp <= 0 {
 		return ""
 	}
-	return time.Unix(exp, 0).UTC().Format(time.RFC3339)
+	return time.Unix(stamp, 0).UTC().Format(time.RFC3339)
 }
 
 func cpaFileName(email string) string {
@@ -191,10 +205,6 @@ func (h *Handler) Produce(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if h.Browser == nil || !h.Browser.Ready() {
-		c.JSON(http.StatusConflict, gin.H{"error": "缺少浏览器，无法生产：浏览器正在下载或下载失败"})
-		return
-	}
 	if err := h.Producer.Start(in.Count); err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
@@ -231,7 +241,7 @@ func (h *Handler) RegistrationLog(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"email": reg.Email, "status": reg.Status,
-		"note": reg.Note, "log": reg.Log,
+		"note": redactCredentialText(reg.Note), "log": redactCredentialText(reg.Log),
 		"has_shot": len(reg.Shot) > 0,
 	})
 }
@@ -301,29 +311,43 @@ func (h *Handler) Download(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "所选账号没有可下载的已注册数据"})
 		return
 	}
-	if in.Format == "cpa" {
-		for _, r := range regs {
-			if buildCPACredentials(r.AuthData, r.Email, time.Now())["access_token"] == "" {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "账号 " + r.Email + " 缺少 CPA 所需的 access_token"})
-				return
+
+	// 出库只按库存状态过滤，不在下载请求里刷新或探针。
+	// 已撤销、需重新登录、JWT 已过期的号不进文件；测活仍走独立接口。
+	now := time.Now().UTC()
+	var batch credentialBatchResult
+	validRegs := make([]models.Registration, 0, len(regs))
+	for _, reg := range regs {
+		out := classifyStoredCredential(reg, now)
+		if out.Exportable && in.Format == "web" {
+			if _, ok := buildWebSession(reg.AuthData, reg.Email); !ok {
+				out.Exportable = false
+				out.Category = chatgptauth.CategoryNeedsRelogin
 			}
 		}
-	}
-	if in.Format == "web" {
-		for _, r := range regs {
-			if _, ok := buildWebSession(r.AuthData, r.Email); !ok {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "账号 " + r.Email + " 是旧版 token-only 记录，没有可恢复的网页 Cookie"})
-				return
-			}
+		batch.Stats.add(out.Category)
+		batch.Outcomes = append(batch.Outcomes, out)
+		if out.Exportable {
+			validRegs = append(validRegs, reg)
 		}
 	}
+	statsJSON, _ := json.Marshal(batch.Stats)
+	c.Header("X-Export-Stats", string(statsJSON))
+	if len(validRegs) == 0 {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{
+			"error": "所选账号均已撤销、过期或需要重新登录，未导出",
+			"stats": batch.Stats,
+		})
+		return
+	}
+	regs = validRegs
 
 	ids := make([]uint, 0, len(regs))
 	for _, r := range regs {
 		ids = append(ids, r.ID)
 	}
 
-	// 下载即出库
+	// 只有真实授权探针通过的账号才会被标记出库。
 	h.DB.Model(&models.Registration{}).Where("id IN ?", ids).Update("shipped", true)
 
 	if in.Format == "cpa" {

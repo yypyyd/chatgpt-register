@@ -8,10 +8,9 @@ import (
 	"sync"
 	"time"
 
-	"chatgpt-register/internal/codexreg"
+	"chatgpt-register/internal/chatgptauth"
 	"chatgpt-register/internal/livecheck"
 	"chatgpt-register/internal/models"
-	"chatgpt-register/internal/proxyutil"
 
 	"github.com/gin-gonic/gin"
 )
@@ -122,40 +121,28 @@ func (h *Handler) LiveCheckStart(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": "已有测活任务进行中"})
 		return
 	}
-	items, err := h.loadCGItems(in.IDs)
+	regs, err := h.loadCGRegistrations(in.IDs)
 	if err != nil {
 		runner.finish("加载账号失败")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	if len(items) == 0 {
+	if len(regs) == 0 {
 		runner.finish("没有可测活的账号")
 		c.JSON(http.StatusBadRequest, gin.H{"error": "没有可测活的账号（需已注册且有会话数据）"})
 		return
 	}
-	runner.setTotal(len(items))
-	opt := h.cgLiveOptions()
+	runner.setTotal(len(regs))
 	go func() {
 		defer runner.finish("")
-		ctx, cancel := context.WithTimeout(context.Background(), livecheck.EstimateChatGPTDuration(len(items)))
+		ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
 		defer cancel()
-		livecheck.CheckChatGPT(ctx, items, func(chunk map[uint]string) {
-			for id, st := range chunk {
-				h.applyCGAlive(id, st)
-				runner.tally(st)
-			}
-		}, opt)
+		result := h.runGPTCredentialBatch(ctx, regs)
+		for _, out := range result.Outcomes {
+			runner.tally(credentialOutcomeAlive(out))
+		}
 	}()
-	c.JSON(http.StatusOK, gin.H{"ok": true, "total": len(items)})
-}
-
-// cgLiveOptions 测活与注册走同一套代理池：每个账号独立出口，避免所有账号从服务器同一 IP 被探测。
-func (h *Handler) cgLiveOptions() livecheck.CGOptions {
-	opt := livecheck.CGOptions{}
-	if h.settingValue("proxy_enabled") != "0" {
-		opt.Proxies = proxyutil.List(h.settingValue("proxy_list"))
-	}
-	return opt
+	c.JSON(http.StatusOK, gin.H{"ok": true, "total": len(regs)})
 }
 
 func (h *Handler) settingValue(key string) string {
@@ -172,68 +159,49 @@ func (h *Handler) LiveCheckStatus(c *gin.Context) {
 
 func (h *Handler) LiveCheckOne(c *gin.Context) {
 	id64, _ := strconv.ParseUint(c.Param("id"), 10, 64)
-	item, ok := h.loadCGItem(uint(id64))
-	if !ok {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "该账号没有可测活的会话数据"})
+	var reg models.Registration
+	if err := h.DB.Select("id").Where("status = ?", "registered").First(&reg, uint(id64)).Error; err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "该账号不是可检测的已注册账号"})
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Minute)
 	defer cancel()
-	res := livecheck.CheckChatGPT(ctx, []livecheck.CGItem{item}, nil, h.cgLiveOptions())
-	st := res[item.ID]
-	if st == "" {
-		st = livecheck.StatusUnknown
-	}
-	now := h.applyCGAlive(item.ID, st)
-	c.JSON(http.StatusOK, gin.H{"id": item.ID, "alive": st, "checked_at": now})
+	result := h.runGPTCredentialBatch(ctx, []models.Registration{reg})
+	out := result.Outcomes[0]
+	updated := out.Registration
+	c.JSON(http.StatusOK, gin.H{
+		"id": reg.ID, "alive": credentialOutcomeAlive(out),
+		"account_credential_status": updated.AccountCredentialStatus,
+		"access_token_status":       updated.AccessTokenStatus,
+		"token_last_verified_at":    updated.TokenLastVerifiedAt,
+		"token_last_error_code":     updated.TokenLastErrorCode,
+		"needs_relogin":             updated.NeedsRelogin,
+		"category":                  out.Category,
+	})
 }
 
-func (h *Handler) applyCGAlive(id uint, st string) time.Time {
-	now := time.Now()
-	h.DB.Model(&models.Registration{}).Where("id = ?", id).
-		Updates(map[string]any{"alive": st, "alive_checked_at": now})
-	return now
-}
-
-func (h *Handler) loadCGItems(ids []uint) ([]livecheck.CGItem, error) {
+func (h *Handler) loadCGRegistrations(ids []uint) ([]models.Registration, error) {
 	var regs []models.Registration
-	q := h.DB.Select("id", "auth_data").Where("auth_data <> ''")
+	q := h.DB.Select("id").Where("status = ?", "registered")
 	if len(ids) > 0 {
 		q = q.Where("id IN ?", ids)
-	} else {
-		q = q.Where("status = ?", "registered")
 	}
 	if err := q.Find(&regs).Error; err != nil {
 		return nil, err
 	}
-	items := make([]livecheck.CGItem, 0, len(regs))
-	for _, r := range regs {
-		if it, ok := cgItemFromAuth(r.ID, r.AuthData); ok {
-			items = append(items, it)
-		}
-	}
-	return items, nil
+	return regs, nil
 }
 
-func (h *Handler) loadCGItem(id uint) (livecheck.CGItem, bool) {
-	var r models.Registration
-	if err := h.DB.Select("id", "auth_data").First(&r, id).Error; err != nil {
-		return livecheck.CGItem{}, false
+func credentialOutcomeAlive(out chatgptauth.Outcome) string {
+	if out.Exportable {
+		return livecheck.StatusAlive
 	}
-	return cgItemFromAuth(r.ID, r.AuthData)
-}
-
-// cgItemFromAuth 从 auth.json 取网页 Cookie、旧 access_token 与注册时代理。
-// 旧记录只有 token 时仍返回 item，测活层会标 unknown，避免继续误判成 dead。
-func cgItemFromAuth(id uint, authData string) (livecheck.CGItem, bool) {
-	session, err := codexreg.WebSessionFromAuthData(authData)
-	if err != nil || (session.AccessToken == "" && len(session.Cookies) == 0) {
-		return livecheck.CGItem{}, false
+	switch out.Category {
+	case chatgptauth.CategoryTokenRevoked, chatgptauth.CategoryNeedsRelogin:
+		return livecheck.StatusDead
+	default:
+		return livecheck.StatusUnknown
 	}
-	return livecheck.CGItem{
-		ID: id, Token: session.AccessToken, Cookies: session.Cookies, Proxy: session.Proxy,
-		Languages: session.Languages,
-	}, true
 }
 
 /* ===================== Grok ===================== */

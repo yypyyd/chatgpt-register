@@ -39,7 +39,8 @@ function rowHtml(x) {
       <td>${esc(x.email)}</td>
       <td>${fmtTime(x.created_at)}</td>
       <td><span class="badge ${esc(x.status)}">${ACC_STATUS[x.status] || esc(x.status)}</span></td>
-      <td>${aliveCell(x)}</td>
+      <td>${credentialCell(x)}</td>
+      <td>${tokenCell(x)}</td>
       <td class="ship-cell">
         <span class="badge ${x.shipped ? 'registered' : 'pending'}" title="下载后自动标记，不能手动修改">${x.shipped ? '已出库' : '未出库'}</span>
       </td>
@@ -199,7 +200,13 @@ async function downloadByIds(ids, format, fallbackFilename, unshippedOnly) {
   });
   if (!r.ok) {
     const d = await r.json().catch(() => ({}));
-    return toast(d.error || '下载失败', true);
+    const s = d.stats || {};
+    const detail = [
+      s.token_revoked && `已撤销 ${s.token_revoked}`,
+      s.token_expired && `已过期 ${s.token_expired}`,
+      s.needs_relogin && `需重登 ${s.needs_relogin}`,
+    ].filter(Boolean).join('、');
+    return toast(detail ? `${d.error || '下载失败'}（${detail}）` : (d.error || '下载失败'), true);
   }
   const blob = await r.blob();
   const disposition = r.headers.get('Content-Disposition') || '';
@@ -210,6 +217,18 @@ async function downloadByIds(ids, format, fallbackFilename, unshippedOnly) {
   a.download = filename;
   a.click();
   URL.revokeObjectURL(a.href);
+  const rawStats = r.headers.get('X-Export-Stats');
+  if (rawStats) {
+    try {
+      const s = JSON.parse(rawStats);
+      const skipped = [
+        s.token_revoked && `已撤销 ${s.token_revoked}`,
+        s.token_expired && `已过期 ${s.token_expired}`,
+        s.needs_relogin && `需重登 ${s.needs_relogin}`,
+      ].filter(Boolean).join('、');
+      toast(`已导出 ${s.already_valid || 0} 个` + (skipped ? `；未导出：${skipped}` : ''));
+    } catch (e) { /* ignore malformed optional summary */ }
+  }
   load(); // 刷新出库状态
 }
 
@@ -249,20 +268,34 @@ async function deleteAllAccounts() {
 
 /* ===== 测活（手动，仅点击触发；只标状态不删号；unknown 不判死） ===== */
 const LIVE_BASE = '/api/registrations';
-const ALIVE_LABEL = { alive: '有效', dead: '失效', unknown: '未知' };
+const ALIVE_LABEL = { alive: 'AT 有效', dead: '明确失效', unknown: '验证未知' };
+const CREDENTIAL_LABEL = { valid: '有效', needs_relogin: '需重新登录', unknown: '未知' };
+const TOKEN_LABEL = { valid: '已验证有效', revoked: '已撤销', expired: '已过期', unknown: '验证未知', unchecked: '未检测' };
 let liveTimer = null;
-function aliveCell(x) {
-  if (!x.alive) return '<span class="badge pending" title="尚未测活">未测</span>';
-  const cls = x.alive === 'alive' ? 'registered' : (x.alive === 'dead' ? 'register_failed' : 'pending');
-  const t = x.alive_checked_at ? '最近检测: ' + fmtTime(x.alive_checked_at) : '';
-  return `<span class="badge ${cls}" title="${t}">${ALIVE_LABEL[x.alive] || esc(x.alive)}</span>`;
+function credentialCell(x) {
+  const st = x.account_credential_status || 'unknown';
+  const cls = st === 'valid' ? 'registered' : (st === 'needs_relogin' ? 'register_failed' : 'pending');
+  const detail = x.refresh_last_success_at ? '最近刷新: ' + fmtTime(x.refresh_last_success_at) : (x.refresh_last_error ? '刷新错误: ' + x.refresh_last_error : '');
+  return `<span class="badge ${cls}" title="${esc(detail)}">${CREDENTIAL_LABEL[st] || esc(st)}</span>`;
+}
+function tokenCell(x) {
+  const st = x.access_token_status || 'unchecked';
+  const cls = st === 'valid' ? 'registered' : ((st === 'revoked' || st === 'expired') ? 'register_failed' : 'pending');
+  const details = [];
+  if (x.token_issued_at) details.push('iat: ' + fmtTime(x.token_issued_at));
+  if (x.token_expires_at) details.push('exp: ' + fmtTime(x.token_expires_at));
+  if (x.token_last_verified_at) details.push('真实探针: ' + fmtTime(x.token_last_verified_at));
+  if (x.token_last_error_code) details.push('错误: ' + x.token_last_error_code);
+  return `<span class="badge ${cls}" title="${esc(details.join(' | '))}">${TOKEN_LABEL[st] || esc(st)}</span>`;
 }
 async function liveCheckOne(id) {
   toast('正在测活 #' + id + ' ...');
   const r = await api(LIVE_BASE + '/' + id + '/livecheck', { method: 'POST' });
   const d = await r.json().catch(() => ({}));
   if (!r.ok) return toast(d.error || '测活失败', true);
-  toast('测活完成: ' + (ALIVE_LABEL[d.alive] || d.alive));
+  const account = CREDENTIAL_LABEL[d.account_credential_status] || d.account_credential_status;
+  const token = TOKEN_LABEL[d.access_token_status] || d.access_token_status;
+  toast('检测完成: 账号凭据 ' + account + ' / AT ' + token);
   load();
 }
 function liveCheckAll() {
@@ -293,7 +326,7 @@ function pollLive() {
       const s = await (await api(LIVE_BASE + '/livecheck/status')).json();
       if (el && (s.running || s.done)) {
         el.style.display = '';
-        const summary = `有效 ${s.alive} · 失效 ${s.dead} · 未知 ${s.unknown}`;
+        const summary = `AT有效 ${s.alive} · 明确失效 ${s.dead} · 验证未知 ${s.unknown}`;
         el.textContent = s.running ? `测活中 ${s.done}/${s.total} · ${summary}` : `测活完成 · ${summary}`;
         if (!s.running) setTimeout(() => { if (el) el.style.display = 'none'; }, 8000);
       }

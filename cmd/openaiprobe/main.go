@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -70,8 +69,8 @@ func capture() error {
 	if err != nil {
 		return err
 	}
-	aj, _ := json.Marshal(res.AuthJSON)
-	fmt.Printf("[reg] 成功 account=%s user=%s plan=%s\n%s\n", res.AccountID, res.UserID, res.PlanType, trunc(string(aj), 600))
+	fmt.Printf("[reg] 成功 account=%s user=%s plan=%s token_fp=%s\n",
+		res.AccountID, res.UserID, res.PlanType, codexreg.AccessTokenFingerprint(res.AccessToken)[:12])
 	return nil
 }
 

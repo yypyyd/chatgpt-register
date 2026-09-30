@@ -18,6 +18,12 @@ var sessionParamRe = regexp.MustCompile(`(?i)(-session-)[^-]*`)
 // 用户串里写死的 session 会被换成本任务的随机值：固定 session 会让所有任务共用
 // 同一个出口 IP，站点很快就把这个 IP 判成 spam。
 func WithBestGoTaskSession(raw string) string {
+	return WithBestGoSession(raw, sessionToken(8))
+}
+
+// WithBestGoSession 与 WithBestGoTaskSession 相同，但使用调用方指定的 session 值，
+// 用于让另一台机器/另一个进程复用同一个住宅出口（诊断与对照实验用）。
+func WithBestGoSession(raw, token string) string {
 	raw = strings.TrimSpace(raw)
 	lower := strings.ToLower(raw)
 	if !strings.Contains(raw, "://") ||
@@ -29,7 +35,6 @@ func WithBestGoTaskSession(raw string) string {
 		return raw
 	}
 	user := u.User.Username()
-	token := sessionToken(8)
 	if sessionParamRe.MatchString(user) {
 		user = sessionParamRe.ReplaceAllString(user, "${1}"+token)
 	} else {

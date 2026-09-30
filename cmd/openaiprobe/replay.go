@@ -61,13 +61,14 @@ func replayOpenAI(path string) error {
 	fmt.Printf("[replay] auth.openai.com POST 共 %d 条\n", len(posts))
 	for i, r := range posts {
 		fmt.Printf("\n=== [%d] %s %s ===\n", i, r.Method, r.URL)
-		fmt.Printf("req body: %s\n", trunc(r.Body, 400))
+		fmt.Printf("req body bytes: %d\n", len(r.Body))
 		resp, err := doReq(cli, r)
 		if err != nil {
 			fmt.Printf("!! 请求失败: %v\n", err)
 			continue
 		}
-		fmt.Printf("resp %d\n%s\n", resp.StatusCode, trunc(readBody(resp), 600))
+		responseBody := readBody(resp)
+		fmt.Printf("resp %d body-bytes=%d\n", resp.StatusCode, len(responseBody))
 		resp.Body.Close()
 	}
 	return nil

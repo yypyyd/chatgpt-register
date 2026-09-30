@@ -32,9 +32,28 @@ type Registration struct {
 	Note string `gorm:"type:text" json:"note"`
 
 	// 手动测活结果：alive(有效) / dead(明确失效) / unknown(网络·CF·限流等无法确定)；空=未测过。
-	// 仅在用户点击测活时更新，unknown 不代表账号失效，也不会删除账号。
+	// Deprecated: 仅为旧客户端兼容保留。新代码分别使用 AccountCredentialStatus 和
+	// AccessTokenStatus，不能再把网页登录态与当前 access token 混成一个“存活”状态。
 	Alive          string     `gorm:"size:16;default:''" json:"alive"`
 	AliveCheckedAt *time.Time `json:"alive_checked_at,omitempty"`
-	CreatedAt      time.Time  `json:"created_at"`
-	UpdatedAt      time.Time  `json:"updated_at"`
+
+	// 长期凭据（refresh_token 或 ChatGPT Web Session）与短期 access token 分开建模。
+	// account_credential_status: valid / needs_relogin / unknown
+	// access_token_status: valid / revoked / expired / unknown / unchecked
+	AccountCredentialStatus string     `gorm:"size:24;default:unknown;index" json:"account_credential_status"`
+	AccessTokenStatus       string     `gorm:"size:16;default:unchecked;index" json:"access_token_status"`
+	TokenIssuedAt           *time.Time `json:"token_issued_at,omitempty"`
+	TokenExpiresAt          *time.Time `json:"token_expires_at,omitempty"`
+	TokenLastVerifiedAt     *time.Time `json:"token_last_verified_at,omitempty"`
+	TokenLastErrorCode      string     `gorm:"size:64" json:"token_last_error_code,omitempty"`
+	RefreshLastSuccessAt    *time.Time `json:"refresh_last_success_at,omitempty"`
+	RefreshLastError        string     `gorm:"size:128" json:"refresh_last_error,omitempty"`
+	NeedsRelogin            bool       `gorm:"default:false;index" json:"needs_relogin"`
+
+	// 只保存不可逆 SHA-256 指纹及非秘密 JWT 元数据；绝不把 token 放入列表或日志。
+	AccessTokenFingerprint string    `gorm:"size:64;index" json:"-"`
+	AccessTokenJTI         string    `gorm:"size:128" json:"-"`
+	CredentialVersion      uint64    `gorm:"default:0;not null" json:"-"`
+	CreatedAt              time.Time `json:"created_at"`
+	UpdatedAt              time.Time `json:"updated_at"`
 }

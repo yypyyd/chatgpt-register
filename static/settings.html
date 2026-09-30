@@ -25,9 +25,9 @@
         </div>
         <div class="field">
           <label>最大并发数</label>
-          <span class="field-hint">注册时同时执行的任务数上限</span>
+		  <span class="field-hint">同时进行的注册任务数。GPT 按这个数字执行，不再另限 2 路</span>
           <div class="input-suffix">
-            <input id="set-max-concurrency" class="px-input" type="number" min="1" max="100" placeholder="默认 10">
+			<input id="set-max-concurrency" class="px-input" type="number" min="1" max="100" placeholder="默认 2">
             <span class="suffix">个</span>
           </div>
         </div>
@@ -57,7 +57,7 @@
         </div>
         <div class="field">
           <label>注册错峰间隔</label>
-          <span class="field-hint">相邻两个注册任务开始提交至少隔多久，避免同时提交触发确认邮件限流（0 = 完全并发）</span>
+		  <span class="field-hint">GPT 相邻两个注册任务实际启动的最小间隔；已在后端强制生效（0 = 不错峰，不建议）</span>
           <div class="input-suffix">
             <input id="set-launch-stagger" class="px-input" type="number" min="0" max="600" placeholder="默认 45">
             <span class="suffix">秒</span>
@@ -65,7 +65,7 @@
         </div>
         <div class="field">
           <label>GPT 注册</label>
-          <span class="field-hint">固定纯协议（Chrome TLS 指纹直连 auth.openai.com），不开浏览器；母号成功后按裂变数量注册 +001/+002。</span>
+		  <span class="field-hint">HTTP 协议建号；官方 Sentinel 由 Node 假浏览器执行 SDK 签发，不开 Chrome。拿不到就失败，绝不本地伪造。网页注册不签发 refresh token，成功条件是完整 Web Session。</span>
         </div>
         <div class="settings-foot">
           <button class="px-btn primary" onclick="saveSettings()">保存设置</button>
@@ -164,7 +164,7 @@
 async function loadSettings() {
   const r = await api('/api/settings');
   const d = await r.json();
-  document.getElementById('set-max-concurrency').value = d.max_concurrency || '10';
+	document.getElementById('set-max-concurrency').value = d.max_concurrency || '2';
   document.getElementById('set-fission-count').value = d.fission_count || '5';
   document.getElementById('set-retry-cooldown').value = d.retry_cooldown_min || '30';
   document.getElementById('set-mailbox-interval').value = d.mailbox_interval_min || '5';

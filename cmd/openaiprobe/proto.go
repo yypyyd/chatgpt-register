@@ -73,15 +73,11 @@ func protoProbe() error {
 	}
 	show := func(tag string, resp *http.Response, body string) {
 		fmt.Printf("\n=== %s → %d %s\n", tag, resp.StatusCode, resp.Header.Get("Location"))
-		if sc := resp.Header.Values("Set-Cookie"); len(sc) > 0 {
-			for _, c := range sc {
-				fmt.Printf("  set-cookie: %s\n", trunc(c, 90))
-			}
-		}
+		fmt.Printf("  set-cookie-count: %d\n", len(resp.Header.Values("Set-Cookie")))
 		if cf := resp.Header.Get("cf-mitigated"); cf != "" {
 			fmt.Printf("  cf-mitigated: %s\n", cf)
 		}
-		fmt.Printf("  body: %s\n", trunc(strings.ReplaceAll(body, "\n", " "), 500))
+		fmt.Printf("  body-bytes: %d\n", len(body))
 	}
 
 	// 0. 首页（拿 chatgpt.com 的 __cf_bm / oai-did 等 Cookie）
@@ -165,7 +161,7 @@ func protoProbe() error {
 	fmt.Println("auth.openai.com cookies:")
 	u, _ := url.Parse("https://auth.openai.com/")
 	for _, c := range cli.GetCookies(u) {
-		fmt.Printf("  %s=%s\n", c.Name, trunc(c.Value, 40))
+		fmt.Printf("  cookie-name: %s\n", c.Name)
 	}
 
 	// 4. 会话快照（不需要 Sentinel）
@@ -280,7 +276,7 @@ func protoProbe() error {
 	fmt.Println("chatgpt.com cookies:")
 	cu, _ := url.Parse("https://chatgpt.com/")
 	for _, c := range cli.GetCookies(cu) {
-		fmt.Printf("  %s=%s\n", c.Name, trunc(c.Value, 30))
+		fmt.Printf("  cookie-name: %s\n", c.Name)
 	}
 	return nil
 }

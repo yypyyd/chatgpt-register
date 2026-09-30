@@ -19,7 +19,7 @@ import (
 	"chatgpt-register/internal/proxyutil"
 )
 
-// 纯协议注册链路（不开浏览器）：
+// 纯协议注册链路（HTTP 主流程；OTP/建号由 Node 假浏览器执行官方 Sentinel SDK）：
 //
 //	chatgpt.com/auth/login (拿 CF/NextAuth Cookie)
 //	→ GET  /api/auth/csrf
@@ -31,14 +31,13 @@ import (
 //	→ GET  callback → 302 chatgpt.com/（种下 __Secure-next-auth.session-token）
 //	→ GET  /api/auth/session → accessToken
 //
-// 前端会给 validate/create_account 附带 openai-sentinel-* 头，实测服务端目前不强制，
-// 因此这里不做 Sentinel；若日后返回 403/`sentinel` 相关错误，需要回退浏览器引擎。
+// auth.openai.com 的关键账户动作必须使用上游 Sentinel SDK 为当前 flow
+// 现场签发的 token。绝不能本地拼接或复用 token；这类伪造值可能同步放行，
+// 但会在异步反滥用复核后导致刚签发的 access token 被撤销。
 // 关键点是 TLS 指纹要够新：Chrome 131 指纹会被 auth.openai.com 的 Cloudflare 拦下（cf-mitigated: challenge），
 // Chrome 133+ 可过。
 
 const (
-	protocolTLSProfile   = "chrome_146"
-	protocolChromeMajor  = "146"
 	protocolStepTimeout  = 45 * time.Second
 	protocolRedirectHops = 8
 )
@@ -48,27 +47,46 @@ const (
 var ErrProtocolChallenged = fmt.Errorf("%w: 协议请求命中 Cloudflare challenge", ErrIPBlocked)
 
 type protocolClient struct {
-	cli       tls_client.HttpClient
-	ua        string
-	acceptLng string
-	languages string
-	platform  string
-	deviceID  string
-	navID     string
-	screen    ScreenProfile
-	in        Input
+	cli          tls_client.HttpClient
+	ua           string
+	chUA         string
+	chromeMajor  string
+	acceptLng    string
+	languages    string
+	locale       string
+	timezone     string
+	platform     string
+	deviceID     string
+	screen       ScreenProfile
+	in           Input
+	node         *sentinelNode
+	authPageURL  string
+	authHTML     []byte
+	pageLoadedAt time.Time
+
+	navID string
+
+	// strict 为 true 时，请求头会被规整成与真实 Chrome 逐项一致的集合/取值/顺序（注册流程使用）。
+	strict bool
+
+	// sentinelPageAt 记录各 flow 的页面就绪时间，用于计算“在页面上停留了多久”。
+	sentinelPageAt map[string]time.Time
+
+	// pendingInteract 描述下一次 Sentinel 签发前要在假页面上完成的拟人输入
+	// （验证码页输入 code / 资料页输入姓名与年龄），签发后清空。
+	pendingInteract map[string]any
 }
 
 func newProtocolClient(in Input, languages string) (*protocolClient, error) {
 	jar := tls_client.NewCookieJar()
-	prof, ok := profiles.MappedTLSClients[protocolTLSProfile]
+	prof, ok := profiles.MappedTLSClients[protocolTLSProfileName()]
 	if !ok {
+		in.logf("⚠️ TLS 指纹 %s 不可用，回退 Chrome_133", protocolTLSProfileName())
 		prof = profiles.Chrome_133
 	}
 	opts := []tls_client.HttpClientOption{
 		tls_client.WithTimeoutSeconds(int(protocolStepTimeout.Seconds())),
 		tls_client.WithClientProfile(prof),
-		tls_client.WithRandomTLSExtensionOrder(),
 		tls_client.WithCookieJar(jar),
 		tls_client.WithNotFollowRedirects(),
 	}
@@ -79,11 +97,13 @@ func newProtocolClient(in Input, languages string) (*protocolClient, error) {
 	if err != nil {
 		return nil, fmt.Errorf("创建 TLS 客户端失败: %w", err)
 	}
-	ua := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/" + protocolChromeMajor + ".0.0.0 Safari/537.36"
+	major := fallbackChromeMajor
 	return &protocolClient{
-		cli: cli, ua: ua, acceptLng: acceptLanguageHeader(languages),
-		languages: languages, platform: "Windows", navID: uuid.NewString(),
-		screen: pickScreenProfile(), in: in,
+		cli: cli, ua: chromeUserAgent(major), chromeMajor: major,
+		acceptLng: acceptLanguageHeader(languages),
+		languages: languages, locale: primaryLanguageTag(languages),
+		platform: "Windows",
+		screen:   pickScreenProfile(), in: in,
 	}, nil
 }
 
@@ -108,33 +128,67 @@ func acceptLanguageHeader(languages string) string {
 	return strings.Join(out, ",")
 }
 
+func (c *protocolClient) clientHints() string {
+	if strings.TrimSpace(c.chUA) != "" {
+		return c.chUA
+	}
+	return secCHUA(c.chromeMajor)
+}
+
 func (c *protocolClient) headers(req *http.Request, referer string, doc bool) {
 	h := req.Header
 	h.Set("user-agent", c.ua)
 	h.Set("accept-language", c.acceptLng)
-	h.Set("sec-ch-ua", fmt.Sprintf(`"Google Chrome";v="%s", "Chromium";v="%s", "Not_A Brand";v="24"`, protocolChromeMajor, protocolChromeMajor))
+	h.Set("sec-ch-ua", c.clientHints())
 	h.Set("sec-ch-ua-mobile", "?0")
 	h.Set("sec-ch-ua-platform", `"`+c.platform+`"`)
+	// 真实浏览器对 chatgpt.com / auth.openai.com 的请求只带这 3 个低熵 Client Hints（抓包核对，
+	// 3000+ 个请求无一例外）。arch / bitness / platform-version / full-version-list 这类高熵提示
+	// 我们此前对每个请求都附带，是明显的非浏览器特征。
 	if referer != "" {
 		h.Set("referer", referer)
 	}
 	if doc {
 		h.Set("accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
 		h.Set("upgrade-insecure-requests", "1")
-		h.Set("sec-fetch-site", "cross-site")
+		h.Set("sec-fetch-site", docFetchSite(req.URL.String(), referer))
 		h.Set("sec-fetch-mode", "navigate")
 		h.Set("sec-fetch-dest", "document")
 	} else {
-		h.Set("accept", "application/json")
+		h.Set("accept", "*/*")
 		h.Set("sec-fetch-site", "same-origin")
 		h.Set("sec-fetch-mode", "cors")
 		h.Set("sec-fetch-dest", "empty")
 	}
-	h[http.HeaderOrderKey] = []string{
-		"accept", "accept-language", "content-type", "origin", "referer",
-		"sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
-		"sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site", "upgrade-insecure-requests", "user-agent",
+}
+
+// docFetchSite 按 Fetch Metadata 规则给出导航请求的 Sec-Fetch-Site：
+// 地址栏直接输入（无 Referer）是 none，同源 same-origin，同一可注册域 same-site，其余 cross-site。
+func docFetchSite(target, referer string) string {
+	if strings.TrimSpace(referer) == "" {
+		return "none"
 	}
+	tu, err1 := url.Parse(target)
+	ru, err2 := url.Parse(referer)
+	if err1 != nil || err2 != nil {
+		return "cross-site"
+	}
+	if strings.EqualFold(tu.Scheme, ru.Scheme) && strings.EqualFold(tu.Host, ru.Host) {
+		return "same-origin"
+	}
+	if registrableDomain(tu.Hostname()) == registrableDomain(ru.Hostname()) {
+		return "same-site"
+	}
+	return "cross-site"
+}
+
+// registrableDomain 对本项目涉及的域名足够用：取最后两段（chatgpt.com / openai.com）。
+func registrableDomain(host string) string {
+	parts := strings.Split(strings.ToLower(host), ".")
+	if len(parts) <= 2 {
+		return host
+	}
+	return strings.Join(parts[len(parts)-2:], ".")
 }
 
 type protoResp struct {
@@ -146,6 +200,7 @@ type protoResp struct {
 
 func (c *protocolClient) do(ctx context.Context, req *http.Request) (*protoResp, error) {
 	req = req.WithContext(ctx)
+	applyWireOrder(req, c.strict)
 	resp, err := c.cli.Do(req)
 	if err != nil {
 		return nil, err
@@ -175,16 +230,61 @@ func (c *protocolClient) postJSON(ctx context.Context, u, referer string, payloa
 		return nil, err
 	}
 	c.headers(req, referer, false)
+	req.Header.Set("accept", "application/json")
 	req.Header.Set("content-type", "application/json")
 	pu, _ := url.Parse(u)
 	req.Header.Set("origin", pu.Scheme+"://"+pu.Host)
-	if strings.Contains(u, "/api/accounts/create_account") {
-		c.attachSentinel(req, "oauth_create_account")
+	if strings.EqualFold(pu.Host, "auth.openai.com") {
+		if c.deviceID != "" {
+			req.Header.Set("oai-device-id", c.deviceID)
+		}
+		if loc := primaryLanguageTag(c.languages); loc != "" {
+			req.Header.Set("oai-language", loc)
+		}
+		// 真实页面里 Remix 应用与 Datadog RUM 会给每个账户 API 请求带上这几组头：
+		// 同一份文档内 document-navigation-id 不变，flow-invocation-id 每次请求都换。
+		if c.navID == "" {
+			c.navID = uuid.NewString()
+		}
+		req.Header.Set("x-openai-document-navigation-id", c.navID)
+		req.Header.Set("x-access-flow-invocation-id", uuid.NewString())
+		setDatadogTraceHeaders(req.Header)
 	}
-	if strings.Contains(u, "/api/accounts/email-otp/validate") {
-		c.attachSentinel(req, "email_otp_validate")
+	flow := sentinelFlowForURL(u)
+	if flow != "" {
+		token, soToken, err := c.realSentinelToken(ctx, flow, referer)
+		if err != nil {
+			return nil, fmt.Errorf("Sentinel SDK 签发失败(%s): %w", flow, err)
+		}
+		if err := rejectForgedSentinelToken(token); err != nil {
+			return nil, fmt.Errorf("Sentinel SDK 签发失败(%s): %w", flow, err)
+		}
+		req.Header.Set("openai-sentinel-token", token)
+		if soToken != "" {
+			req.Header.Set("openai-sentinel-so-token", soToken)
+		}
+		if tokenID := sentinelTokenID(token); tokenID != "" {
+			req.Header.Set("oai-device-id", tokenID)
+		}
+		c.in.logf("🛡 已使用官方 Sentinel SDK 签发 flow=%s shape=%s id_match=%t so=%t",
+			flow, sentinelTokenShape(token), sentinelTokenID(token) == c.deviceID, soToken != "")
 	}
 	return c.do(ctx, req)
+}
+
+func sentinelFlowForURL(u string) string {
+	switch {
+	case strings.Contains(u, "/api/accounts/create_account"):
+		return "oauth_create_account"
+	case strings.Contains(u, "/api/accounts/email-otp/validate"):
+		return "email_otp_validate"
+	case strings.Contains(u, "/api/accounts/authorize/continue"):
+		return "authorize_continue"
+	case strings.Contains(u, "/api/accounts/password/verify"):
+		return "password_verify"
+	default:
+		return ""
+	}
 }
 
 // followRedirects 从 start 出发一路跟 3xx，直到非 3xx 或跳数用尽；返回最终 URL 与响应。
@@ -203,7 +303,7 @@ func (c *protocolClient) followRedirects(ctx context.Context, start, referer str
 		if perr != nil {
 			return cur, resp, fmt.Errorf("解析跳转地址失败: %w", perr)
 		}
-		referer = cur
+		// 浏览器在整条重定向链里沿用最初发起导航时的 Referer，不会把上一跳的 URL 当 Referer。
 		cur = next.String()
 	}
 	return cur, nil, fmt.Errorf("跳转次数过多（>%d）", protocolRedirectHops)
@@ -261,20 +361,25 @@ func truncateForLog(s string, n int) string {
 
 // protoResult 协议注册产出：accessToken、Cookie 以及本次出口/指纹信息。
 type protoResult struct {
-	AccessToken string
-	Cookies     []WebCookie
-	UserAgent   string
-	Screen      ScreenProfile
-	Locale      string
-	Languages   string
-	EgressIP    string
-	Country     string
-	Timezone    string
+	AccessToken       string
+	RefreshToken      string
+	IDToken           string
+	Cookies           []WebCookie
+	UserAgent         string
+	Screen            ScreenProfile
+	Locale            string
+	Languages         string
+	EgressIP          string
+	Country           string
+	Timezone          string
+	ChromeMajor       string
+	SentinelDisplay   string
+	InitiallyVerified bool
 }
 
 // registerProtocol 用纯 HTTP 请求完成注册。
 func registerProtocol(ctx context.Context, in Input) (res *protoResult, err error) {
-	in.logf("🚀 启动纯协议注册流程（TLS 指纹 %s）...", protocolTLSProfile)
+	in.logf("🚀 启动纯协议注册流程（TLS 指纹 %s，UA Chrome/%s，官方 Sentinel 由 Node 假浏览器签发，失败即中止）...", protocolTLSProfileName(), fallbackChromeMajor)
 
 	geo := lookupGeoIPViaRequest(in)
 	locale, languages := "en-US", "en-US,en"
@@ -285,14 +390,18 @@ func registerProtocol(ctx context.Context, in Input) (res *protoResult, err erro
 	if err != nil {
 		return nil, err
 	}
-	res = &protoResult{UserAgent: c.ua, Screen: c.screen, Locale: locale, Languages: languages}
+	defer c.closeSentinel()
+	c.strict = true
+	c.locale = bcp47Locale(locale)
+	res = &protoResult{UserAgent: c.ua, Screen: c.screen, Locale: locale, Languages: languages, ChromeMajor: c.chromeMajor}
 	if geo != nil {
 		res.EgressIP, res.Country, res.Timezone = geo.Query, geo.CountryCode, geo.Timezone
+		c.timezone = geo.Timezone
 	}
 
-	// 1. 首页：种 __cf_bm / oai-did / next-auth csrf
-	const loginPage = "https://chatgpt.com/auth/login"
-	if r, err := c.get(ctx, loginPage, "", true); err != nil {
+	// 1. 首页：种 __cf_bm / oai-did（真实浏览器的会话从 chatgpt.com 首页开始）
+	const home = "https://chatgpt.com/"
+	if r, err := c.get(ctx, home, "", true); err != nil {
 		return nil, fmt.Errorf("打开 chatgpt.com 失败: %w", err)
 	} else if r.Status != 200 {
 		return nil, fmt.Errorf("chatgpt.com 首页 HTTP %d", r.Status)
@@ -304,8 +413,22 @@ func registerProtocol(ctx context.Context, in Input) (res *protoResult, err erro
 		deviceID = uuid.NewString()
 	}
 	c.deviceID = deviceID
+	loggingID := uuid.NewString()
 
-	// 2. csrf
+	// 2. 点“Sign up for free”并提交邮箱后，浏览器会跳到 /auth/login_with（带 login_hint 等参数），
+	// 该页面里的脚本再取 providers 与 csrf，最后 POST signin/openai（抓包核对过参数与顺序）。
+	// login_hint 必须保留 plus addressing 的 '+'：url.Values.Encode 会把 '+' 编成空格，
+	// OpenAI 就会把 user+001@ 当成母号 user@，OTP 后 create_account 报 user_already_exists / Terms。
+	loginPage := "https://chatgpt.com/auth/login_with?callback_path=%2F&screen_hint=signup&login_hint=" +
+		url.QueryEscape(in.Email) + "&auth_session_logging_id=" + loggingID + "&ext-oai-did=" + deviceID
+	if r, err := c.get(ctx, loginPage, home, true); err != nil {
+		return nil, fmt.Errorf("打开 login_with 失败: %w", err)
+	} else if r.Status != 200 {
+		return nil, fmt.Errorf("login_with HTTP %d", r.Status)
+	}
+	if _, err := c.get(ctx, "https://chatgpt.com/api/auth/providers", loginPage, false); err != nil {
+		return nil, fmt.Errorf("获取 providers 失败: %w", err)
+	}
 	r, err := c.get(ctx, "https://chatgpt.com/api/auth/csrf", loginPage, false)
 	if err != nil {
 		return nil, fmt.Errorf("获取 csrf 失败: %w", err)
@@ -318,17 +441,10 @@ func registerProtocol(ctx context.Context, in Input) (res *protoResult, err erro
 	}
 
 	// 3. signin/openai → authorize url（ext-oai-did 必须与 chatgpt.com 的 oai-did cookie 相同）
-	q := url.Values{}
-	q.Set("prompt", "login")
-	q.Set("ext-oai-did", deviceID)
-	q.Set("auth_session_logging_id", uuid.NewString())
-	q.Set("screen_hint", "login_or_signup")
-	// login_hint 必须保留 plus addressing 的 '+'。url.Values.Encode 会把 '+'
-	// 编成空格，OpenAI 就会把 user+001@ 当成母号 user@，OTP 后 create_account
-	// 报 user_already_exists / Terms。
-	authQuery := q.Encode() + "&login_hint=" + url.QueryEscape(in.Email)
+	authQuery := "prompt=login&screen_hint=signup&auth_session_logging_id=" + loggingID +
+		"&ext-oai-did=" + deviceID + "&login_hint=" + url.QueryEscape(in.Email)
 	form := url.Values{}
-	form.Set("callbackUrl", "/")
+	form.Set("callbackUrl", "https://chatgpt.com/")
 	form.Set("csrfToken", csrf.CSRFToken)
 	form.Set("json", "true")
 	req, _ := http.NewRequest(http.MethodPost, "https://chatgpt.com/api/auth/signin/openai?"+authQuery, strings.NewReader(form.Encode()))
@@ -348,7 +464,7 @@ func registerProtocol(ctx context.Context, in Input) (res *protoResult, err erro
 	}
 	in.logf("🔗 authorize login_hint=%s did=%s", extractLoginHint(signin.URL), deviceID)
 
-	// 4. authorize → 跟随跳转。落地 /email-verification 表示验证码已发出。
+	// 4. authorize 全程走同一条 TLS 客户端。落地 /email-verification 表示验证码已发出。
 	otpSentAt := time.Now().Add(-5 * time.Second)
 	landing, lr, err := c.followRedirects(ctx, signin.URL, "https://chatgpt.com/")
 	if err != nil && isTransientNetErr(err) {
@@ -357,6 +473,12 @@ func registerProtocol(ctx context.Context, in Input) (res *protoResult, err erro
 	}
 	if err != nil {
 		return nil, fmt.Errorf("authorize 跳转失败: %w", err)
+	}
+	if lr != nil {
+		c.rememberAuthPage(landing, lr.Body)
+	} else {
+		c.authPageURL = landing
+		c.pageLoadedAt = time.Now()
 	}
 	switch {
 	case strings.Contains(landing, "/email-verification"):
@@ -401,11 +523,19 @@ func registerProtocol(ctx context.Context, in Input) (res *protoResult, err erro
 		return nil, fmt.Errorf("authorize 落地页未知 (HTTP %d): %s", status, truncateForLog(landing, 200))
 	}
 
+	// 验证码页已加载：此刻起官方 SDK 的 Session Observer 开始观察这个“会话”，
+	// 等码期间由 Node 侧做真人式的鼠标漂移。
+	if strings.Contains(landing, "/email-verification") {
+		c.startSentinelPage(ctx, "email_otp_validate", landing)
+	}
+
 	// 5. 收码 + 校验（验证码错误则重发一次）
 	code, err := in.FetchCode(ctx, otpSentAt)
 	if err != nil {
 		return nil, fmt.Errorf("获取邮箱验证码失败: %w", err)
 	}
+	// 真人看完邮件、复制验证码再回来，至少要十几秒。
+	c.dwellOnPage(ctx, "email_otp_validate", 14, 32)
 	continueURL, err := c.validateOTP(ctx, landing, strings.TrimSpace(code))
 	if err != nil && strings.Contains(err.Error(), "wrong_email_otp_code") {
 		in.logf("📨 验证码被拒，重发后再试一次")
@@ -427,11 +557,20 @@ func registerProtocol(ctx context.Context, in Input) (res *protoResult, err erro
 	// 6. 新号需要填资料（about-you → create_account）
 	if strings.Contains(continueURL, "/about-you") {
 		in.logf("📝 账户完善页面已出现")
-		if _, err := c.get(ctx, continueURL, landing, true); err != nil {
-			return nil, fmt.Errorf("打开资料页失败: %w", err)
+		aboutURL := resolveAuthURL(continueURL)
+		if loaded, lerr := c.loadAuthDocument(ctx, aboutURL, landing); lerr != nil {
+			in.logf("⚠️ 资料页文档未加载: %v", lerr)
+		} else if strings.TrimSpace(loaded) != "" {
+			continueURL = loaded
+			in.logf("📝 资料页 HTML 已水合")
 		}
-		birth := protocolBirthdate(in.Age)
-		in.logf("👤 提交资料 name=%s age=%s birthdate=%s email=%s", in.FullName, in.Age, birth, in.Email)
+		// 资料页加载：SDK 为 oauth_create_account 流 init，收集器重新开始观察。
+		c.startSentinelPage(ctx, "oauth_create_account", aboutURL)
+		// 真人读页面、想姓名、敲键盘需要十几秒；停留期间 Node 侧继续做鼠标漂移。
+		c.dwellOnPage(ctx, "oauth_create_account", 12, 26)
+		birth, typedAge := protocolBirthdate(in.Age)
+		in.logf("👤 提交资料 name=%s age=%d birthdate=%s email=%s", in.FullName, typedAge, birth, in.Email)
+		c.pendingInteract = map[string]any{"kind": "profile", "name": in.FullName, "age": strconv.Itoa(typedAge)}
 		r, err = c.postJSON(ctx, "https://auth.openai.com/api/accounts/create_account", continueURL, map[string]any{
 			"name":      in.FullName,
 			"birthdate": birth,
@@ -462,7 +601,7 @@ func registerProtocol(ctx context.Context, in Input) (res *protoResult, err erro
 		continueURL = cr.ContinueURL
 	}
 
-	// 7. OAuth 回调 → chatgpt.com 会话
+	// 7. OAuth 回调 → chatgpt.com 会话，继续走同一 TLS 客户端。
 	if !strings.Contains(continueURL, "chatgpt.com/api/auth/callback/") {
 		return nil, fmt.Errorf("未拿到 chatgpt.com 回调地址: %s", truncateForLog(continueURL, 200))
 	}
@@ -470,7 +609,6 @@ func registerProtocol(ctx context.Context, in Input) (res *protoResult, err erro
 		return nil, fmt.Errorf("OAuth 回调失败: %w", err)
 	}
 
-	// 8. accessToken
 	in.logf("🔑 提取 accessToken...")
 	r, err = c.get(ctx, "https://chatgpt.com/api/auth/session", "https://chatgpt.com/", false)
 	if err != nil {
@@ -487,11 +625,23 @@ func registerProtocol(ctx context.Context, in Input) (res *protoResult, err erro
 	res.AccessToken = token
 	in.logf("🔑 accessToken 获取成功")
 
+	res.UserAgent = c.ua
+	res.ChromeMajor = c.chromeMajor
+	res.SentinelDisplay = c.sentinelDisplay()
 	res.Cookies = c.webCookies()
 	if len(res.Cookies) == 0 {
 		return nil, fmt.Errorf("登录成功但没有捕获到会话 Cookie")
 	}
 	in.logf("🍪 协议会话已保存（%d 个 Cookie）", len(res.Cookies))
+
+	// The ChatGPT web signup flow does not issue a refresh_token. Keep the full
+	// authenticated Web Session as the renewable credential source; export and
+	// live-check will ask /api/auth/session for a candidate AT and then verify
+	// that exact token at the real backend authorization boundary. A rotating
+	// RT is still supported for imported OAuth credentials, but attempting a
+	// second non-interactive Codex login here creates an unrelated Hydra
+	// transaction and is not a reliable or supported signup completion step.
+	in.logf("🔐 网页登录会话已保存；出库前将重新取 AT 并做真实授权探针")
 	return res, nil
 }
 
@@ -525,8 +675,9 @@ func (c *protocolClient) probeExistingSessionEmail(ctx context.Context, aboutYou
 	if err != nil {
 		return "", err
 	}
-	c.in.logf("🔎 session HTTP %d body=%s", r.Status, truncateForLog(string(r.Body), 400))
-	return sessionUserEmail(r.Body), nil
+	who := sessionUserEmail(r.Body)
+	c.in.logf("🔎 session HTTP %d email_match=%t", r.Status, who != "")
+	return who, nil
 }
 
 func cookieValue(c *protocolClient, site, name string) string {
@@ -588,69 +739,21 @@ func preserveLoginHintPlus(raw, email string) string {
 	return u.String()
 }
 
-func (c *protocolClient) attachSentinel(req *http.Request, flow string) {
-	id := c.deviceID
-	if id == "" {
-		id = uuid.NewString()
-		c.deviceID = id
-	}
-	if c.navID == "" {
-		c.navID = uuid.NewString()
-	}
-	tok := map[string]any{
-		"p":    c.sentinelP(),
-		"id":   id,
-		"flow": flow,
-	}
-	b, _ := json.Marshal(tok)
-	req.Header.Set("openai-sentinel-token", string(b))
-	req.Header.Set("x-openai-document-navigation-id", c.navID)
-	req.Header.Set("x-access-flow-invocation-id", uuid.NewString())
-}
-
-func (c *protocolClient) sentinelP() string {
-	lang := c.languages
-	if lang == "" {
-		lang = "en-US,en"
-	}
-	primary := strings.Split(lang, ",")[0]
-	sdk := "https://sentinel.openai.com/backend-api/sentinel/sdk.js"
-	now := time.Now()
-	fp := []any{
-		c.screen.Width,
-		now.Format("Mon Jan 02 2006 15:04:05 GMT-0700 (MST)"),
-		c.screen.Width * c.screen.Height * 4,
-		5,
-		c.ua,
-		sdk,
-		nil,
-		primary,
-		lang,
-		26,
-		"languages−" + lang,
-		"location",
-		"cookieStore",
-		float64(55000+ri(2000)) + 0.9,
-		c.navID,
-		"",
-		16,
-		float64(now.UnixMilli()) + 0.6,
-		0, 0, 0, 0, 0, 0, 0,
-	}
-	raw, _ := json.Marshal(fp)
-	return "gAAAAAB" + base64.StdEncoding.EncodeToString(raw) + "~S"
-}
-
-func protocolBirthdate(ageStr string) string {
+// protocolBirthdate 与官方资料页的行为一致：页面只让用户填“年龄”，隐藏字段 birthday 由
+// “今天减去年龄”得出（同月同日），请求体里提交的就是这个 birthday。同时返回实际使用的年龄，
+// 供拟人输入时敲进年龄框，保证“敲的数字”和“提交的生日”一致。
+func protocolBirthdate(ageStr string) (string, int) {
 	age, _ := strconv.Atoi(strings.TrimSpace(ageStr))
 	if age < 19 || age > 90 {
 		age = 21 + ri(20) // 21–40，避开刚满 18 的边界
 	}
 	now := time.Now()
-	year := now.Year() - age
-	month := time.Month(1 + ri(12))
-	day := 1 + ri(28)
-	return time.Date(year, month, day, 0, 0, 0, 0, time.UTC).Format("2006-01-02")
+	day := now.Day()
+	month := now.Month()
+	if month == time.February && day == 29 {
+		day = 28
+	}
+	return time.Date(now.Year()-age, month, day, 0, 0, 0, 0, time.UTC).Format("2006-01-02"), age
 }
 
 func (c *protocolClient) submitCreatePassword(ctx context.Context, referer, password string) (string, error) {
@@ -682,6 +785,8 @@ func (c *protocolClient) submitCreatePassword(ctx context.Context, referer, pass
 }
 
 func (c *protocolClient) validateOTP(ctx context.Context, referer, code string) (string, error) {
+	// 提交前在假页面上完成“点输入框 → 逐位输入 → 点按钮”，让 so 快照带上真人交互量。
+	c.pendingInteract = map[string]any{"kind": "otp", "text": code}
 	r, err := c.postJSON(ctx, "https://auth.openai.com/api/accounts/email-otp/validate", referer, map[string]string{"code": code})
 	if err != nil {
 		return "", fmt.Errorf("提交验证码失败: %w", err)
