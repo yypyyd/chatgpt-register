@@ -27,6 +27,7 @@ type LeonardoCookie struct {
 type LeonardoItem struct {
 	ID      uint
 	Cookies []LeonardoCookie
+	Proxy   string
 }
 
 // CheckLeonardo 批量测活 Leonardo 账号：
@@ -40,7 +41,6 @@ func CheckLeonardo(ctx context.Context, items []LeonardoItem, onChunk Chunk) map
 		return out
 	}
 
-	client := &http.Client{Timeout: 30 * time.Second}
 	var (
 		mu  sync.Mutex
 		wg  sync.WaitGroup
@@ -63,6 +63,12 @@ func CheckLeonardo(ctx context.Context, items []LeonardoItem, onChunk Chunk) map
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
+			client, closeClient, err := probeClient(it.Proxy)
+			if err != nil {
+				record(it.ID, StatusUnknown)
+				return
+			}
+			defer closeClient()
 			record(it.ID, probeLeonardoSession(ctx, client, it))
 		}(it)
 	}

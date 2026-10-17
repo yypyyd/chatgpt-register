@@ -27,9 +27,7 @@ const (
 	ConnectCreate    = SiteURL + "/auth_mgmt.AuthManagement/CreateEmailValidationCode"
 	ConnectVerify    = SiteURL + "/auth_mgmt.AuthManagement/VerifyEmailValidationCode"
 	ConnectPass      = SiteURL + "/auth_mgmt.AuthManagement/ValidatePassword"
-	ConnectSession   = SiteURL + "/auth_mgmt.AuthManagement/CreateSession"
 	SignupURLGrok    = SiteURL + "/sign-up?redirect=grok-com"
-	SigninURLGrok    = SiteURL + "/sign-in?redirect=grok-com"
 	DefaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
 	// Document-aligned Next.js router state tree (URL-encoded at use).
@@ -70,10 +68,6 @@ type Client struct {
 	profile string
 	mu      sync.Mutex
 	cfg     SignupConfig
-}
-
-func NewClient(proxy string, cm *clearance.Manager) (*Client, error) {
-	return NewClientOpts(ClientOptions{Proxy: proxy, Clearance: cm, Impersonate: "chrome_131"})
 }
 
 func NewClientOpts(opt ClientOptions) (*Client, error) {
@@ -152,12 +146,6 @@ func (c *Client) applyClearanceCookies() {
 		c.ua = b.UserAgent
 		c.sess.SetUserAgent(b.UserAgent)
 	}
-}
-
-func (c *Client) Config() SignupConfig {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.cfg
 }
 
 // WarmSignup GETs sign-up page; used for CF probe and config scrape.
@@ -335,121 +323,6 @@ func (c *Client) ValidatePassword(email, password string) error {
 		return Failf(CodeGRPCPassword, "validate password http=%d grpc=%s", resp.StatusCode, st)
 	}
 	return nil
-}
-
-// WarmSignin establishes the accounts.x.ai sign-in session immediately before
-// minting the single-use Turnstile token used by CreateSession.
-func (c *Client) WarmSignin() (int, error) {
-	c.applyClearanceCookies()
-	req, err := NewRequest(http.MethodGet, SigninURLGrok, nil)
-	if err != nil {
-		return 0, err
-	}
-	c.setBrowserHeaders(req)
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-	req.Header.Set("Referer", SiteURL+"/")
-	req.Header.Set("Sec-Fetch-Mode", "navigate")
-	req.Header.Set("Sec-Fetch-Dest", "document")
-	resp, err := c.sess.Do(req)
-	if err != nil {
-		return 0, Wrap(CodeCreateSession, "warm sign-in", err)
-	}
-	_, _ = readAllBody(resp)
-	if resp.StatusCode >= 400 {
-		return resp.StatusCode, Failf(CodeCreateSession, "warm sign-in http=%d", resp.StatusCode)
-	}
-	return resp.StatusCode, nil
-}
-
-// CreateSession performs the password login used after registration:
-// local Turnstile -> AuthManagement/CreateSession -> a fresh SSO session JWT.
-// A Turnstile token is single-use; callers must mint a new token for every retry.
-func (c *Client) CreateSession(email, password, turnstileToken string) (string, error) {
-	return c.createSessionAt(ConnectSession, email, password, turnstileToken)
-}
-
-func (c *Client) createSessionAt(endpoint, email, password, turnstileToken string) (string, error) {
-	email = strings.TrimSpace(email)
-	turnstileToken = strings.TrimSpace(turnstileToken)
-	if email == "" || password == "" || turnstileToken == "" {
-		return "", Failf(CodeCreateSession, "CreateSession parameters incomplete")
-	}
-	inner := buildCreateSessionRequest(email, password, turnstileToken, "")
-	req, err := NewRequest(http.MethodPost, endpoint, bytes.NewReader(grpcWebFrame(inner)))
-	if err != nil {
-		return "", err
-	}
-	c.setGRPCHeaders(req)
-	req.Header.Set("Referer", SigninURLGrok)
-	resp, err := c.sess.Do(req)
-	if err != nil {
-		return "", Wrap(CodeCreateSession, "CreateSession", err)
-	}
-	body, _ := readAllBody(resp)
-	grpcStatus := readGRPCStatus(resp, body)
-	if grpcStatus == "" {
-		grpcStatus = "0"
-	}
-	if resp.StatusCode != 200 || grpcStatus != "0" {
-		msg := grpcMessage(resp, body)
-		if msg != "" {
-			return "", Failf(CodeCreateSession, "CreateSession http=%d grpc=%s message=%s", resp.StatusCode, grpcStatus, truncate(msg, 180))
-		}
-		return "", Failf(CodeCreateSession, "CreateSession http=%d grpc=%s", resp.StatusCode, grpcStatus)
-	}
-
-	sso := sessionSSOFromCookies(resp.Cookies())
-	if !isSessionSSO(sso) {
-		sso = extractSessionJWT(body)
-	}
-	if !isSessionSSO(sso) {
-		return "", Failf(CodeCreateSession, "CreateSession succeeded but returned no SSO")
-	}
-	c.sess.SetCookies(SiteURL, []*http.Cookie{{Name: "sso", Value: sso, Domain: ".x.ai", Path: "/"}})
-	return sso, nil
-}
-
-func buildCreateSessionRequest(email, password, turnstileToken, castleToken string) []byte {
-	emailPassword := append(pbStr(1, email), pbStr(2, password)...)
-	credentials := pbMsg(1, emailPassword)
-	req := pbMsg(1, credentials)
-	antiAbuse := append(pbStr(1, turnstileToken), pbStr(2, castleToken)...)
-	return append(req, pbMsg(4, antiAbuse)...)
-}
-
-func extractSessionJWT(body []byte) string {
-	for _, token := range jwtRe.FindAllString(string(body), -1) {
-		if isSessionSSO(token) {
-			return token
-		}
-	}
-	return ""
-}
-
-func grpcMessage(resp *http.Response, body []byte) string {
-	if resp != nil {
-		for _, raw := range []string{resp.Header.Get("grpc-message"), resp.Trailer.Get("grpc-message")} {
-			if raw == "" {
-				continue
-			}
-			if decoded, err := url.QueryUnescape(raw); err == nil {
-				return decoded
-			}
-			return raw
-		}
-	}
-	s := string(body)
-	if i := strings.LastIndex(s, "grpc-message:"); i >= 0 {
-		rest := strings.TrimLeft(s[i+len("grpc-message:"):], " \t")
-		if j := strings.IndexAny(rest, "\r\n"); j >= 0 {
-			rest = rest[:j]
-		}
-		if decoded, err := url.QueryUnescape(strings.TrimSpace(rest)); err == nil {
-			return decoded
-		}
-		return strings.TrimSpace(rest)
-	}
-	return ""
 }
 
 // SignupServerAction posts Next.js server action body; returns response text and SSO cookie if set.

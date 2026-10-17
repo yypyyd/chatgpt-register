@@ -1,6 +1,6 @@
 // Package leonardoreg 用 HTTP 协议完成 leonardo.ai 的邮箱注册，并采集站点 Cookie
 // （含 better-auth 会话 cookie）供导出。先用页面过 Vercel BotID，再 fetch 同一套
-// 接口（不填注册表单）。MintTurnstile 仍供其它平台借用浏览器点选。
+// 接口（不填注册表单）。
 package leonardoreg
 
 import (
@@ -20,9 +20,6 @@ type Input struct {
 
 	// CaptchaKey 是 2Captcha 的 client key，协议注册解 Turnstile 用。
 	CaptchaKey string
-
-	// EgressCheck 为 true 时先打开 api.ipify.org 打印 Chromium 实际出口 IP（排障用）。
-	EgressCheck bool
 
 	// WaitCode 返回 Leonardo 发到邮箱的 6 位注册验证码。
 	WaitCode func(ctx context.Context) (string, error)

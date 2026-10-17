@@ -82,8 +82,10 @@ func (c *Client) listGraphMessages(ctx context.Context, accessToken string, limi
 			})
 		}
 	}
-	if len(output) == 0 && firstErr != nil {
-		return nil, firstErr
+	if firstErr != nil {
+		// A successful Inbox response cannot prove that Junk is empty when its
+		// request failed. Preserve partial data and report the incomplete read.
+		return sortAndLimit(output, limit), firstErr
 	}
 	return sortAndLimit(output, limit), nil
 }

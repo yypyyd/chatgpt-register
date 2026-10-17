@@ -25,6 +25,7 @@ var errIMAPAuthRejected = errors.New("IMAP XOAUTH2 rejected")
 
 type imapSession interface {
 	Authenticate(sasl.Client) error
+	Login(username, password string) error
 	Noop() error
 	List(string, string, chan *imap.MailboxInfo) error
 	Select(string, bool) (*imap.MailboxStatus, error)

@@ -288,13 +288,6 @@ type ProbeIdentity struct {
 	UserAgent string
 }
 
-// ProbeAccessToken verifies the exact token against the same real, non-image
-// ChatGPT endpoint used by image2api for account bootstrap. It consumes no
-// image quota and never relies on JWT exp alone.
-func ProbeAccessToken(ctx context.Context, token, proxy, languages string) (AccessTokenProbeResult, error) {
-	return ProbeAccessTokenWithIdentity(ctx, ProbeIdentity{Token: token, Proxy: proxy, Languages: languages})
-}
-
 func ProbeAccessTokenWithIdentity(ctx context.Context, in ProbeIdentity) (AccessTokenProbeResult, error) {
 	if strings.TrimSpace(in.Token) == "" {
 		return AccessTokenProbeResult{ErrorCode: "missing_access_token"}, nil

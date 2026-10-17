@@ -2,6 +2,10 @@ package codexreg
 
 import "errors"
 
+// ErrEmailCodeNotReceived 仅用于邮箱读取正常、等待期内没有匹配验证邮件的情况。
+// 鉴权、邮件列表、正文读取和验证码解析错误不能归入此类。
+var ErrEmailCodeNotReceived = errors.New("超时未收到验证码邮件")
+
 // ErrAccountTaken 注册时提示账号停用/已删除，视为该地址不可再用。
 var ErrAccountTaken = errors.New("账号不存在或已被删除/停用")
 

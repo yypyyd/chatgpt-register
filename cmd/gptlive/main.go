@@ -14,7 +14,7 @@ import (
 	"chatgpt-register/internal/codexreg"
 	"chatgpt-register/internal/mailfetch"
 	"chatgpt-register/internal/models"
-	"chatgpt-register/internal/proxyutil"
+	"chatgpt-register/internal/proxypool"
 
 	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
@@ -47,16 +47,29 @@ func main() {
 	if err != nil {
 		fatal("open db: %v", err)
 	}
-	baseProxy := firstProxy(db)
-	proxy := baseProxy
-	if proxy == "" && *mode != "otp" && *mode != "pick" {
-		fatal("no proxy configured")
-	}
-	proxy = proxyutil.WithBestGoTaskSession(proxy)
-	fmt.Printf("mode=%s proxy_host=%s\n", *mode, proxyHost(proxy))
-
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
+	lease := proxypool.Lease{}
+	if *mode != "otp" && *mode != "pick" {
+		if err := proxypool.Migrate(db); err != nil {
+			fatal("proxy migration: %v", err)
+		}
+		budget := time.Minute
+		if *mode == "register" {
+			budget = proxypool.RegistrationBudget("chatgpt")
+		}
+		lease, err = proxypool.New(db).Acquire(ctx, "chatgpt", budget)
+		if err != nil {
+			fatal("ChatGPT proxy: %v", err)
+		}
+		if lease.Proxy == "" {
+			fatal("ChatGPT proxy is disabled")
+		}
+	}
+	baseProxy, proxy := lease.Proxy, lease.Proxy
+	ctx, cancelProxy := lease.Context(ctx)
+	defer cancelProxy()
+	fmt.Printf("mode=%s proxy_host=%s\n", *mode, proxyHost(proxy))
 
 	wopt := watchOpts{Label: *label, First: *first, Every: *every, Total: *total, Cookies: *withCookies}
 	switch *mode {
@@ -378,22 +391,6 @@ func fetchCode(ctx context.Context, mail *mailfetch.Client, mb models.Mailbox, s
 func looksLikeOpenAI(m mailfetch.Message) bool {
 	s := strings.ToLower(m.From + " " + m.FromName + " " + m.Subject)
 	return strings.Contains(s, "openai") || strings.Contains(s, "chatgpt")
-}
-
-func firstProxy(db *gorm.DB) string {
-	var enabled models.Setting
-	if err := db.Where("key = ?", "proxy_enabled").First(&enabled).Error; err == nil && enabled.Value == "0" {
-		return ""
-	}
-	var list models.Setting
-	if err := db.Where("key = ?", "proxy_list").First(&list).Error; err != nil {
-		return ""
-	}
-	proxies := proxyutil.List(list.Value)
-	if len(proxies) == 0 {
-		return ""
-	}
-	return proxies[0]
 }
 
 func proxyHost(raw string) string {

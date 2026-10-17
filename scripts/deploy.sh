@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 一键部署脚本：全新服务器可直接用——自动建工作目录、写 systemd 服务、装 Chrome、建 venv 补依赖，
+# 一键部署脚本：自动建工作目录、写 systemd 服务、准备 Chrome，
 # 再装二进制和 scripts/，重启服务并校验，校验失败自动回滚。
 # 用法：
 #   scripts/deploy.sh root@1.2.3.4 [root@5.6.7.8 ...]
@@ -13,9 +13,6 @@
 #   SCRIPTS_DST       远端脚本目录，默认 /usr/local/share/chatgpt-register/scripts
 #   WORKDIR            远端工作目录（数据库所在），默认 /opt/chatgpt-register
 #   ADDR               服务监听地址，默认 127.0.0.1:9000（只在首次写 service 文件时生效）
-#   VENV              Python 虚拟环境，默认 /opt/cloakbrowser-venv
-#   FORCE_VENV=1      强制重装 requirements.txt 里的依赖
-#   SKIP_VENV=1       跳过 Python 依赖检查
 #   SKIP_CHROME=1     跳过 Chrome 检查/安装
 #   DB_SRC             本地数据库文件路径；设置后在远端没有数据库时装为初始库（绝不覆盖已有库）
 set -euo pipefail
@@ -28,10 +25,7 @@ REMOTE_BIN="${REMOTE_BIN:-/usr/local/bin/chatgpt-register}"
 SCRIPTS_DST="${SCRIPTS_DST:-/usr/local/share/chatgpt-register/scripts}"
 WORKDIR="${WORKDIR:-/opt/chatgpt-register}"
 ADDR="${ADDR:-127.0.0.1:9000}"
-VENV="${VENV:-/opt/cloakbrowser-venv}"
 SSH_PORT="${SSH_PORT:-22}"
-FORCE_VENV="${FORCE_VENV:-0}"
-SKIP_VENV="${SKIP_VENV:-0}"
 SKIP_CHROME="${SKIP_CHROME:-0}"
 DB_SRC="${DB_SRC:-}"
 
@@ -69,11 +63,11 @@ stage_files() {
   fi
 }
 
-# 远端安装：首次自动初始化（工作目录/service 文件/Chrome/venv），备份旧二进制 -> 装新二进制和脚本
-# -> 补依赖 -> 重启 -> 校验，校验失败自动回滚
+# 远端安装：首次自动初始化（工作目录/service 文件/Chrome），备份旧二进制 -> 装新二进制和脚本
+# -> 重启 -> 校验，校验失败自动回滚
 remote_install() {
   "${SSH[@]}" "$1" \
-    "SERVICE='$SERVICE' REMOTE_BIN='$REMOTE_BIN' SCRIPTS_DST='$SCRIPTS_DST' WORKDIR='$WORKDIR' ADDR='$ADDR' VENV='$VENV' BIN_MD5='$BIN_MD5' FORCE_VENV='$FORCE_VENV' SKIP_VENV='$SKIP_VENV' SKIP_CHROME='$SKIP_CHROME' bash -s" <<'REMOTE'
+    "SERVICE='$SERVICE' REMOTE_BIN='$REMOTE_BIN' SCRIPTS_DST='$SCRIPTS_DST' WORKDIR='$WORKDIR' ADDR='$ADDR' BIN_MD5='$BIN_MD5' SKIP_CHROME='$SKIP_CHROME' bash -s" <<'REMOTE'
 set -euo pipefail
 STAGE=/tmp/cgr-deploy
 TS=$(date -u +%Y%m%d%H%M%S)
@@ -125,7 +119,7 @@ UNITEOF
   systemctl enable "$SERVICE" >/dev/null 2>&1 || true
 fi
 
-# Chrome：turnstile/cloakbrowser 依赖，没有就装
+# Chrome：浏览器注册渠道需要，没有就装
 if [ "$SKIP_CHROME" != "1" ] && ! command -v google-chrome >/dev/null 2>&1; then
   echo "== 未检测到 google-chrome，开始安装"
   export DEBIAN_FRONTEND=noninteractive
@@ -163,32 +157,6 @@ for f in "$STAGE"/scripts/*; do
     *)    install -m 0644 "$f" "$SCRIPTS_DST/" ;;
   esac
 done
-
-# Python 依赖：venv 不存在就建，FORCE_VENV=1 强制重装
-if [ "$SKIP_VENV" != "1" ]; then
-  if [ ! -x "$VENV/bin/python" ]; then
-    echo "== venv 不存在，创建 $VENV"
-    python3 -m venv "$VENV" 2>/dev/null || {
-      export DEBIAN_FRONTEND=noninteractive
-      apt-get update -qq || true
-      apt-get install -y -qq python3-venv
-      python3 -m venv "$VENV"
-    }
-    FORCE_VENV=1
-  fi
-  if [ "$FORCE_VENV" = "1" ] && [ -f "$SCRIPTS_DST/requirements.txt" ]; then
-    "$VENV/bin/pip" install -q --upgrade pip
-    "$VENV/bin/pip" install -q -r "$SCRIPTS_DST/requirements.txt"
-  fi
-  "$VENV/bin/python" -c 'import importlib.util,sys
-missing=[m for m in ("cloakbrowser",) if importlib.util.find_spec(m) is None]
-sys.exit(1 if missing else 0)' || {
-    if [ -f "$SCRIPTS_DST/requirements.txt" ]; then
-      echo "== 依赖缺失，按 requirements.txt 补装"
-      "$VENV/bin/pip" install -q -r "$SCRIPTS_DST/requirements.txt"
-    fi
-  }
-fi
 
 systemctl restart "$SERVICE"
 

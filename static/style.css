@@ -704,6 +704,15 @@ button.px-select-opt {
 .settings-card .px-input { width: 100%; }
 .settings-card textarea.px-input { resize: none; font-family: inherit; line-height: 1.6; }
 .proxy-textarea { font-weight: 700; font-size: 12.5px; }
+.proxy-channels { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 20px; }
+.proxy-channel-tab { display: flex; align-items: center; gap: 8px; padding: 9px 12px; border: 1px solid var(--glass-border); border-radius: 10px; background: var(--glass); color: var(--text-2); font: inherit; font-size: 13px; cursor: pointer; }
+.proxy-channel-tab.active { border-color: var(--primary); background: var(--primary-soft); color: var(--primary); font-weight: 700; }
+.proxy-channel-badge { font-size: 11px; color: var(--text-3); font-weight: 500; }
+.proxy-channel-badge.enabled { color: #16a34a; }
+.proxy-example { margin: 10px 0; }
+.field-hint.proxy-hint-warning { color: #b45309; }
+#proxy-mode-summary { margin-bottom: 18px; }
+#proxy-window-hint { display: block; overflow-wrap: anywhere; }
 .input-suffix { position: relative; }
 .input-suffix .suffix {
   position: absolute; right: 14px; top: 50%; transform: translateY(-50%);

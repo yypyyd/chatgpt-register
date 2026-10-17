@@ -11,7 +11,6 @@ import (
 	"chatgpt-register/internal/chatgptauth"
 	"chatgpt-register/internal/codexreg"
 	"chatgpt-register/internal/models"
-	"chatgpt-register/internal/proxyutil"
 
 	"gorm.io/gorm/clause"
 )
@@ -50,19 +49,6 @@ func (s *exportStats) add(category string) {
 		s.NeedsRelogin++
 	default:
 		s.TemporaryUnknown++
-	}
-}
-
-func (s *exportStats) remove(category string) {
-	switch category {
-	case chatgptauth.CategoryRefreshedAndValid:
-		if s.RefreshedAndValid > 0 {
-			s.RefreshedAndValid--
-		}
-	case chatgptauth.CategoryAlreadyValid:
-		if s.AlreadyValid > 0 {
-			s.AlreadyValid--
-		}
 	}
 }
 
@@ -118,10 +104,7 @@ func (h *Handler) runGPTCredentialBatch(ctx context.Context, regs []models.Regis
 	if len(regs) == 0 {
 		return result
 	}
-	proxies := []string(nil)
-	if h.settingValue("proxy_enabled") != "0" {
-		proxies = proxyutil.List(h.settingValue("proxy_list"))
-	}
+	manager := h.proxyManager()
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, gptCredentialConcurrency)
 	for i := range regs {
@@ -136,11 +119,14 @@ func (h *Handler) runGPTCredentialBatch(ctx context.Context, regs []models.Regis
 				result.Outcomes[i] = chatgptauth.Outcome{Category: chatgptauth.CategoryTemporaryUnknown, ErrorCode: "request_cancelled"}
 				return
 			}
-			fallbackProxy := ""
-			if len(proxies) > 0 {
-				fallbackProxy = proxyutil.WithBestGoTaskSession(proxyutil.Normalize(proxies[i%len(proxies)]))
+			lease, err := manager.Acquire(ctx, "chatgpt", 2*time.Minute)
+			if err != nil {
+				result.Outcomes[i] = chatgptauth.Outcome{Category: chatgptauth.CategoryTemporaryUnknown, ErrorCode: "proxy_unavailable"}
+				return
 			}
-			result.Outcomes[i] = h.GPTCredentials.EnsureExportable(ctx, regs[i].ID, fallbackProxy)
+			proxyCtx, cancelProxy := lease.Context(ctx)
+			defer cancelProxy()
+			result.Outcomes[i] = h.GPTCredentials.EnsureExportable(proxyCtx, regs[i].ID, lease.Proxy)
 		}()
 	}
 	wg.Wait()

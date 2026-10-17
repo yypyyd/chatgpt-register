@@ -54,7 +54,15 @@ Adobe 注册与 ChatGPT、Grok 完全隔离：独立数据表 `adobe_registratio
 - `json`：单个 Adobe 的 Cookie JSON 对象（含 `cookie_string`、`cookies_map`、带元数据的 `cookies` 数组、`storage`；单账号 `.json`，多账号 `.zip`）。
 - `array`：多个 Adobe 批量导出的 Cookie 数组，始终单个 `.json` 文件。
 
-生命周期与 Grok 一致：并发受全局 `max_concurrency`（默认 1）约束，代理走全局 `proxy_enabled` / `proxy_list`，无头由 `adobe_headless` 控制；服务启动时把残留的 `registering`/`waiting_code` 记录回收为 `register_failed`，可重新注册。Adobe 与 Grok 共用任务级代理会话策略：BestGo 动态住宅代理若未显式配置 `-session-`，生产器会为每个注册任务生成独立 session，不同任务允许轮换出口，但同一浏览器/协议流程（含 Turnstile 与 OAuth）保持出口 IP 稳定；认证代理日志同时记录本地桥入口和不含凭据的上游地址，避免把 `127.0.0.1` 误认为直连。
+生命周期与 Grok 一致：并发受全局 `max_concurrency`（默认 1）约束，代理使用各渠道独立配置，无头由 `adobe_headless` 控制；服务启动时把残留的 `registering`/`waiting_code` 记录回收为 `register_failed`，可重新注册。API 提供的 session 原样绑定单次注册尝试；Adobe 注册后自检及 Grok 的 OAuth 交换沿用已分配代理与截止时间。认证代理日志记录本地桥入口和不含凭据的上游地址，避免把 `127.0.0.1` 误认为直连。
+
+### 渠道独立代理与 API 提取
+
+`internal/proxypool.Manager` 在单实例中共享，内部按 chatgpt/grok/adobe/leonardo 维护独立缓存、并发提取状态及错误退避。设置键为 `proxy_<channel>_{enabled,source,api_url,list}`，由受鉴权的 `/api/proxy/channels` GET、`/api/proxy/channels/:channel` PUT 与 `/:channel/test` POST 管理。保存采用事务；通用 settings 接口不接受代理配置写入，也不返回历史渠道的代理凭据。首次启动将旧全局配置按历史有效行为复制到四个渠道，内部迁移标记防止重新覆盖。
+
+任务获得并发及错峰名额后再申请代理。API HTTP 请求不使用环境代理，限制超时、响应体大小与重试次数，解析文本中的 URL 或 host:port:user:pass，严格校验并去重。每个 API 条目只分配一次，管理器登记已分配会话以防跨渠道重复使用；API 返回的认证字段、地区和 session 不再被生产器改写。旧独立列表保留轮转及 BestGo 任务 session 行为。
+
+未分配结果最多缓存 30 秒。`sessTime` 为上游轮换分钟数，已知窗口以请求发出时间保守估算并减去 30 秒余量；不足以覆盖本次流程预算的代理不分配，已分配会话通过 context 截止时间限制后续网络操作。GPT 的预算为 8 分钟，其余渠道至少预留 5 分钟，并同样受窗口截止限制。供应商的实际起算点仍需实测确认。配置修改会丢弃旧配置的未分配及在途提取结果，已有任务继续使用分配时的代理。API 失败不会切换直连，返回内容仅映射预定义错误，白名单错误提供明确说明且不回显凭据。
 
 ## 已知限制
 
@@ -76,6 +84,10 @@ Adobe 注册与 ChatGPT、Grok 完全隔离：独立数据表 `adobe_registratio
 - **已知风险**：管理员凭据被盗后仍可执行不可恢复的全部删除；应依赖强管理员密码、HTTPS 与数据库备份降低风险。
 
 ## 变更历史
+
+### 2026-10-17 - 按渠道拆分代理并支持 API 提取
+
+新增六个独立开关、来源和 API 配置及页面标签。注册、注册后自检、GPT 测活备用代理、Grok OAuth 补换与 gptlive 工具改为读取对应渠道。添加代理分配并发、配置热更新、失败关闭、旧配置迁移、认证代理探测及页面草稿隔离测试；前端测试命令为 `node --test scripts/test_proxy_settings.cjs`。
 
 ### 2026-09-30 - GPT 并发跟随设置，不再强制 2 路
 
@@ -99,7 +111,7 @@ Adobe 注册与 ChatGPT、Grok 完全隔离：独立数据表 `adobe_registratio
 
 **变更理由**：这条 Chromium 路径已经没有任何注册调用，留着会让人以为还能切回真浏览器。用户要求只保留当前这一套全协议实现。
 
-**影响范围**：`internal/codexreg`。Adobe / Grok / Lumina 仍使用各自的浏览器注册，未改。
+**影响范围**：`internal/codexreg`。Adobe / Grok 仍使用各自的浏览器注册，未改。
 
 ### 2026-09-29 - 修复注册后 token_revoked：补齐 Sentinel 会话观察器与环境指纹
 

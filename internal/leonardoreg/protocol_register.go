@@ -2,7 +2,6 @@ package leonardoreg
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -110,11 +109,6 @@ func (c *leoClient) signup(ctx context.Context, in Input, sitekey, token string)
 		return merr
 	}
 	return c.signupBetterAuth(ctx, in, fresh)
-}
-
-func captchaMissing(code, msg, raw string) bool {
-	s := strings.ToLower(code + " " + msg + " " + raw)
-	return strings.Contains(s, "missing captcha")
 }
 
 func (c *leoClient) remintCaptcha(ctx context.Context, sitekey string) (string, error) {
@@ -391,12 +385,6 @@ func (c *leoClient) ensureSession(ctx context.Context, in Input, sitekey string)
 		in.logf("sign-in/email HTTP %d %s", r.Status, trimText(string(r.Body), 200))
 		code, msg := parseAuthError(r.Body)
 		if r.Status < 400 && !looksLikeAPIError(r.Body) {
-			var wrap struct {
-				Token string `json:"token"`
-			}
-			if json.Unmarshal(r.Body, &wrap) == nil && strings.TrimSpace(wrap.Token) != "" {
-				c.adoptSessionToken(wrap.Token)
-			}
 			last = nil
 			break
 		}
@@ -438,79 +426,6 @@ func (c *leoClient) result(in Input) (*Result, error) {
 		"cookies":     cookies,
 	}
 	return &Result{AuthJSON: auth}, nil
-}
-
-func (c *leoClient) checkEmail(ctx context.Context, in Input, token string) (taken, unconfirmed bool, err error) {
-	queries := []string{
-		`query GetUserByUserEmail($arg1: GetUserByUserEmailInput!) { getUserByUserEmail(arg1: $arg1) { userId confirmationStatus cognitoProvider } }`,
-		`mutation GetUserByUserEmail($arg1: GetUserByUserEmailInput!) { getUserByUserEmail(arg1: $arg1) { userId confirmationStatus cognitoProvider } }`,
-		`query GetUserByUserEmail($arg1: getUserByUserEmailInput!) { getUserByUserEmail(arg1: $arg1) { userId confirmationStatus cognitoProvider } }`,
-	}
-	vars := map[string]any{
-		"arg1": map[string]any{
-			"userEmail":         in.Email,
-			"verificationToken": token,
-		},
-	}
-	var last string
-	for _, q := range queries {
-		payload := map[string]any{"query": q, "variables": vars}
-		r, rerr := c.postJSON(ctx, graphqlURL, payload, "")
-		if rerr != nil {
-			last = rerr.Error()
-			continue
-		}
-		in.logf("getUserByUserEmail HTTP %d %s", r.Status, trimText(string(r.Body), 200))
-		if r.vercel() {
-			return false, false, fmt.Errorf("graphql 命中 Vercel BotID")
-		}
-		var wrap struct {
-			Data struct {
-				GetUserByUserEmail *struct {
-					UserID             *string `json:"userId"`
-					ConfirmationStatus *string `json:"confirmationStatus"`
-					CognitoProvider    *string `json:"cognitoProvider"`
-				} `json:"getUserByUserEmail"`
-			} `json:"data"`
-			Errors []struct {
-				Message string `json:"message"`
-			} `json:"errors"`
-		}
-		if json.Unmarshal(r.Body, &wrap) != nil {
-			last = trimText(string(r.Body), 180)
-			continue
-		}
-		if len(wrap.Errors) > 0 {
-			last = wrap.Errors[0].Message
-			if captchaRejected(fmt.Errorf("%s", last)) {
-				return false, false, fmt.Errorf("%s", last)
-			}
-			continue
-		}
-		u := wrap.Data.GetUserByUserEmail
-		if u == nil || u.UserID == nil || strings.TrimSpace(*u.UserID) == "" {
-			status := ""
-			if u != nil && u.ConfirmationStatus != nil {
-				status = *u.ConfirmationStatus
-			}
-			if strings.EqualFold(status, "UNCONFIRMED") {
-				return true, true, nil
-			}
-			return false, false, nil
-		}
-		status := ""
-		if u.ConfirmationStatus != nil {
-			status = *u.ConfirmationStatus
-		}
-		if strings.EqualFold(status, "UNCONFIRMED") {
-			return true, true, nil
-		}
-		return true, false, nil
-	}
-	if last == "" {
-		last = "graphql 无响应"
-	}
-	return false, false, fmt.Errorf("%s", last)
 }
 
 func sleepCtxLeo(ctx context.Context, d time.Duration) bool {

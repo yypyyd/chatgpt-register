@@ -138,11 +138,6 @@ func clickTurnstileCheckbox(page *rod.Page) string {
 	return tryTurnstileClick(page)
 }
 
-// hasTurnstileWidget 判断页面上是否还挂着 Turnstile 组件。
-func hasTurnstileWidget(page *rod.Page) bool {
-	return hasSel(page, `[name="cf-turnstile-response"]`)
-}
-
 // x11ClickTurnstile 用 xdotool 移动真实光标去点复选框：事件由 X 进入浏览器，
 // screenX/screenY、trusted 都和真人一致。无显示环境或没装 xdotool 时返回空串。
 func x11ClickTurnstile(page *rod.Page, box turnstileBox) string {

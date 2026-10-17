@@ -59,18 +59,6 @@ func (m *Manager) Get() Bundle {
 	return m.bundle
 }
 
-func (m *Manager) CookieHeader() string {
-	b := m.Get()
-	parts := make([]string, 0, len(b.Cookies))
-	for _, c := range b.Cookies {
-		if c.Name == "" {
-			continue
-		}
-		parts = append(parts, c.Name+"="+c.Value)
-	}
-	return strings.Join(parts, "; ")
-}
-
 func (m *Manager) UserAgent() string {
 	ua := m.Get().UserAgent
 	if ua == "" {

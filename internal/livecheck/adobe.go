@@ -37,6 +37,7 @@ type AdobeCookie struct {
 type AdobeItem struct {
 	ID      uint
 	Cookies []AdobeCookie
+	Proxy   string
 }
 
 // CheckAdobe 批量测活 Adobe 账号：对每个账号用其 Cookie 做 cookie→token 交换。
@@ -50,7 +51,6 @@ func CheckAdobe(ctx context.Context, items []AdobeItem, onChunk Chunk) map[uint]
 		return out
 	}
 
-	client := &http.Client{Timeout: 30 * time.Second}
 	var (
 		mu  sync.Mutex
 		wg  sync.WaitGroup
@@ -77,6 +77,12 @@ func CheckAdobe(ctx context.Context, items []AdobeItem, onChunk Chunk) map[uint]
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
+			client, closeClient, err := probeClient(it.Proxy)
+			if err != nil {
+				record(it.ID, StatusUnknown)
+				return
+			}
+			defer closeClient()
 			record(it.ID, probeAdobeToken(ctx, client, it))
 		}(it)
 	}

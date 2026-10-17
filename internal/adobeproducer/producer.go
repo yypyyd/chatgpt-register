@@ -15,6 +15,7 @@ import (
 	"chatgpt-register/internal/mailfetch"
 	"chatgpt-register/internal/models"
 	"chatgpt-register/internal/prodcore"
+	"chatgpt-register/internal/proxypool"
 
 	"gorm.io/gorm"
 )
@@ -48,9 +49,9 @@ type Producer struct {
 	runTracked  []uint // 本次生产建过的任务 id
 }
 
-func New(db *gorm.DB, mail *mailfetch.Client) *Producer {
+func New(db *gorm.DB, mail *mailfetch.Client, managers ...*proxypool.Manager) *Producer {
 	return &Producer{
-		Core:    prodcore.New(db),
+		Core:    prodcore.New(db, "adobe", managers...),
 		db:      db,
 		mail:    mail,
 		waiters: map[uint]chan string{},
@@ -455,12 +456,15 @@ func (p *Producer) run(id uint) {
 	defer p.ReleaseSlot()
 
 	p.appendLog(id, "开始 Adobe 邮箱注册")
+	lease, proxyErr := p.AcquireProxy(ctx)
+	proxyCtx, cancelProxy := lease.Context(ctx)
+	defer cancelProxy()
 	since := time.Now().Add(-30 * time.Second)
 
 	in := adobereg.Input{
 		Email:    reg.Email,
 		Password: reg.Password,
-		Proxy:    p.NextProxy(),
+		Proxy:    lease.Proxy,
 		Headless: p.SettingOn("adobe_headless"),
 		// 出口 IP 探测默认关闭以提速；需排障时置 adobe_egress_check=1。
 		EgressCheck: p.SettingOn("adobe_egress_check"),
@@ -483,7 +487,11 @@ func (p *Producer) run(id uint) {
 		},
 	}
 
-	res, err := adobereg.Register(ctx, in)
+	var res *adobereg.Result
+	err := proxyErr
+	if err == nil {
+		res, err = adobereg.Register(proxyCtx, in)
+	}
 	if err != nil {
 		p.appendLog(id, "注册失败: "+err.Error())
 		p.db.Model(&models.AdobeRegistration{}).Where("id = ?", id).Updates(map[string]any{
@@ -493,6 +501,7 @@ func (p *Producer) run(id uint) {
 		return
 	}
 
+	res.AuthJSON["proxy"] = lease.Proxy
 	authBytes, _ := json.MarshalIndent(res.AuthJSON, "", "  ")
 	p.appendLog(id, "Adobe 注册成功")
 	p.db.Model(&models.AdobeRegistration{}).Where("id = ?", id).Updates(map[string]any{
@@ -502,7 +511,7 @@ func (p *Producer) run(id uint) {
 
 	// 注册成功后立即用与下游一致的 cookie→token 交换自检：若被 Adobe 卡在
 	// ride 身份核验（换不到 token），账号下游不可用，自动标记为失效（不删号）。
-	p.selfCheckAdobeAlive(id, string(authBytes))
+	p.selfCheckAdobeAlive(proxyCtx, id, string(authBytes), lease.Proxy)
 }
 
 // Rescue 对一个已注册但被 ride 卡住的号，异步还原会话并自动过掉身份核验。
@@ -574,9 +583,16 @@ func (p *Producer) runRescue(id uint) {
 	defer p.ReleaseSlot()
 
 	p.appendLog(id, "开始救回：还原会话并尝试过 Adobe 身份核验")
+	lease, err := p.AcquireProxy(ctx)
+	if err != nil {
+		p.appendLog(id, "救回失败："+err.Error())
+		return
+	}
+	proxyCtx, cancelProxy := lease.Context(ctx)
+	defer cancelProxy()
 	since := time.Now().Add(-15 * time.Second)
 	in := adobereg.Input{
-		Proxy:       p.NextProxy(),
+		Proxy:       lease.Proxy,
 		Headless:    p.SettingOn("adobe_headless"),
 		EgressCheck: p.SettingOn("adobe_egress_check"),
 		Log: func(f string, a ...any) {
@@ -596,15 +612,16 @@ func (p *Producer) runRescue(id uint) {
 		},
 	}
 
-	res, err := adobereg.RescueRide(ctx, in, cookies)
+	res, err := adobereg.RescueRide(proxyCtx, in, cookies)
 	if err != nil {
 		p.appendLog(id, "救回失败: "+err.Error())
 		return
 	}
+	res.AuthJSON["proxy"] = lease.Proxy
 	authBytes, _ := json.MarshalIndent(res.AuthJSON, "", "  ")
 	p.db.Model(&models.AdobeRegistration{}).Where("id = ?", id).Update("auth_data", string(authBytes))
 	// 复用注册后的自检判定 alive/dead。
-	p.selfCheckAdobeAlive(id, string(authBytes))
+	p.selfCheckAdobeAlive(proxyCtx, id, string(authBytes), lease.Proxy)
 }
 
 // cookiesFromAuthData 从存库的 auth_data JSON 解析出 cookie 列表（供 cookie 注入用）。
@@ -620,14 +637,14 @@ func cookiesFromAuthData(authData string) []map[string]any {
 
 // selfCheckAdobeAlive 用注册产出的 Cookie 做一次 cookie→token 交换，把结果写入
 // alive 字段：alive=下游可用、dead=被拒（如 ride 身份核验）、unknown=网络/限流不判死。
-func (p *Producer) selfCheckAdobeAlive(id uint, authData string) {
+func (p *Producer) selfCheckAdobeAlive(ctx context.Context, id uint, authData, proxy string) {
 	cookies := livecheck.CookiesFromAuthJSON(authData)
 	if len(cookies) == 0 {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
-	result := livecheck.CheckAdobe(ctx, []livecheck.AdobeItem{{ID: id, Cookies: cookies}}, nil)
+	result := livecheck.CheckAdobe(ctx, []livecheck.AdobeItem{{ID: id, Cookies: cookies, Proxy: proxy}}, nil)
 	alive := result[id]
 	if alive == "" {
 		alive = livecheck.StatusUnknown

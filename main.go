@@ -98,6 +98,9 @@ func main() {
 		api.PUT("/settings", h.SettingsSave)
 
 		api.POST("/proxy/test", h.ProxyTest)
+		api.GET("/proxy/channels", h.ProxyChannels)
+		api.PUT("/proxy/channels/:channel", h.ProxyChannelSave)
+		api.POST("/proxy/channels/:channel/test", h.ProxyChannelTest)
 
 		api.GET("/grok/registrations", h.GrokList)
 		api.DELETE("/grok/registrations", h.GrokDeleteAll)
@@ -152,18 +155,6 @@ func main() {
 		api.GET("/leonardo/registrations/livecheck/status", h.LeonardoLiveCheckStatus)
 		api.POST("/leonardo/registrations/:id/livecheck", h.LeonardoLiveCheckOne)
 
-		api.GET("/lumina/registrations", h.LuminaList)
-		api.DELETE("/lumina/registrations", h.LuminaDeleteAll)
-		api.POST("/lumina/registrations", h.LuminaStart)
-		api.POST("/lumina/produce", h.LuminaProduce)
-		api.GET("/lumina/produce/status", h.LuminaProduceStatus)
-		api.POST("/lumina/produce/stop", h.LuminaProduceStop)
-		api.POST("/lumina/registrations/:id/code", h.LuminaSubmitCode)
-		api.POST("/lumina/registrations/:id/stop", h.LuminaStop)
-		api.DELETE("/lumina/registrations/:id", h.LuminaDelete)
-		api.GET("/lumina/registrations/:id/logs", h.LuminaLog)
-		api.GET("/lumina/registrations/:id/shot", h.LuminaShot)
-		api.POST("/lumina/download", h.LuminaDownload)
 	}
 
 	sub, err := fs.Sub(staticFS, "static")
@@ -172,7 +163,7 @@ func main() {
 	}
 	httpFS := http.FS(sub)
 	r.StaticFS("/static", httpFS)
-	for _, p := range []string{"login", "dashboard", "mailboxes", "accounts", "grok", "adobe", "leonardo", "lumina", "settings"} {
+	for _, p := range []string{"login", "dashboard", "mailboxes", "accounts", "grok", "adobe", "leonardo", "settings"} {
 		p := p
 		r.GET("/"+p, func(c *gin.Context) { c.FileFromFS(p+".html", httpFS) })
 	}

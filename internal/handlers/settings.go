@@ -4,6 +4,7 @@ import (
 	"net/http"
 
 	"chatgpt-register/internal/models"
+	"chatgpt-register/internal/proxypool"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm/clause"
@@ -23,7 +24,7 @@ func (h *Handler) SettingsGet(c *gin.Context) {
 	}
 	out := map[string]string{}
 	for _, s := range items {
-		if reservedSettingKeys[s.Key] {
+		if reservedSettingKeys[s.Key] || proxypool.IsSettingKey(s.Key) {
 			continue
 		}
 		out[s.Key] = s.Value
@@ -36,6 +37,12 @@ func (h *Handler) SettingsSave(c *gin.Context) {
 	if err := c.ShouldBindJSON(&in); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
+	}
+	for key := range in {
+		if proxypool.IsSettingKey(key) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "请通过各渠道的代理配置保存开关和提取 API"})
+			return
+		}
 	}
 	for k, v := range in {
 		if reservedSettingKeys[k] {

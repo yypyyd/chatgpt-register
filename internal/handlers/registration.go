@@ -10,11 +10,11 @@ import (
 	"chatgpt-register/internal/chatgptauth"
 	"chatgpt-register/internal/grokproducer"
 	"chatgpt-register/internal/leonardoproducer"
-	"chatgpt-register/internal/luminaproducer"
 	"chatgpt-register/internal/mailfetch"
 	"chatgpt-register/internal/mailverify"
 	"chatgpt-register/internal/models"
 	"chatgpt-register/internal/producer"
+	"chatgpt-register/internal/proxypool"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -28,12 +28,11 @@ type Handler struct {
 	GrokProducer     *grokproducer.Producer
 	AdobeProducer    *adobeproducer.Producer
 	LeonardoProducer *leonardoproducer.Producer
-	// LuminaProducer 用浏览器注册 BytePlus Lumina（ai.byteplus.com/lumina）。
-	LuminaProducer  *luminaproducer.Producer
-	Browser         *browserboot.Manager
-	MailboxVerifier *mailverify.Service
-	GPTCredentials  *chatgptauth.Service
-	// Live 保存各平台的批量测活进度（仅内存），键：chatgpt / grok / adobe / leonardo。
+	Browser          *browserboot.Manager
+	MailboxVerifier  *mailverify.Service
+	GPTCredentials   *chatgptauth.Service
+	Proxies          *proxypool.Manager
+	// Live 保存支持测活的平台的批量检测进度（仅内存）。
 	Live map[string]*liveRunner
 }
 
@@ -43,7 +42,8 @@ func New(db *gorm.DB, authSvc *auth.Service, browser *browserboot.Manager) (*Han
 	if err := verifier.Start(); err != nil {
 		return nil, err
 	}
-	h := &Handler{DB: db, Mail: mail, Auth: authSvc, Producer: producer.New(db, mail), GrokProducer: grokproducer.New(db, mail), AdobeProducer: adobeproducer.New(db, mail), LeonardoProducer: leonardoproducer.New(db, mail), LuminaProducer: luminaproducer.New(db, mail), Browser: browser, MailboxVerifier: verifier, Live: newLiveRunners(), GPTCredentials: chatgptauth.New(db)}
+	proxies := proxypool.New(db)
+	h := &Handler{DB: db, Mail: mail, Auth: authSvc, Producer: producer.New(db, mail, proxies), GrokProducer: grokproducer.New(db, mail, proxies), AdobeProducer: adobeproducer.New(db, mail, proxies), LeonardoProducer: leonardoproducer.New(db, mail, proxies), Browser: browser, MailboxVerifier: verifier, Live: newLiveRunners(), GPTCredentials: chatgptauth.New(db), Proxies: proxies}
 	h.startGPTCredentialMigration()
 	return h, nil
 }

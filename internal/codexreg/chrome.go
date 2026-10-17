@@ -5,7 +5,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
 )
 
 const (
@@ -138,11 +137,4 @@ func cookieNamed(cookies []WebCookie, name string) string {
 		}
 	}
 	return ""
-}
-
-func pauseHuman(minMs, extraMs int) {
-	if extraMs < 0 {
-		extraMs = 0
-	}
-	time.Sleep(time.Duration(minMs+ri(extraMs+1)) * time.Millisecond)
 }

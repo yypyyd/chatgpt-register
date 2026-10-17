@@ -37,12 +37,13 @@ func TestIsForgedSentinelToken(t *testing.T) {
 
 func TestSentinelFlowForURL(t *testing.T) {
 	cases := map[string]string{
-		"https://auth.openai.com/api/accounts/create_account":     "oauth_create_account",
-		"https://auth.openai.com/api/accounts/email-otp/validate": "email_otp_validate",
-		"https://auth.openai.com/api/accounts/authorize/continue": "authorize_continue",
-		"https://auth.openai.com/api/accounts/password/verify":    "password_verify",
-		"https://auth.openai.com/api/accounts/email-otp/resend":   "",
-		"https://chatgpt.com/api/auth/session":                    "",
+		"https://auth.openai.com/api/accounts/create_account":        "oauth_create_account",
+		"https://auth.openai.com/api/accounts/email-otp/validate":    "email_otp_validate",
+		"https://auth.openai.com/api/accounts/passwordless/send-otp": "authorize_continue",
+		"https://auth.openai.com/api/accounts/authorize/continue":    "authorize_continue",
+		"https://auth.openai.com/api/accounts/password/verify":       "password_verify",
+		"https://auth.openai.com/api/accounts/email-otp/resend":      "",
+		"https://chatgpt.com/api/auth/session":                       "",
 	}
 	for u, want := range cases {
 		if got := sentinelFlowForURL(u); got != want {

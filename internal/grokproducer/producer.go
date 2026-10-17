@@ -15,6 +15,7 @@ import (
 	"chatgpt-register/internal/mailfetch"
 	"chatgpt-register/internal/models"
 	"chatgpt-register/internal/prodcore"
+	"chatgpt-register/internal/proxypool"
 
 	"gorm.io/gorm"
 )
@@ -55,9 +56,9 @@ type Producer struct {
 	runTracked  []uint // 本次生产建过的任务 id
 }
 
-func New(db *gorm.DB, mail *mailfetch.Client) *Producer {
+func New(db *gorm.DB, mail *mailfetch.Client, managers ...*proxypool.Manager) *Producer {
 	return &Producer{
-		Core:    prodcore.New(db),
+		Core:    prodcore.New(db, "grok", managers...),
 		db:      db,
 		mail:    mail,
 		waiters: map[uint]chan string{},
@@ -498,13 +499,16 @@ func (p *Producer) run(id uint) {
 	defer p.ReleaseSlot()
 
 	p.appendLog(id, "开始 Grok 邮箱注册")
+	lease, proxyErr := p.AcquireProxy(ctx)
+	proxyCtx, cancelProxy := lease.Context(ctx)
+	defer cancelProxy()
 	// since 在获得槽位后再取，避免排队期间旧验证码被误读。
 	since := time.Now().Add(-30 * time.Second)
 
 	in := grokreg.Input{
 		Email:               reg.Email,
 		Password:            reg.Password,
-		Proxy:               p.NextProxy(),
+		Proxy:               lease.Proxy,
 		CaptchaKey:          grokCaptchaKey(p),
 		Impersonate:         p.Setting("grok_impersonate"),
 		ImpersonateFallback: p.Setting("grok_impersonate_fallback"),
@@ -522,7 +526,11 @@ func (p *Producer) run(id uint) {
 		},
 	}
 
-	res, err := grokreg.Register(ctx, in)
+	var res *grokreg.Result
+	err := proxyErr
+	if err == nil {
+		res, err = grokreg.Register(proxyCtx, in)
+	}
 	if err != nil {
 		p.appendLog(id, "注册失败: "+err.Error())
 		status := "register_failed"
@@ -537,7 +545,8 @@ func (p *Producer) run(id uint) {
 		return
 	}
 
-	p.mintOAuth(ctx, id, in.Proxy, reg.Email, res.AuthJSON)
+	p.mintOAuth(proxyCtx, id, in.Proxy, reg.Email, res.AuthJSON)
+	res.AuthJSON["proxy"] = lease.Proxy
 
 	authBytes, _ := json.MarshalIndent(res.AuthJSON, "", "  ")
 	p.appendLog(id, "Grok 注册成功")

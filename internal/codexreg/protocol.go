@@ -24,7 +24,7 @@ import (
 //	chatgpt.com/auth/login (拿 CF/NextAuth Cookie)
 //	→ GET  /api/auth/csrf
 //	→ POST /api/auth/signin/openai?login_hint=<email>  → {url: auth.openai.com/api/accounts/authorize?...}
-//	→ GET  authorize  → 302 /email-verification（服务端已按 login_hint 发验证码）
+//	→ GET  authorize  → 302 /email-verification（页面到达不代表邮件已发送）
 //	→ POST auth.openai.com/api/accounts/email-otp/validate {code}
 //	    → 新号: continue_url=/about-you → POST /api/accounts/create_account {name,birthdate}
 //	    → 老号: continue_url=chatgpt.com/api/auth/callback/openai?code=...
@@ -63,6 +63,10 @@ type protocolClient struct {
 	authPageURL  string
 	authHTML     []byte
 	pageLoadedAt time.Time
+	// initialEmailSessionCache mirrors the auth page's client-auth-session
+	// cache. The verification loader reads it twice around Sentinel minting;
+	// it does not force a second network dump when the checksum is unchanged.
+	initialEmailSessionCache *initialEmailSession
 
 	navID string
 
@@ -278,6 +282,8 @@ func sentinelFlowForURL(u string) string {
 		return "oauth_create_account"
 	case strings.Contains(u, "/api/accounts/email-otp/validate"):
 		return "email_otp_validate"
+	case strings.Contains(u, "/api/accounts/passwordless/send-otp"):
+		return "authorize_continue"
 	case strings.Contains(u, "/api/accounts/authorize/continue"):
 		return "authorize_continue"
 	case strings.Contains(u, "/api/accounts/password/verify"):
@@ -464,7 +470,7 @@ func registerProtocol(ctx context.Context, in Input) (res *protoResult, err erro
 	}
 	in.logf("🔗 authorize login_hint=%s did=%s", extractLoginHint(signin.URL), deviceID)
 
-	// 4. authorize 全程走同一条 TLS 客户端。落地 /email-verification 表示验证码已发出。
+	// 4. authorize 全程走同一条 TLS 客户端。验证码页只表示进入验证步骤，不能据此确认发信。
 	otpSentAt := time.Now().Add(-5 * time.Second)
 	landing, lr, err := c.followRedirects(ctx, signin.URL, "https://chatgpt.com/")
 	if err != nil && isTransientNetErr(err) {
@@ -482,7 +488,7 @@ func registerProtocol(ctx context.Context, in Input) (res *protoResult, err erro
 	}
 	switch {
 	case strings.Contains(landing, "/email-verification"):
-		in.logf("📧 已提交邮箱，验证码已发出")
+		in.logf("📧 已进入邮箱验证页，等待收件确认（尚未确认发信成功）")
 	case strings.Contains(landing, "/create-account/password"):
 		in.logf("🔒 创建密码页已出现，自动设置密码")
 		next, err := c.submitCreatePassword(ctx, landing, in.Password)
@@ -495,12 +501,18 @@ func registerProtocol(ctx context.Context, in Input) (res *protoResult, err erro
 				return nil, fmt.Errorf("提交密码后跳转失败: %w", ferr)
 			}
 			landing, lr = landing2, lr2
+			if lr2 != nil {
+				c.rememberAuthPage(landing2, lr2.Body)
+			} else {
+				c.authPageURL = landing2
+				c.pageLoadedAt = time.Now()
+			}
 		}
 		if !strings.Contains(landing, "/email-verification") && !strings.Contains(landing, "/about-you") {
 			return nil, fmt.Errorf("提交密码后未进入验证码页: %s", truncateForLog(landing, 200))
 		}
 		if strings.Contains(landing, "/email-verification") {
-			in.logf("📧 已提交邮箱，验证码已发出")
+			in.logf("📧 已进入邮箱验证页，等待收件确认（尚未确认发信成功）")
 		}
 	case strings.Contains(landing, "/log-in/password"):
 		in.logf("🔒 该邮箱已有账号（密码登录页）")
@@ -526,22 +538,32 @@ func registerProtocol(ctx context.Context, in Input) (res *protoResult, err erro
 	// 验证码页已加载：此刻起官方 SDK 的 Session Observer 开始观察这个“会话”，
 	// 等码期间由 Node 侧做真人式的鼠标漂移。
 	if strings.Contains(landing, "/email-verification") {
+		// 当前 passwordless 流程把首次发码放在验证码页 clientLoader 中：页面 HTML
+		// 加载完成不等于邮件已经发送。严格按官网顺序读取并复核 auth session，
+		// 再用 authorize_continue Sentinel token 调专用首次发码接口。
+		firstSentAt, sent, sendErr := c.sendInitialEmailCodeIfPending(ctx, landing)
+		if sendErr != nil {
+			return nil, fmt.Errorf("首次发送邮箱验证码失败: %w", sendErr)
+		}
+		if sent {
+			otpSentAt = firstSentAt
+		}
 		c.startSentinelPage(ctx, "email_otp_validate", landing)
 	}
 
-	// 5. 收码 + 校验（验证码错误则重发一次）
-	code, err := in.FetchCode(ctx, otpSentAt)
+	// 5. 收码 + 校验。没有新邮件或验证码错误时最多重发一次。
+	code, resent, err := c.fetchEmailCode(ctx, landing, otpSentAt)
 	if err != nil {
 		return nil, fmt.Errorf("获取邮箱验证码失败: %w", err)
 	}
 	// 真人看完邮件、复制验证码再回来，至少要十几秒。
 	c.dwellOnPage(ctx, "email_otp_validate", 14, 32)
 	continueURL, err := c.validateOTP(ctx, landing, strings.TrimSpace(code))
-	if err != nil && strings.Contains(err.Error(), "wrong_email_otp_code") {
+	if err != nil && !resent && strings.Contains(err.Error(), "wrong_email_otp_code") {
 		in.logf("📨 验证码被拒，重发后再试一次")
-		resentAt := time.Now()
-		if _, rerr := c.postJSON(ctx, "https://auth.openai.com/api/accounts/email-otp/resend", landing, map[string]any{}); rerr != nil {
-			return nil, fmt.Errorf("重发验证码失败: %w", rerr)
+		resentAt, rerr := c.resendEmailCode(ctx, landing)
+		if rerr != nil {
+			return nil, rerr
 		}
 		code, err = in.FetchCode(ctx, resentAt)
 		if err != nil {
@@ -712,31 +734,6 @@ func extractLoginHint(raw string) string {
 		return ""
 	}
 	return u.Query().Get("login_hint")
-}
-
-func preserveLoginHintPlus(raw, email string) string {
-	if !strings.Contains(email, "+") {
-		return raw
-	}
-	u, err := url.Parse(raw)
-	if err != nil {
-		return raw
-	}
-	q := u.Query()
-	hint := q.Get("login_hint")
-	if hint == email {
-		return raw
-	}
-	// url.Parse Query() 会把 %2B 解成 '+'；若服务端回的是空格替换后的母号，强制写回原邮箱。
-	q.Set("login_hint", email)
-	// Query().Encode() 会把 space 编成 '+'，必须手动拼 login_hint。
-	q.Del("login_hint")
-	enc := q.Encode()
-	if enc != "" {
-		enc += "&"
-	}
-	u.RawQuery = enc + "login_hint=" + url.QueryEscape(email)
-	return u.String()
 }
 
 // protocolBirthdate 与官方资料页的行为一致：页面只让用户填“年龄”，隐藏字段 birthday 由

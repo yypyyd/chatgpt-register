@@ -119,3 +119,26 @@ func firstNonEmpty(vals ...string) string {
 	}
 	return ""
 }
+
+// readTurnstileToken 读出已签发的 token。
+func readTurnstileToken(page *rod.Page) string {
+	v, err := page.Eval(`() => {
+		let token = String(window.__mintedTurnstileToken || '').trim();
+		if (token.length < 20) {
+			const input = document.querySelector('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]');
+			token = String((input && input.value) || '').trim();
+		}
+		if (token.length < 20) {
+			try {
+				if (window.turnstile && typeof window.turnstile.getResponse === 'function') {
+					token = String(window.turnstile.getResponse() || '').trim();
+				}
+			} catch (e) {}
+		}
+		return token;
+	}`)
+	if err != nil {
+		return ""
+	}
+	return v.Value.Str()
+}

@@ -14,7 +14,6 @@ import (
 
 	"chatgpt-register/internal/grokoauth"
 	"chatgpt-register/internal/models"
-	"chatgpt-register/internal/proxyutil"
 
 	"github.com/gin-gonic/gin"
 )
@@ -32,12 +31,6 @@ type grokProduceInput struct {
 
 type grokCodeInput struct {
 	Code string `json:"code" binding:"required"`
-}
-
-func validGrokStatus(s string) bool {
-	return s == "" || s == "pending" || s == "registering" ||
-		s == "waiting_code" || s == "registered" || s == "register_failed" ||
-		s == "already_registered"
 }
 
 func (h *Handler) GrokList(c *gin.Context) {
@@ -338,7 +331,6 @@ const grokOAuthWorkers = 3
 // format=sub2api 出 Sub2API 账号备份 JSON，format=cpa 出 CLIProxyAPI 的 xAI 凭证。
 // 优先用注册时存库的令牌；旧账号没有就现场拿 sso 补换一次。
 func (h *Handler) downloadGrokOAuth(c *gin.Context, regs []models.GrokRegistration, format string) {
-	proxyRaw := h.exportProxy()
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Minute)
 	defer cancel()
 
@@ -364,9 +356,21 @@ func (h *Handler) downloadGrokOAuth(c *gin.Context, regs []models.GrokRegistrati
 		wg.Add(1)
 		go func(i int, reg models.GrokRegistration, sso string) {
 			defer wg.Done()
-			sem <- struct{}{}
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				results[i] = result{email: reg.Email, err: ctx.Err()}
+				return
+			}
 			defer func() { <-sem }()
-			info, cerr := grokoauth.ConvertSSO(ctx, proxyRaw, sso)
+			lease, err := h.proxyManager().Acquire(ctx, "grok", 2*time.Minute)
+			if err != nil {
+				results[i] = result{email: reg.Email, err: err}
+				return
+			}
+			proxyCtx, cancelProxy := lease.Context(ctx)
+			defer cancelProxy()
+			info, cerr := grokoauth.ConvertSSO(proxyCtx, lease.Proxy, sso)
 			if cerr != nil {
 				results[i] = result{email: reg.Email, err: cerr}
 				return
@@ -474,26 +478,6 @@ func (h *Handler) saveGrokOAuth(reg models.GrokRegistration, info *grokoauth.Tok
 		return
 	}
 	h.DB.Model(&models.GrokRegistration{}).Where("id = ?", reg.ID).Update("auth_data", string(out))
-}
-
-// exportProxy 取设置页代理列表里的第一个代理；未开代理则直连。
-// 与注册一致地为 BestGo 动态住宅代理挂任务级 session，避免一次换取里出口 IP 乱跳。
-func (h *Handler) exportProxy() string {
-	var enabled models.Setting
-	if err := h.DB.Where("key = ?", "proxy_enabled").First(&enabled).Error; err != nil ||
-		strings.TrimSpace(enabled.Value) != "1" {
-		return ""
-	}
-	var list models.Setting
-	if err := h.DB.Where("key = ?", "proxy_list").First(&list).Error; err != nil {
-		return ""
-	}
-	for _, line := range strings.Split(strings.ReplaceAll(list.Value, ",", "\n"), "\n") {
-		if s := strings.TrimSpace(line); s != "" {
-			return proxyutil.WithBestGoTaskSession(proxyutil.Normalize(s))
-		}
-	}
-	return ""
 }
 
 func safeFileName(s string) string {

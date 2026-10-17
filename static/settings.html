@@ -78,27 +78,48 @@
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="20" height="10" rx="2"/><path d="M6 12h.01M10 12h.01M14 12h4"/></svg>
           </span>
           <div>
-            <h2>代理配置</h2>
-            <p>注册时通过代理访问，降低风控</p>
+            <h2>渠道代理</h2>
+            <p>各渠道独立开关、提取 API 和代理会话</p>
           </div>
         </div>
+        <div id="proxy-channels" class="proxy-channels" role="tablist" aria-label="代理渠道"></div>
+        <div id="proxy-editor" style="display:none">
         <label class="switch-row">
           <input id="set-proxy-enabled" type="checkbox">
           <span class="switch-ui"></span>
-          <span class="switch-label">启用代理</span>
+          <span id="proxy-switch-label" class="switch-label">启用此渠道代理</span>
         </label>
+        <p id="proxy-mode-summary" class="field-hint" aria-live="polite"></p>
+        <div class="field">
+          <label for="set-proxy-source">代理来源</label>
+          <select id="set-proxy-source" class="px-input" onchange="proxySourceChanged()">
+            <option value="api">API 提取</option>
+            <option value="list">独立列表（兼容旧配置）</option>
+          </select>
+        </div>
+        <div id="proxy-api-fields" class="field">
+          <label for="set-proxy-api">提取 API 地址</label>
+          <textarea id="set-proxy-api" class="px-input proxy-textarea" rows="3" spellcheck="false" autocomplete="off" placeholder="粘贴完整的代理提取 API 地址" oninput="proxyDraftChanged()"></textarea>
+          <span class="field-hint">支持每行一条的文本结果。地区、数量和轮换时间通过 API 参数配置；sessTime 的单位是分钟。</span>
+          <button type="button" class="px-btn ghost proxy-example" onclick="useProxyExample()">填入 BestGo 示例</button>
+          <span id="proxy-window-hint" class="field-hint" aria-live="polite"></span>
+        </div>
+        <div id="proxy-list-fields" style="display:none">
         <div class="field">
           <div class="field-label-row">
             <label>代理列表</label>
             <span id="proxy-count" class="count-badge">识别到 0 个代理</span>
           </div>
           <span class="field-hint">每行一个，支持 http(s)://user:pass@host:port、socks5://host:port、host:port:user:pass</span>
-          <textarea id="set-proxy-list" class="px-input proxy-textarea" rows="5" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off" oninput="updateProxyCount()" placeholder="http://user:pass@1.2.3.4:8080&#10;socks5://1.2.3.4:1080&#10;1.2.3.4:8080:user:pass"></textarea>
+          <textarea id="set-proxy-list" class="px-input proxy-textarea" rows="5" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off" oninput="proxyDraftChanged()" placeholder="http://user:pass@1.2.3.4:8080&#10;socks5://1.2.3.4:1080&#10;1.2.3.4:8080:user:pass"></textarea>
         </div>
+        </div>
+        <p id="proxy-pool-status" class="field-hint" aria-live="polite"></p>
         <div id="proxy-test-result" class="proxy-result" style="display:none"></div>
         <div class="settings-foot">
-          <button id="proxy-test-btn" class="px-btn ghost" onclick="testProxy()">测试代理</button>
-          <button class="px-btn primary" onclick="saveProxy()">保存代理</button>
+          <button id="proxy-test-btn" class="px-btn ghost" onclick="testProxy()">提取并测试</button>
+          <button id="proxy-save-btn" class="px-btn primary" onclick="saveProxy()">保存此渠道</button>
+        </div>
         </div>
       </div>
 
@@ -159,7 +180,8 @@
 </div>
 
 <div id="toast" class="toast" style="display:none"></div>
-<script src="/static/layout.js"></script>
+<script src="/static/layout.js?v=8"></script>
+<script src="/static/proxy-settings.js?v=2"></script>
 <script>
 async function loadSettings() {
   const r = await api('/api/settings');
@@ -169,72 +191,8 @@ async function loadSettings() {
   document.getElementById('set-retry-cooldown').value = d.retry_cooldown_min || '30';
   document.getElementById('set-mailbox-interval').value = d.mailbox_interval_min || '5';
   document.getElementById('set-launch-stagger').value = d.launch_stagger_sec === undefined ? '45' : d.launch_stagger_sec;
-  document.getElementById('set-proxy-enabled').checked = d.proxy_enabled === '1';
-  document.getElementById('set-proxy-list').value = d.proxy_list || '';
   document.getElementById('set-captcha-enabled').checked = d.captcha_enabled === '1';
   document.getElementById('set-captcha-key').value = d.captcha_2captcha_key || '';
-  updateProxyCount();
-}
-
-function proxyLines() {
-  return document.getElementById('set-proxy-list').value
-    .split('\n').map(s => s.trim()).filter(Boolean);
-}
-
-function firstProxy() {
-  return proxyLines()[0] || '';
-}
-
-function updateProxyCount() {
-  document.getElementById('proxy-count').textContent = '识别到 ' + proxyLines().length + ' 个代理';
-}
-
-async function testProxy() {
-  const proxy = firstProxy();
-  const box = document.getElementById('proxy-test-result');
-  const btn = document.getElementById('proxy-test-btn');
-  if (!proxy) { box.style.display = 'none'; return toast('请先填写代理', true); }
-  btn.disabled = true;
-  const old = btn.textContent;
-  btn.textContent = '测试中…';
-  box.style.display = 'flex';
-  box.className = 'proxy-result testing';
-  box.innerHTML = '<span class="spinner"></span> 正在测试第一个代理…';
-  try {
-    const r = await api('/api/proxy/test', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ proxy }),
-    });
-    const d = await r.json().catch(() => ({}));
-    if (r.ok && d.ok) {
-      box.className = 'proxy-result ok';
-      box.innerHTML = '✓ 代理可用 · 出口 IP <b>' + (d.ip || '未知') + '</b> · ' + (d.ms || 0) + ' ms';
-    } else {
-      box.className = 'proxy-result fail';
-      box.textContent = '✗ 代理不可用：' + (d.error || '连接失败');
-    }
-  } catch (e) {
-    box.className = 'proxy-result fail';
-    box.textContent = '✗ 测试失败：' + e;
-  } finally {
-    btn.disabled = false;
-    btn.textContent = old;
-  }
-}
-
-async function saveProxy() {
-  const body = {
-    proxy_enabled: document.getElementById('set-proxy-enabled').checked ? '1' : '0',
-    proxy_list: document.getElementById('set-proxy-list').value.trim(),
-  };
-  const r = await api('/api/settings', {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  if (!r.ok) return toast('保存失败', true);
-  toast('代理配置已保存');
 }
 
 async function saveCaptcha() {
@@ -290,6 +248,7 @@ async function changePassword() {
 }
 
 loadSettings();
+loadProxySettings();
 </script>
 </body>
 </html>

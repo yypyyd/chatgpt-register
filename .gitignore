@@ -3,3 +3,4 @@ adskull-register
 adskull-register.exe
 backups/
 .ace-tool/
+/build/

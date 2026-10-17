@@ -26,7 +26,7 @@ import (
 	"chatgpt-register/internal/mailfetch"
 	"chatgpt-register/internal/models"
 	"chatgpt-register/internal/prodcore"
-	"chatgpt-register/internal/proxyutil"
+	"chatgpt-register/internal/proxypool"
 
 	"gorm.io/gorm"
 )
@@ -43,9 +43,9 @@ const (
 	defaultMailboxIntervalMin = 5
 	defaultLaunchStaggerSec   = 45
 	// registerAttemptTimeout 单次协议注册的墙钟上限。
-	// 需覆盖：Node 伪浏览器执行官方 Sentinel SDK + 页面停留/真人交互合成 + 收码 3 分钟 + 建号探针。
+	// 需覆盖：Node 伪浏览器执行官方 Sentinel SDK + 页面停留/真人交互合成 + 每轮收码 1 分钟（最多重发一次）+ 建号探针。
 	registerAttemptTimeout = 8 * time.Minute
-	codePollTimeout        = 3 * time.Minute
+	codePollTimeout        = time.Minute
 	codePollInterval       = 5 * time.Second
 	// 邮箱服务（Graph）连续 503 等临时错误达到该时长即放弃并自动停用该邮箱。
 	mailTempErrGiveUp = 30 * time.Second
@@ -59,7 +59,6 @@ var codeRe = regexp.MustCompile(`\b(\d{6})\b`)
 type Config struct {
 	MaxConcurrency int
 	FissionCount   int
-	Proxies        []string      // 代理池，按账户轮转；空=直连
 	RetryCooldown  time.Duration // 失败地址的重试冷却时间
 	// MailboxInterval 同一邮箱两次注册之间的最小间隔，避免验证码邮件互相干扰
 	MailboxInterval time.Duration
@@ -81,10 +80,15 @@ type Progress struct {
 	UpdatedAt  time.Time `json:"updated_at"`
 }
 
+type verificationMailbox interface {
+	ListMessages(context.Context, mailfetch.Account, int) ([]mailfetch.Message, error)
+	GetMessage(context.Context, mailfetch.Account, string) (mailfetch.Message, error)
+}
+
 // Producer 单例，管理一次生产任务的生命周期与进度。
 type Producer struct {
 	db   *gorm.DB
-	mail *mailfetch.Client
+	mail verificationMailbox
 
 	mu     sync.Mutex
 	prog   Progress
@@ -95,14 +99,13 @@ type Producer struct {
 	// failed 记录当前仍处于失败态的邮箱（重试成功后会移除）。
 	// 只有最终没能注册成功的邮箱才计入失败数——中途重试失败不算。
 	failed     map[string]struct{}
-	pxMu       sync.Mutex
-	pxIdx      int
+	proxies    *proxypool.Manager
 	launchMu   sync.Mutex
 	lastLaunch time.Time
 }
 
-func New(db *gorm.DB, mail *mailfetch.Client) *Producer {
-	return &Producer{db: db, mail: mail, inflight: map[string]uint{}, failed: map[string]struct{}{}}
+func New(db *gorm.DB, mail *mailfetch.Client, managers ...*proxypool.Manager) *Producer {
+	return &Producer{db: db, mail: mail, proxies: proxypool.Select(db, managers...), inflight: map[string]uint{}, failed: map[string]struct{}{}}
 }
 
 // Start 启动一次生产（异步）。已在运行则返回错误。
@@ -158,6 +161,7 @@ func (p *Producer) run(ctx context.Context, target int) {
 	sem := make(chan struct{}, cfg.MaxConcurrency)
 	var wg sync.WaitGroup
 
+productionLoop:
 	for {
 		if ctx.Err() != nil {
 			p.logf("已手动停止")
@@ -195,11 +199,17 @@ func (p *Producer) run(ctx context.Context, target int) {
 			continue
 		}
 
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			p.releaseInflight(email)
+			break productionLoop
+		}
 		if !p.waitLaunchSlot(ctx, cfg.LaunchStagger) {
+			<-sem
 			p.releaseInflight(email)
 			break
 		}
-		sem <- struct{}{}
 		wg.Add(1)
 		go func(mb models.Mailbox, email string, isMother bool) {
 			defer wg.Done()
@@ -342,12 +352,16 @@ func (p *Producer) produceOne(ctx context.Context, cfg Config, mb models.Mailbox
 		p.db.Model(&models.Registration{}).Where("email = ?", email).Update("log", snapshot)
 	}
 
-	// 出口 IP：轮转代理池取一个基础代理。若为 bestgo 住宅代理（可换 IP），
-	// Terms of Use 拒绝 / Cloudflare 拦截时换新住宅 session(=新 IP) 重试，最多 maxIPAttempts 次；
-	// 直连/固定出口无法换 IP，Terms 拒绝直接标记 rejected，不空转重试。
+	// Allocate after the worker has a concurrency/launch slot. Preserve the
+	// API's session parameters for the complete registration attempt.
 	const maxIPAttempts = 3
-	baseProxy := p.nextProxy(cfg)
-	canRotate := isRotatable(baseProxy)
+	lease, proxyErr := p.proxies.Acquire(ctx, "chatgpt", registerAttemptTimeout)
+	if proxyErr != nil {
+		appendLog("代理分配失败：" + proxyErr.Error())
+		p.setRegistrationFailed(email, proxyErr.Error(), logBuf.String())
+		return proxyErr
+	}
+	canRotate := lease.Proxy != ""
 	attempts := 1
 	if canRotate {
 		attempts = maxIPAttempts
@@ -359,19 +373,23 @@ func (p *Producer) produceOne(ctx context.Context, cfg Config, mb models.Mailbox
 	netRetry := 0
 	var res *codexreg.Result
 	var err error
+	firstAttempt := true
 	for attempt := 1; attempt <= attempts; attempt++ {
-		proxy := baseProxy
-		if canRotate {
-			proxy = rotateBestgoSession(baseProxy) // 每次尝试换新住宅 session = 新出口 IP
-			if attempt > 1 {
-				appendLog(fmt.Sprintf("♻ 更换住宅 IP 后第 %d/%d 次重试（上次：%v）", attempt, attempts, err))
+		if !firstAttempt {
+			lease, err = p.proxies.Acquire(ctx, "chatgpt", registerAttemptTimeout)
+			if err != nil {
+				break
 			}
+		}
+		firstAttempt = false
+		if attempt > 1 {
+			appendLog(fmt.Sprintf("♻ 分配新代理会话后第 %d/%d 次重试", attempt, attempts))
 		}
 		since := time.Now().Add(-30 * time.Second)
 		in := codexreg.Input{
 			Email:    email,
 			Password: password,
-			Proxy:    proxy,
+			Proxy:    lease.Proxy,
 			Log: func(f string, a ...any) {
 				msg := fmt.Sprintf(f, a...)
 				appendLog(msg)
@@ -384,9 +402,11 @@ func (p *Producer) produceOne(ctx context.Context, cfg Config, mb models.Mailbox
 				return p.fetchCode(ctx, mb, since)
 			},
 		}
-		attemptCtx, cancelAttempt := context.WithTimeout(ctx, registerAttemptTimeout)
+		proxyCtx, cancelProxy := lease.Context(ctx)
+		attemptCtx, cancelAttempt := context.WithTimeout(proxyCtx, registerAttemptTimeout)
 		res, err = codexreg.Register(attemptCtx, in)
 		cancelAttempt()
+		cancelProxy()
 		if err == nil {
 			break
 		}
@@ -480,17 +500,28 @@ func isTransientNetErr(err error) bool {
 
 // fetchCode 轮询邮箱，从 OpenAI/ChatGPT 验证邮件里提取 6 位验证码。
 func (p *Producer) fetchCode(ctx context.Context, mb models.Mailbox, since time.Time) (string, error) {
+	return p.pollCode(ctx, mb, since, codePollTimeout, codePollInterval)
+}
+
+func (p *Producer) pollCode(ctx context.Context, mb models.Mailbox, since time.Time, timeout, interval time.Duration) (string, error) {
 	acc := mailfetch.Account{Email: mb.Email, ClientID: mb.ClientID, RefreshToken: mb.RefreshToken}
-	deadline := time.Now().Add(codePollTimeout)
-	var lastErr error
+	pollCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	var listErr, bodyErr error
+	matchedMail := false
+	polls := 0
 	var tempErrSince time.Time // 邮箱服务连续 503/不可用的起始时间
-	for time.Now().Before(deadline) {
-		if ctx.Err() != nil {
-			return "", ctx.Err()
-		}
-		msgs, err := p.mail.ListMessages(ctx, acc, 15)
+	for pollCtx.Err() == nil {
+		polls++
+		msgs, err := p.mail.ListMessages(pollCtx, acc, 15)
 		if err != nil {
-			lastErr = err
+			listErr = err
+			if pollCtx.Err() != nil {
+				break
+			}
+			if errors.Is(err, mailfetch.ErrAuthFailed) || errors.Is(err, mailfetch.ErrMissingCreds) {
+				return "", fmt.Errorf("无法读取验证码邮箱: %w", err)
+			}
 			if errors.Is(err, mailfetch.ErrAuthTemporary) {
 				if tempErrSince.IsZero() {
 					tempErrSince = time.Now()
@@ -503,6 +534,7 @@ func (p *Producer) fetchCode(ctx context.Context, mb models.Mailbox, since time.
 				tempErrSince = time.Time{}
 			}
 		} else {
+			listErr, bodyErr = nil, nil
 			tempErrSince = time.Time{}
 			// 取"最新"一封 OpenAI 验证邮件里的码：重发后新码到达时能覆盖旧码，
 			// 避免重发场景下抓回已失效的旧验证码。
@@ -512,10 +544,19 @@ func (p *Producer) fetchCode(ctx context.Context, mb models.Mailbox, since time.
 				if m.ReceivedAt.Before(since) || !looksLikeOpenAI(m) {
 					continue
 				}
+				matchedMail = true
 				code := ""
 				if c := codeRe.FindStringSubmatch(m.Subject); c != nil {
 					code = c[1]
-				} else if full, gerr := p.mail.GetMessage(ctx, acc, m.ID); gerr == nil {
+				} else {
+					full, gerr := p.mail.GetMessage(pollCtx, acc, m.ID)
+					if gerr != nil {
+						if errors.Is(gerr, mailfetch.ErrAuthFailed) || errors.Is(gerr, mailfetch.ErrMissingCreds) {
+							return "", fmt.Errorf("已发现验证邮件，但读取正文失败: %w", gerr)
+						}
+						bodyErr = gerr
+						continue
+					}
 					if c := codeRe.FindStringSubmatch(full.Subject + " " + full.Text); c != nil {
 						code = c[1]
 					}
@@ -529,15 +570,23 @@ func (p *Producer) fetchCode(ctx context.Context, mb models.Mailbox, since time.
 			}
 		}
 		select {
-		case <-ctx.Done():
-			return "", ctx.Err()
-		case <-time.After(codePollInterval):
+		case <-pollCtx.Done():
+		case <-time.After(interval):
 		}
 	}
-	if lastErr != nil {
-		return "", fmt.Errorf("超时未收到验证码邮件（读取邮箱最近一次出错: %v）", lastErr)
+	if ctx.Err() != nil {
+		return "", ctx.Err()
 	}
-	return "", fmt.Errorf("超时未收到验证码邮件")
+	if listErr != nil {
+		return "", fmt.Errorf("等待验证码超时（轮询 %d 次，读取邮件列表失败）: %w", polls, listErr)
+	}
+	if bodyErr != nil {
+		return "", fmt.Errorf("等待验证码超时（已发现匹配邮件，但读取正文失败）: %w", bodyErr)
+	}
+	if matchedMail {
+		return "", fmt.Errorf("等待验证码超时：已发现 OpenAI/ChatGPT 邮件，但未提取到 6 位验证码")
+	}
+	return "", fmt.Errorf("%w（邮箱读取正常，轮询 %d 次；未发现 %s 之后的 OpenAI/ChatGPT 验证邮件，不能据此判定邮箱失效）", codexreg.ErrEmailCodeNotReceived, polls, since.UTC().Format(time.RFC3339))
 }
 
 func looksLikeOpenAI(m mailfetch.Message) bool {
@@ -577,23 +626,11 @@ func (p *Producer) mailboxBusy(mbID uint) bool {
 	return false
 }
 
-// counts 返回(已注册成功数, 在跑数)。
-func (p *Producer) counts() (int, int) {
-	registered := p.registeredCount()
-	return registered, p.inflightCount()
-}
-
 // producedThisRun 返回本次生产任务已成功产出的账号数（不含库里历史已注册）。
 func (p *Producer) producedThisRun() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.prog.Registered
-}
-
-func (p *Producer) registeredCount() int {
-	var n int64
-	p.db.Model(&models.Registration{}).Where("status = ?", "registered").Count(&n)
-	return int(n)
 }
 
 // isRegistered 该地址是否已终结（注册成功 / 已被他人注册 / Terms 拒绝），不再对其发起新注册。
@@ -715,23 +752,7 @@ func (p *Producer) loadConfig() Config {
 		staggerSec = 0
 	}
 	cfg.LaunchStagger = time.Duration(staggerSec) * time.Second
-	// 代理默认开：未设置(空)视为开，仅显式 "0" 才关闭(直连)。可在设置页开关/编辑。
-	if p.getSetting("proxy_enabled") != "0" {
-		cfg.Proxies = proxyutil.List(p.getSetting("proxy_list"))
-	}
 	return cfg
-}
-
-// nextProxy 从代理池按轮转取一个；池为空返回空串（直连）。
-func (p *Producer) nextProxy(cfg Config) string {
-	if len(cfg.Proxies) == 0 {
-		return ""
-	}
-	p.pxMu.Lock()
-	proxy := cfg.Proxies[p.pxIdx%len(cfg.Proxies)]
-	p.pxIdx++
-	p.pxMu.Unlock()
-	return proxy
 }
 
 func (p *Producer) waitLaunchSlot(ctx context.Context, interval time.Duration) bool {

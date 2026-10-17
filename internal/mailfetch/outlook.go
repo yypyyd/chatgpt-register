@@ -7,21 +7,25 @@ import (
 	"errors"
 	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
 
 var (
-	ErrMissingCreds  = errors.New("client_id / refresh_token 必填")
+	ErrMissingCreds  = errors.New("邮箱缺少收信凭据")
 	ErrAuthFailed    = errors.New("邮箱鉴权失败")
 	ErrAuthTemporary = errors.New("邮箱鉴权服务暂时不可用")
 )
 
-// Account contains the OAuth credentials for one mailbox.
+// Account contains the credentials for one mailbox.
+// Outlook 走 ClientID + RefreshToken；谷歌企业邮箱可以只填 Password，走 IMAP。
 type Account struct {
 	Email        string
 	ClientID     string
 	RefreshToken string
+	Password     string
+	Provider     string
 }
 
 // Message is a mailbox message. ListMessages only fills the headers; the body
@@ -104,6 +108,9 @@ func (c *Client) ListMessages(ctx context.Context, acc Account, limit int) ([]Me
 	if limit < 1 {
 		limit = 20
 	}
+	if !hasOAuth(acc) {
+		return c.listPasswordIMAP(ctx, acc, limit)
+	}
 	for attempt := 0; attempt < 2; attempt++ {
 		tok, err := c.accessToken(ctx, acc)
 		if err != nil {
@@ -129,6 +136,9 @@ func (c *Client) GetMessage(ctx context.Context, acc Account, msgID string) (Mes
 	if err := validateAccount(acc); err != nil {
 		return Message{}, err
 	}
+	if !hasOAuth(acc) {
+		return c.getPasswordIMAP(ctx, acc, msgID)
+	}
 	for attempt := 0; attempt < 2; attempt++ {
 		tok, err := c.accessToken(ctx, acc)
 		if err != nil {
@@ -148,11 +158,18 @@ func (c *Client) GetMessage(ctx context.Context, acc Account, msgID string) (Mes
 	return Message{}, ErrAuthFailed
 }
 
+func hasOAuth(acc Account) bool {
+	return strings.TrimSpace(acc.ClientID) != "" && strings.TrimSpace(acc.RefreshToken) != ""
+}
+
 func validateAccount(acc Account) error {
-	if acc.ClientID == "" || acc.RefreshToken == "" {
-		return ErrMissingCreds
+	if hasOAuth(acc) {
+		return nil
 	}
-	return nil
+	if strings.TrimSpace(acc.Email) != "" && strings.TrimSpace(acc.Password) != "" {
+		return nil
+	}
+	return ErrMissingCreds
 }
 
 func sortAndLimit(messages []Message, limit int) []Message {

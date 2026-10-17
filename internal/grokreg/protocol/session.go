@@ -100,12 +100,6 @@ func (s *Session) SetUserAgent(ua string) {
 	s.mu.Unlock()
 }
 
-func (s *Session) UserAgent() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.ua
-}
-
 // SetCookies injects cookies for host.
 func (s *Session) SetCookies(rawURL string, cookies []*http.Cookie) {
 	if s == nil || s.cli == nil {

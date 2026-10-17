@@ -24,7 +24,7 @@ func Normalize(raw string) string {
 	case 2: // host:port
 		return "http://" + parts[0] + ":" + parts[1]
 	case 4: // host:port:user:pass
-		return "http://" + url.QueryEscape(parts[2]) + ":" + url.QueryEscape(parts[3]) + "@" + parts[0] + ":" + parts[1]
+		return (&url.URL{Scheme: "http", Host: parts[0] + ":" + parts[1], User: url.UserPassword(parts[2], parts[3])}).String()
 	default:
 		return "http://" + raw
 	}

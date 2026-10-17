@@ -9,6 +9,7 @@ import (
 	"chatgpt-register/internal/codexreg"
 	"chatgpt-register/internal/emailalias"
 	"chatgpt-register/internal/models"
+	"chatgpt-register/internal/proxypool"
 
 	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
@@ -30,7 +31,10 @@ func Init(path string) (*gorm.DB, error) {
 	sqlDB.SetMaxIdleConns(1)
 	sqlDB.SetConnMaxLifetime(time.Hour)
 	dropUnusedTables(db)
-	if err := db.AutoMigrate(&models.Registration{}, &models.GrokRegistration{}, &models.AdobeRegistration{}, &models.LeonardoRegistration{}, &models.LuminaRegistration{}, &models.Mailbox{}, &models.Setting{}, &models.Admin{}); err != nil {
+	if err := db.AutoMigrate(&models.Registration{}, &models.GrokRegistration{}, &models.AdobeRegistration{}, &models.LeonardoRegistration{}, &models.Mailbox{}, &models.Setting{}, &models.Admin{}); err != nil {
+		return nil, err
+	}
+	if err := proxypool.Migrate(db); err != nil {
 		return nil, err
 	}
 	normalizeLegacyStatuses(db)
@@ -90,7 +94,6 @@ func dropUnusedTables(db *gorm.DB) {
 	for _, name := range []string{
 		"oreate_registrations",
 		"higgsfield_registrations",
-		"dola_registrations",
 		"gmail_producer_locks",
 		"gmail_purchase_intents",
 		"gmail_registrations",
@@ -115,7 +118,6 @@ func reclaimOrphanRegistering(db *gorm.DB) {
 		{&models.GrokRegistration{}, "程序重启中断，可重新注册"},
 		{&models.AdobeRegistration{}, "程序重启中断，可重新注册"},
 		{&models.LeonardoRegistration{}, "程序重启中断，可重新注册"},
-		{&models.LuminaRegistration{}, "程序重启中断，可重新注册"},
 	} {
 		db.Model(m.model).Where("status IN ?", orphanStatuses).
 			Updates(map[string]any{"status": "register_failed", "note": m.note})

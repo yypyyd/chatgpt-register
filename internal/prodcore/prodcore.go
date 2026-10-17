@@ -1,5 +1,5 @@
 // Package prodcore 收拢各平台 producer 共用的那层逻辑：系统设置读取、并发槽位闸门、
-// 代理池轮换、账号日志追加。这些行为与具体平台无关，之前在每个 producer 里各存一份。
+// 渠道代理分配、账号日志追加。这些行为与具体平台无关。
 package prodcore
 
 import (
@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"chatgpt-register/internal/models"
-	"chatgpt-register/internal/proxyutil"
+	"chatgpt-register/internal/proxypool"
 
 	"gorm.io/gorm"
 )
@@ -19,18 +19,19 @@ import (
 // 同时抢 CPU 会互相超时，串行最稳，可用设置页「最大并发数」调大。
 const defaultMaxConcurrency = 1
 
-// Core 由各平台 Producer 嵌入。自带一把锁，只保护并发计数与代理游标，
+// Core 由各平台 Producer 嵌入。自带一把锁，只保护并发计数，
 // 与 Producer 自己的锁互不影响。
 type Core struct {
-	db *gorm.DB
+	db      *gorm.DB
+	channel string
+	proxies *proxypool.Manager
 
 	mu     sync.Mutex
 	active int // 已获得并发槽位、真正在跑的任务数
-	pxIdx  int // 代理池轮转游标
 }
 
-func New(db *gorm.DB) *Core {
-	return &Core{db: db}
+func New(db *gorm.DB, channel string, managers ...*proxypool.Manager) *Core {
+	return &Core{db: db, channel: channel, proxies: proxypool.Select(db, managers...)}
 }
 
 // Setting 读一个系统设置项，未设置返回空串。
@@ -112,21 +113,9 @@ func (c *Core) ReleaseSlot() {
 	c.mu.Unlock()
 }
 
-// NextProxy 跟设置页上的全局代理开关与代理列表，按任务轮换出口；
-// 关闭或代理池为空时返回空串（直连）。
-func (c *Core) NextProxy() string {
-	if !c.SettingOn("proxy_enabled") {
-		return ""
-	}
-	proxies := proxyutil.List(c.Setting("proxy_list"))
-	if len(proxies) == 0 {
-		return ""
-	}
-	c.mu.Lock()
-	proxy := proxies[c.pxIdx%len(proxies)]
-	c.pxIdx++
-	c.mu.Unlock()
-	return proxyutil.WithBestGoTaskSession(proxy)
+// AcquireProxy reads this channel's current settings only after a task can run.
+func (c *Core) AcquireProxy(ctx context.Context) (proxypool.Lease, error) {
+	return c.proxies.Acquire(ctx, c.channel, proxypool.RegistrationBudget(c.channel))
 }
 
 // AppendLogLine 给账号执行日志追加一行（带时间戳），超过 maxBytes 时保留尾部。

@@ -15,6 +15,7 @@ import (
 	"chatgpt-register/internal/mailfetch"
 	"chatgpt-register/internal/models"
 	"chatgpt-register/internal/prodcore"
+	"chatgpt-register/internal/proxypool"
 
 	"gorm.io/gorm"
 )
@@ -48,9 +49,9 @@ type Producer struct {
 	runTracked  []uint // 本次生产建过的任务 id
 }
 
-func New(db *gorm.DB, mail *mailfetch.Client) *Producer {
+func New(db *gorm.DB, mail *mailfetch.Client, managers ...*proxypool.Manager) *Producer {
 	return &Producer{
-		Core:    prodcore.New(db),
+		Core:    prodcore.New(db, "leonardo", managers...),
 		db:      db,
 		mail:    mail,
 		waiters: map[uint]chan string{},
@@ -452,16 +453,17 @@ func (p *Producer) run(id uint) {
 	defer p.ReleaseSlot()
 
 	p.appendLog(id, "开始 Leonardo 协议注册")
+	lease, proxyErr := p.AcquireProxy(ctx)
+	proxyCtx, cancelProxy := lease.Context(ctx)
+	defer cancelProxy()
 	since := time.Now().Add(-30 * time.Second)
 
 	in := leonardoreg.Input{
 		Email:      reg.Email,
 		Password:   reg.Password,
-		Proxy:      p.NextProxy(),
+		Proxy:      lease.Proxy,
 		Headless:   p.SettingOn("leonardo_headless"),
 		CaptchaKey: strings.TrimSpace(p.Setting("captcha_2captcha_key")),
-		// 出口 IP 探测默认关闭以提速；需排障时置 leonardo_egress_check=1。
-		EgressCheck: p.SettingOn("leonardo_egress_check"),
 		Log: func(f string, a ...any) {
 			p.appendLog(id, fmt.Sprintf(f, a...))
 		},
@@ -476,7 +478,11 @@ func (p *Producer) run(id uint) {
 		},
 	}
 
-	res, err := leonardoreg.Register(ctx, in)
+	var res *leonardoreg.Result
+	err := proxyErr
+	if err == nil {
+		res, err = leonardoreg.Register(proxyCtx, in)
+	}
 	if err != nil {
 		p.appendLog(id, "注册失败: "+err.Error())
 		status := "register_failed"
@@ -491,6 +497,7 @@ func (p *Producer) run(id uint) {
 		return
 	}
 
+	res.AuthJSON["proxy"] = lease.Proxy
 	authBytes, _ := json.MarshalIndent(res.AuthJSON, "", "  ")
 	p.appendLog(id, "Leonardo 注册成功")
 	p.db.Model(&models.LeonardoRegistration{}).Where("id = ?", id).Updates(map[string]any{
@@ -500,19 +507,19 @@ func (p *Producer) run(id uint) {
 
 	// 注册成功后立即用采集到的 Cookie 自检一次会话：会话无效说明这个号导出后
 	// 不可用，自动标记为失效（不删号）。
-	p.selfCheckLeonardoAlive(id, string(authBytes))
+	p.selfCheckLeonardoAlive(proxyCtx, id, string(authBytes), lease.Proxy)
 }
 
 // selfCheckLeonardoAlive 用注册产出的 Cookie 探一次 Leonardo 会话，把结果写入
 // alive 字段：alive=会话有效、dead=会话被拒、unknown=网络/限流不判死。
-func (p *Producer) selfCheckLeonardoAlive(id uint, authData string) {
+func (p *Producer) selfCheckLeonardoAlive(ctx context.Context, id uint, authData, proxy string) {
 	cookies := livecheck.LeonardoCookiesFromAuthJSON(authData)
 	if len(cookies) == 0 {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
-	result := livecheck.CheckLeonardo(ctx, []livecheck.LeonardoItem{{ID: id, Cookies: cookies}}, nil)
+	result := livecheck.CheckLeonardo(ctx, []livecheck.LeonardoItem{{ID: id, Cookies: cookies, Proxy: proxy}}, nil)
 	alive := result[id]
 	if alive == "" {
 		alive = livecheck.StatusUnknown

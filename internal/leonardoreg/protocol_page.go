@@ -203,17 +203,6 @@ func pageCookies(page *rod.Page) []map[string]any {
 	return out
 }
 
-func pageHTML(page *rod.Page) string {
-	if page == nil {
-		return ""
-	}
-	v, err := page.Timeout(8 * time.Second).Eval(`() => document.documentElement ? document.documentElement.innerHTML : ''`)
-	if err != nil {
-		return ""
-	}
-	return v.Value.Str()
-}
-
 func pageTitle(page *rod.Page) string {
 	if page == nil {
 		return ""

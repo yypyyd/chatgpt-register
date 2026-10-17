@@ -699,7 +699,7 @@ func fillStep2(ctx context.Context, page *rod.Page, in Input) error {
 
 // errCaptchaPuzzle 表示 Adobe 弹出了 hCaptcha 图形验证（同一出口 IP 注册过多触发），
 // 刷新页面无法消除，直接失败并提示换 IP 比反复重试更省时间。
-var errCaptchaPuzzle = errors.New("触发 Adobe 图形验证（同 IP 注册过多），建议开启 2Captcha 打码、开启代理 proxy_enabled=1 或降低注册频率")
+var errCaptchaPuzzle = errors.New("触发 Adobe 图形验证（同 IP 注册过多），建议开启 2Captcha 打码、开启 Adobe 独立代理或降低注册频率")
 
 // onCaptchaPuzzle 检测 hCaptcha 验证弹窗（"Please solve a few puzzles"）。
 func onCaptchaPuzzle(page *rod.Page) bool {

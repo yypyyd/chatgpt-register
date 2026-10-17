@@ -9,6 +9,13 @@
 // 更不会删除账号。测活只写状态，由用户主动点击触发，不做后台定时轮询。
 package livecheck
 
+import (
+	"net/http"
+	"time"
+
+	"chatgpt-register/internal/proxyutil"
+)
+
 const (
 	StatusAlive   = "alive"
 	StatusDead    = "dead"
@@ -18,6 +25,18 @@ const (
 // Chunk 是批量测活的增量回调：每完成一批就回传 id->status，
 // 供上层即时写库、刷新页面进度。
 type Chunk func(map[uint]string)
+
+func probeClient(proxy string) (*http.Client, func(), error) {
+	transport, err := proxyutil.Transport(proxy)
+	if err != nil {
+		return nil, func() {}, err
+	}
+	if transport == nil {
+		transport = http.DefaultTransport.(*http.Transport).Clone()
+		transport.Proxy = nil
+	}
+	return &http.Client{Transport: transport, Timeout: 30 * time.Second}, transport.CloseIdleConnections, nil
+}
 
 func emit(onChunk Chunk, m map[uint]string) {
 	if onChunk != nil && len(m) > 0 {

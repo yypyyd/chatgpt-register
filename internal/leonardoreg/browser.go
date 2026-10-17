@@ -2,7 +2,6 @@ package leonardoreg
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -28,14 +27,9 @@ var ErrEmailTaken = errors.New("该邮箱已注册 Leonardo")
 
 const (
 	loginURL = "https://app.leonardo.ai/auth/login"
-	appURL   = "https://app.leonardo.ai/"
 
-	// Leonardo 登录页各步骤的输入框（React 表单，id 稳定）。
-	selEmail    = `#email-field`
-	selNewPass  = `#create-password-field`
-	selConfirm  = `#confirm-password-field`
-	selLoginPwd = `#password-field`
-	selCode     = `#confirmation-code-field`
+	// 登录页用于显示邮箱入口的输入框。
+	selEmail = `#email-field`
 
 	// stuckReloadAfter 登录页卡住（SPA 只转圈、没渲染出邮箱框）多久后重新加载页面。
 	stuckReloadAfter = 25 * time.Second
@@ -159,310 +153,6 @@ func launchLeonardoBrowser(in Input) (browser *rod.Browser, bridge *proxyutil.Au
 	}, nil
 }
 
-func registerBrowser(ctx context.Context, in Input) (res *Result, err error) {
-	if in.Headless {
-		in.logf("启动无头浏览器，打开 Leonardo 注册页")
-	} else {
-		in.logf("启动可见浏览器，打开 Leonardo 注册页")
-	}
-
-	browser, authBridge, cleanup, err := launchLeonardoBrowser(in)
-	if err != nil {
-		return nil, err
-	}
-	proxyConfigured := strings.TrimSpace(in.Proxy) != ""
-	if authBridge != nil {
-		defer authBridge.Close()
-	}
-	defer func() {
-		// 关浏览器后清理 launcher 临时用户数据目录，避免残留 Profile 堆积
-		_ = rod.Try(browser.MustClose)
-		cleanup()
-	}()
-
-	var page *rod.Page
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("Leonardo 注册流程异常: %v", r)
-		}
-		if err == nil || page == nil || in.SaveShot == nil {
-			return
-		}
-		func() {
-			defer func() {
-				if r2 := recover(); r2 != nil {
-					in.logf("截图失败(panic): %v", r2)
-				}
-			}()
-			data, serr := page.Timeout(15*time.Second).Screenshot(false, nil)
-			if serr != nil || len(data) == 0 {
-				in.logf("截图失败: %v", serr)
-				return
-			}
-			in.SaveShot(data)
-			in.logf("已保存失败现场截图")
-		}()
-	}()
-
-	// 出口 IP 探测仅用于排障，默认跳过以省一次整页加载。
-	if proxyConfigured && in.EgressCheck {
-		checkPage := browser.MustPage("https://api.ipify.org?format=json")
-		checkPage.MustWaitLoad()
-		if body, berr := checkPage.Timeout(15 * time.Second).Element("body"); berr == nil && body != nil {
-			if value, terr := body.Text(); terr == nil {
-				in.logf("Chromium 实际代理出口: %s", trimText(value, 160))
-			}
-		}
-		_ = checkPage.Close()
-	}
-
-	page = browser.MustPage("")
-	if !in.Headless {
-		// 多个注册任务共用一个 X 显示，窗口默认叠在同一位置，真光标点击会点到别人
-		// 的窗口，按格子摆开各自独占一块屏幕。
-		if slot := acquireWindowSlot(); slot >= 0 {
-			defer releaseWindowSlot(slot)
-			placeBrowserWindow(browser, page, slot, in)
-		} else {
-			in.logf("可见窗口格子已用满，窗口可能与其它任务重叠")
-		}
-	}
-	if in.Headless {
-		// 可见模式覆盖视口会让 outerHeight 小于 innerHeight，真实光标坐标算不出来。
-		_ = (proto.EmulationSetDeviceMetricsOverride{
-			Width:             1280,
-			Height:            900,
-			DeviceScaleFactor: 1,
-			Mobile:            false,
-		}).Call(page)
-	}
-	if in.Headless {
-		// 无头 Chrome 的 UA 带 HeadlessChrome 标记，会被 Cloudflare 直接拦下。
-		if ver, verr := (proto.BrowserGetVersion{}).Call(browser); verr == nil {
-			if ua := cleanUserAgent(ver.UserAgent); ua != "" {
-				_ = (proto.EmulationSetUserAgentOverride{
-					UserAgent:      ua,
-					AcceptLanguage: "en-US,en;q=0.9",
-					Platform:       platformForUA(ua),
-				}).Call(page)
-				in.logf("无头 UA 已修正: %s", ua)
-			}
-		}
-	}
-
-	if err = gotoStable(ctx, page, loginURL, in, 120*time.Second); err != nil {
-		return nil, err
-	}
-	in.logf("Leonardo 登录页已加载")
-
-	if err = gotoEmailForm(ctx, page, in); err != nil {
-		return nil, err
-	}
-	if err = submitEmail(ctx, page, in); err != nil {
-		return nil, err
-	}
-	if err = createPassword(ctx, page, in); err != nil {
-		return nil, err
-	}
-	if err = confirmSignup(ctx, page, in); err != nil {
-		return nil, err
-	}
-
-	auth, cerr := captureAuth(ctx, page, in)
-	if cerr != nil {
-		return nil, cerr
-	}
-	return &Result{AuthJSON: auth}, nil
-}
-
-// gotoEmailForm 等待登录页渲染出邮箱输入框；页面默认就是「Continue with Email」，
-// 若被折叠在按钮后面则点开。SPA 卡住时重新加载再试。
-func gotoEmailForm(ctx context.Context, page *rod.Page, in Input) error {
-	deadline := time.Now().Add(90 * time.Second)
-	nextReload := time.Now().Add(stuckReloadAfter)
-	for time.Now().Before(deadline) {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if hasVisibleSel(page, selEmail) {
-			in.logf("已进入邮箱注册表单")
-			return nil
-		}
-		if time.Now().After(nextReload) {
-			in.logf("登录页仍未渲染出邮箱输入框，重新加载后再试")
-			_ = gotoStable(ctx, page, loginURL, in, 45*time.Second)
-			nextReload = time.Now().Add(stuckReloadAfter)
-			continue
-		}
-		dismissCookieBanner(page)
-		clickByText(page, `a,span,button`, `continue with email`)
-		time.Sleep(300 * time.Millisecond)
-	}
-	return fmt.Errorf("未能进入 Leonardo 邮箱注册表单")
-}
-
-// submitEmail 填邮箱、等 Turnstile 签发 token 后提交；Leonardo 随后用 GraphQL 查这个
-// 邮箱是新号还是老号，新号会进入「创建密码」步骤。
-func submitEmail(ctx context.Context, page *rod.Page, in Input) error {
-	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if attempt > 0 {
-			in.logf("邮箱步骤重试第 %d 次：重新加载登录页", attempt)
-			_ = gotoStable(ctx, page, loginURL, in, 60*time.Second)
-			if err := gotoEmailForm(ctx, page, in); err != nil {
-				lastErr = err
-				continue
-			}
-		}
-		if err := fillInput(ctx, page, selEmail, in.Email, 45*time.Second); err != nil {
-			lastErr = fmt.Errorf("输入邮箱失败: %w", err)
-			continue
-		}
-		if err := waitTurnstile(ctx, page, in, 90*time.Second); err != nil {
-			lastErr = err
-			continue
-		}
-		in.logf("已填写邮箱，提交邮箱步骤")
-		advanced := func() bool {
-			return hasVisibleSel(page, selNewPass) || hasVisibleSel(page, selCode) || hasVisibleSel(page, selLoginPwd)
-		}
-		if err := submitAndAdvance(ctx, page, advanced, 60*time.Second); err != nil {
-			// 页面上的报错文案才是真正原因（邮箱域名被拒、Turnstile token 失效等）。
-			lastErr = fmt.Errorf("提交邮箱失败: %w（%s）", err, trimText(pageAlert(page), 160))
-			continue
-		}
-		if hasVisibleSel(page, selLoginPwd) && !hasVisibleSel(page, selNewPass) {
-			// Leonardo 判定该邮箱已有账号，走的是登录而不是注册。
-			return fmt.Errorf("%w（页面进入登录密码步骤）", ErrEmailTaken)
-		}
-		return nil
-	}
-	return lastErr
-}
-
-// createPassword 填写「创建密码 + 再输一次」并提交，随后页面进入验证码步骤。
-// 已经直接跳到验证码步骤（例如上次注册未确认）时跳过。
-func createPassword(ctx context.Context, page *rod.Page, in Input) error {
-	if !hasVisibleSel(page, selNewPass) {
-		if hasVisibleSel(page, selCode) {
-			in.logf("账号已存在但未确认，直接进入验证码步骤")
-			return nil
-		}
-		return fmt.Errorf("未出现创建密码表单")
-	}
-	if err := fillInput(ctx, page, selNewPass, in.Password, 30*time.Second); err != nil {
-		return fmt.Errorf("输入密码失败: %w", err)
-	}
-	if err := fillInput(ctx, page, selConfirm, in.Password, 30*time.Second); err != nil {
-		return fmt.Errorf("确认密码失败: %w", err)
-	}
-	// 创建账号这一步同样要带 Turnstile token（signup 接口的 verificationToken）。
-	if err := waitTurnstile(ctx, page, in, 90*time.Second); err != nil {
-		return err
-	}
-	in.logf("已填写密码，提交创建账号")
-	if err := submitAndAdvance(ctx, page, func() bool { return hasVisibleSel(page, selCode) }, 90*time.Second); err != nil {
-		return fmt.Errorf("创建账号失败: %w（%s）", err, trimText(pageAlert(page), 160))
-	}
-	return nil
-}
-
-// confirmSignup 取邮箱验证码填入并提交，成功后 Leonardo 自动登录并跳出登录页。
-func confirmSignup(ctx context.Context, page *rod.Page, in Input) error {
-	for attempt := 0; attempt < 2; attempt++ {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if !hasVisibleSel(page, selCode) {
-			return nil
-		}
-		in.logf("等待 Leonardo 邮箱验证码")
-		code, err := in.WaitCode(ctx)
-		if err != nil {
-			return fmt.Errorf("获取邮箱验证码失败: %w", err)
-		}
-		if err = fillInput(ctx, page, selCode, code, 45*time.Second); err != nil {
-			return fmt.Errorf("填写验证码失败: %w", err)
-		}
-		// 确认注册接口同样要 Turnstile token，组件还在页面上就得先过一次。
-		if hasTurnstileWidget(page) {
-			if err = waitTurnstile(ctx, page, in, 90*time.Second); err != nil {
-				return err
-			}
-		}
-		in.logf("已填写验证码，提交确认注册")
-		if err = submitAndAdvance(ctx, page, func() bool { return !hasVisibleSel(page, selCode) }, 90*time.Second); err == nil {
-			in.logf("验证码校验通过，等待自动登录")
-			return nil
-		}
-		// 旧码被拒时点「重新发送」，让下一轮等的是新邮件。
-		clickByText(page, `button,a,span`, `resend`)
-		in.logf("验证码提交后仍停留在验证步骤（%s），已请求重发验证码后重试", trimText(pageAlert(page), 120))
-	}
-	return fmt.Errorf("邮箱验证码校验未通过")
-}
-
-// captureAuth 采集 Leonardo 站点 Cookie（含 better-auth 会话 cookie）与本地存储。
-func captureAuth(ctx context.Context, page *rod.Page, in Input) (map[string]any, error) {
-	// 确认注册后前端会自动登录并跳转，等它落到应用页再采集，确保会话 cookie 已下发。
-	if !waitCleared(ctx, page, 60*time.Second, func() bool {
-		u := pageURL(page)
-		return strings.Contains(u, "leonardo.ai") && !strings.Contains(u, "/auth/login")
-	}) {
-		in.logf("等待跳转到 Leonardo 应用页超时，主动打开应用页采集会话")
-		_ = gotoStable(ctx, page, appURL, in, 60*time.Second)
-	}
-	in.logf("当前页面: %s", trimText(pageURL(page), 120))
-
-	all, err := proto.NetworkGetAllCookies{}.Call(page)
-	if err != nil {
-		return nil, fmt.Errorf("读取 Cookie 失败: %w", err)
-	}
-	cookieList := make([]map[string]any, 0, len(all.Cookies))
-	hasSession := false
-	for _, c := range all.Cookies {
-		if strings.Contains(strings.ToLower(c.Name), "better-auth") {
-			hasSession = true
-		}
-		cookieList = append(cookieList, map[string]any{
-			"name":     c.Name,
-			"value":    c.Value,
-			"domain":   c.Domain,
-			"path":     c.Path,
-			"expires":  c.Expires,
-			"httpOnly": c.HTTPOnly,
-			"secure":   c.Secure,
-			"sameSite": c.SameSite,
-		})
-	}
-	if !hasSession {
-		return nil, fmt.Errorf("未采集到 better-auth 会话 cookie，登录可能未完成（当前页面: %s）", trimText(pageURL(page), 120))
-	}
-	in.logf("已采集 %d 条 Cookie（含 better-auth 会话 cookie）", len(cookieList))
-
-	storageRaw := page.MustEval(`() => JSON.stringify({
-		localStorage: Object.fromEntries(Object.entries(localStorage)),
-		sessionStorage: Object.fromEntries(Object.entries(sessionStorage)),
-		location: location.href
-	})`).String()
-	var storage map[string]any
-	_ = json.Unmarshal([]byte(storageRaw), &storage)
-
-	return map[string]any{
-		"auth_mode":   "leonardo_browser_session",
-		"platform":    "leonardo",
-		"email":       in.Email,
-		"captured_at": time.Now().UTC().Format(time.RFC3339),
-		"cookies":     cookieList,
-		"storage":     storage,
-	}, nil
-}
-
-/* ===== 页面推进 ===== */
-
 func gotoStable(ctx context.Context, page *rod.Page, target string, in Input, timeout time.Duration) error {
 	_ = rod.Try(func() { page.Timeout(timeout).MustNavigate(target) })
 	deadline := time.Now().Add(timeout)
@@ -491,59 +181,6 @@ func gotoStable(ctx context.Context, page *rod.Page, target string, in Input, ti
 		return nil
 	}
 	return fmt.Errorf("导航到 %s 超时", target)
-}
-
-// submitAndAdvance 反复点主按钮直到页面进入下一步或超时。
-func submitAndAdvance(ctx context.Context, page *rod.Page, advanced func() bool, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if advanced() {
-			return nil
-		}
-		clickPrimary(page)
-		for i := 0; i < 24; i++ {
-			if advanced() {
-				return nil
-			}
-			time.Sleep(250 * time.Millisecond)
-		}
-	}
-	if advanced() {
-		return nil
-	}
-	return fmt.Errorf("提交后页面未进入下一步")
-}
-
-// clickPrimary 点击表单主按钮：优先可点的 type=submit，否则按文本兜底。
-func clickPrimary(page *rod.Page) bool {
-	el, err := page.Timeout(10 * time.Second).Element(`button[type="submit"]:not([disabled])`)
-	if err == nil && el != nil {
-		if verr := el.WaitVisible(); verr == nil {
-			if mouseClickElement(el) {
-				return true
-			}
-			return el.Click(proto.InputMouseButtonLeft, 1) == nil
-		}
-	}
-	return clickByText(page, `button:not([disabled])`, `continue`) ||
-		clickByText(page, `button:not([disabled])`, `create account`)
-}
-
-// pageAlert 读取表单上的错误/提示文案，便于把失败原因写进日志。
-func pageAlert(page *rod.Page) string {
-	v, err := page.Timeout(8 * time.Second).Eval(`() => {
-		const visible = el => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
-		const el = [...document.querySelectorAll('[role="alert"], [aria-live], .text-negative')]
-			.find(e => visible(e) && (e.textContent || '').trim());
-		return el ? el.textContent.trim() : '';
-	}`)
-	if err != nil {
-		return ""
-	}
-	return v.Value.Str()
 }
 
 /* ===== 通用小工具 ===== */
@@ -581,16 +218,8 @@ func pageURL(page *rod.Page) string {
 	return info.URL
 }
 
-func hasSel(page *rod.Page, selector string) bool {
-	has, _, err := page.Has(selector)
-	if err != nil {
-		return false
-	}
-	return has
-}
-
 // hasVisibleSel 判断选择器是否命中「可见」元素；登录页会把各步骤输入框都预置在
-// DOM 里但只显示当前步骤，仅凭 hasSel 会误判。
+// DOM 里但只显示当前步骤，需要检查可见性。
 func hasVisibleSel(page *rod.Page, selector string) bool {
 	ok, err := page.Timeout(6*time.Second).Eval(`selector => {
 		const visible = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
@@ -699,21 +328,6 @@ func waitVisible(page *rod.Page, selector string, timeout time.Duration) (*rod.E
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-}
-
-func waitCleared(ctx context.Context, page *rod.Page, timeout time.Duration, cleared func() bool) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if ctx.Err() != nil {
-			return false
-		}
-		if cleared() {
-			return true
-		}
-		_ = page
-		time.Sleep(300 * time.Millisecond)
-	}
-	return cleared()
 }
 
 // clickByText 点击选择器命中的、可见且文本匹配（大小写不敏感）的第一个元素。
