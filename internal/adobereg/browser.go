@@ -185,6 +185,9 @@ func registerBrowser(ctx context.Context, in Input) (res *Result, err error) {
 	}
 
 	page = browser.MustPage("")
+	if _, e := page.EvalOnNewDocument(adobeArkoseIDScript); e != nil {
+		in.logf("安装 Arkose 消息 id 监听失败: %v", e)
+	}
 	_ = (proto.EmulationSetDeviceMetricsOverride{
 		Width:             1280,
 		Height:            900,
@@ -215,6 +218,8 @@ func registerBrowser(ctx context.Context, in Input) (res *Result, err error) {
 		return nil, err
 	}
 	if err = fillStep1(ctx, page, in); err != nil {
+		// 邮箱已有 Adobe 账号时直接返回给 producer，由它标记为“已存在/跳过”，
+		// 后续批量任务也会排除这个邮箱，不再重复注册或尝试登录。
 		return nil, err
 	}
 	// 步骤顺序自适应：姓名/生日步与邮箱验证可能以任意顺序出现。
@@ -401,6 +406,8 @@ func RescueRide(ctx context.Context, in Input, cookies []map[string]any) (res *R
 	if err := gotoStable(ctx, page, fireflyURL, in, 90*time.Second); err != nil {
 		in.logf("打开 Firefly 异常（继续尝试过核验）: %v", err)
 	}
+	// 等 Firefly 应用真正挂载后再采集，否则 ARP/Sherlock 还没初始化。
+	_ = waitFireflyReady(ctx, page, in, 20*time.Second)
 	auth, cerr := captureAuth(page, in)
 	if cerr != nil {
 		return nil, cerr
@@ -600,9 +607,15 @@ func fillStep1(ctx context.Context, page *rod.Page, in Input) error {
 			lastErr = fmt.Errorf("输入邮箱失败: %w", err)
 			continue
 		}
+		if onAccountExists(page) {
+			return ErrAccountExists
+		}
 		if err := fillInput(ctx, page, `input[name="password"]`, in.Password, 30*time.Second); err != nil {
 			lastErr = fmt.Errorf("输入密码失败: %w", err)
 			continue
+		}
+		if onAccountExists(page) {
+			return ErrAccountExists
 		}
 		in.logf("已填写邮箱与密码，提交第一步")
 		// 提交后等待离开邮箱/密码步：出现姓名框、出现验证码框，或密码框消失。
@@ -612,6 +625,9 @@ func fillStep1(ctx context.Context, page *rod.Page, in Input) error {
 				!hasSel(page, `input[name="password"]`)
 		}
 		if err := submitAndAdvance(ctx, page, in, leftStep1, 60*time.Second); err != nil {
+			if onAccountExists(page) {
+				return ErrAccountExists
+			}
 			lastErr = fmt.Errorf("提交第一步失败: %w", err)
 			if errors.Is(err, errCaptchaPuzzle) {
 				break // 图形验证是 IP 级风控，重新加载注册页也过不去
@@ -625,33 +641,75 @@ func fillStep1(ctx context.Context, page *rod.Page, in Input) error {
 
 // completeSignup 在第一步之后自适应处理后续步骤：邮箱验证与姓名/生日步
 // 可能以任意顺序出现，循环处理直到两者都已完成、页面离开注册表单。
+//
+// 超时按“阶段”计算：每完成邮箱验证或创建账号提交，就重置 3 分钟窗口。
+// Arkose 打码可能耗时数分钟，不能用进入函数时的固定截止时间把提交后的
+// 结果检查窗口挤掉；判定超时前也会再查一次页面，避免刚好跳转完成被误判。
 func completeSignup(ctx context.Context, page *rod.Page, in Input) error {
-	deadline := time.Now().Add(180 * time.Second)
-	for time.Now().Before(deadline) {
+	const stepTimeout = 180 * time.Second
+	deadline := time.Now().Add(stepTimeout)
+	extend := func(reason string) {
+		deadline = time.Now().Add(stepTimeout)
+		in.logf("注册阶段完成（%s），重置 3 分钟步骤超时", reason)
+	}
+	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		u := pageURL(page)
+		if isSignupErrorURL(u) {
+			return fmt.Errorf("注册落到错误页: %s", trimText(u, 200))
+		}
+		if isSignupDoneURL(u) {
+			in.logf("注册表单已完成: %s", trimText(u, 120))
+			return nil
+		}
 		if onEmailVerify(page, u) {
 			if err := handleEmailVerification(ctx, page, in); err != nil {
 				return err
 			}
+			extend("邮箱验证")
 			continue
 		}
 		if hasSel(page, `input[name="firstname"]`) {
 			if err := fillStep2(ctx, page, in); err != nil {
 				return err
 			}
+			extend("创建账号提交")
 			continue
 		}
-		if !strings.Contains(u, "signup") && !strings.Contains(u, "create-account") &&
-			!strings.Contains(u, "#/create") {
-			in.logf("注册表单已完成: %s", trimText(u, 120))
-			return nil
+		if time.Now().After(deadline) {
+			// 页面可能刚好在超时边界跳转完成，失败前再确认一次。
+			u = pageURL(page)
+			if isSignupDoneURL(u) {
+				in.logf("注册表单已完成: %s", trimText(u, 120))
+				return nil
+			}
+			return fmt.Errorf("完成注册步骤超时（可能遇到额外校验，当前页面: %s）", trimText(u, 200))
 		}
 		time.Sleep(300 * time.Millisecond)
 	}
-	return fmt.Errorf("完成注册步骤超时（可能遇到额外校验）")
+}
+
+// isSignupErrorURL 判断是否落到了 Adobe 的错误页。
+func isSignupErrorURL(u string) bool {
+	lu := strings.ToLower(strings.TrimSpace(u))
+	return strings.Contains(lu, "/error") || strings.Contains(lu, "error=")
+}
+
+// isSignupDoneURL 判断注册表单是否已经完成（离开 signup/create-account 流程）。
+// 空 URL（正在跳转）和邮箱验证页不算完成。
+func isSignupDoneURL(u string) bool {
+	lu := strings.ToLower(strings.TrimSpace(u))
+	if lu == "" || isSignupErrorURL(lu) || !strings.Contains(lu, "adobe.com") {
+		return false
+	}
+	for _, block := range []string{"signup", "create-account", "#/create", "email-verification", "/password"} {
+		if strings.Contains(lu, block) {
+			return false
+		}
+	}
+	return true
 }
 
 func fillStep2(ctx context.Context, page *rod.Page, in Input) error {
@@ -701,13 +759,188 @@ func fillStep2(ctx context.Context, page *rod.Page, in Input) error {
 // 刷新页面无法消除，直接失败并提示换 IP 比反复重试更省时间。
 var errCaptchaPuzzle = errors.New("触发 Adobe 图形验证（同 IP 注册过多），建议开启 2Captcha 打码、开启 Adobe 独立代理或降低注册频率")
 
+// errArkosePuzzle 表示 Adobe 走到了 Arkose FunCaptcha。它和 hCaptcha 是两套
+// 完全不同的接口，不能用 hCaptcha 的打码结果顶替。
+var errArkosePuzzle = errors.New("触发 Adobe Arkose 图形验证，请在系统设置启用 2Captcha 打码后重试")
+
+// errArkoseTokenRejected 表示打码服务返回了 token，但页面没有接受（Arkose 仍存在）。
+// 这类情况应切换到备用打码服务重试，而不是用同一家继续解。
+var errArkoseTokenRejected = errors.New("Arkose token 未被页面接受")
+
+// ErrAccountExists 表示 Adobe 明确提示该邮箱已有账号。此时继续重试注册页
+// 没有意义，应改用库存密码登录复用这个账号。
+var ErrAccountExists = errors.New("Adobe 邮箱已有账号")
+
 // onCaptchaPuzzle 检测 hCaptcha 验证弹窗（"Please solve a few puzzles"）。
 func onCaptchaPuzzle(page *rod.Page) bool {
 	return hasSel(page, `iframe[src*="hcaptcha.com"]`)
 }
 
+// onArkosePuzzle 检测 Adobe 当前使用的 Arkose FunCaptcha（arks-client/adobe 或
+// arkoselabs 的 enforcement iframe，新版还会同时渲染 arkose-<id>-wrapper）。
+func onArkosePuzzle(page *rod.Page) bool {
+	return hasSel(page, `iframe[src*="arkoselabs"],iframe[src*="arks-client"],div[class*="arkose-"]`)
+}
+
+// onAccountExists 检测 Adobe 创建账号页的“该邮箱已有账号”提示。
+func onAccountExists(page *rod.Page) bool {
+	res, err := page.Timeout(3 * time.Second).Eval(`() => (document.body ? document.body.innerText : '').toLowerCase()`)
+	if err != nil {
+		return false
+	}
+	s := res.Value.Str()
+	return strings.Contains(s, "already exists") ||
+		strings.Contains(s, "account with this email") ||
+		strings.Contains(s, "已有账号")
+}
+
 // maxCaptchaSolves 单次提交里最多打码几次，避免反复失败白烧打码额度。
 const maxCaptchaSolves = 2
+
+// maxArkoseSolves 单次提交里最多解几次 Arkose；token 被拒时再解一次仍失败就
+// 直接报错，避免无限循环。
+const maxArkoseSolves = 2
+
+// adobeArkoseIDScript 在页面脚本之前挂上 message 监听，记录 Arkose iframe
+// 发给父页面的消息 id。父页面 Arkose API 校验的 id 是它自己生成的 io.id，
+// 不是 iframe hash 里的 session；直接拿 hash 里的 session 注入会被丢弃。
+const adobeArkoseIDScript = `window.__adobeArkId = ''; window.addEventListener('message', function (e) {
+  try {
+    var d = (typeof e.data === 'string') ? JSON.parse(e.data) : e.data;
+    if (d && d.id && d.message) { window.__adobeArkId = d.id; }
+  } catch (_) {}
+}, true);`
+
+// arkoseChallenge 是 Arkose enforcement iframe 里的打码参数。iframe 的 hash
+// 形如 #<publickey>&<session-id>&<parent-origin>；GameURL 是内层 game-core
+// 谜题 iframe，2Captcha 只有拿这个 URL 当 pageurl 才能解出来。
+type arkoseChallenge struct {
+	Src       string
+	PublicKey string
+	SessionID string
+	MessageID string
+	Surl      string
+	GameURL   string
+}
+
+// arkoseInfo 从当前页面的 Arkose iframe 解析 publickey / session id / surl，
+// 并读取提前捕获到的父页面消息 id。
+func arkoseInfo(page *rod.Page) (*arkoseChallenge, error) {
+	res, err := page.Timeout(10 * time.Second).Eval(`() => {
+		const f = [...document.querySelectorAll('iframe')].find(x => /enforcement/.test(x.src) && /(arkoselabs|arks-client)/.test(x.src));
+		if (!f) return '';
+		const u = new URL(f.src);
+		const parts = decodeURIComponent((u.hash || '').replace(/^#/, '')).split('&');
+		return JSON.stringify({ src: f.src, pk: parts[0] || '', sid: parts[1] || '', surl: u.origin, mid: window.__adobeArkId || '' });
+	}`)
+	if err != nil {
+		return nil, fmt.Errorf("读取 Arkose 参数失败: %w", err)
+	}
+	var raw struct {
+		Src  string `json:"src"`
+		PK   string `json:"pk"`
+		SID  string `json:"sid"`
+		Surl string `json:"surl"`
+		MID  string `json:"mid"`
+	}
+	if json.Unmarshal([]byte(res.Value.Str()), &raw) != nil || raw.PK == "" {
+		return nil, fmt.Errorf("未取到 Arkose publickey")
+	}
+	mid := raw.MID
+	if mid == "" {
+		mid = raw.SID
+	}
+	return &arkoseChallenge{Src: raw.Src, PublicKey: raw.PK, SessionID: raw.SID, MessageID: mid, Surl: raw.Surl}, nil
+}
+
+// arkoseGameURL 从 CDP 的 frame tree 里找内层 game-core 谜题 iframe。
+func arkoseGameURL(page *rod.Page) string {
+	res, err := proto.PageGetFrameTree{}.Call(page)
+	if err != nil || res == nil || res.FrameTree == nil {
+		return ""
+	}
+	var walk func(*proto.PageFrameTree) string
+	walk = func(t *proto.PageFrameTree) string {
+		if t == nil {
+			return ""
+		}
+		if t.Frame != nil && strings.Contains(t.Frame.URL, "game-core") {
+			return t.Frame.URL
+		}
+		for _, c := range t.ChildFrames {
+			if u := walk(c); u != "" {
+				return u
+			}
+		}
+		return ""
+	}
+	return walk(res.FrameTree)
+}
+
+// solveArkose 用 2Captcha 解 Arkose，并把 token 以 Arkose iframe 完成事件的
+// 形式回送给页面。父页面监听 message 事件，并校验 event.source / id，所以这里
+// 用 MessageEvent 构造一个 source 指向该 iframe 的事件，而不是直接改隐藏域。
+func solveArkose(ctx context.Context, page *rod.Page, in Input, challenge *arkoseChallenge) error {
+	ua := userAgent
+	if v, err := page.Timeout(5 * time.Second).Eval(`navigator.userAgent`); err == nil && strings.TrimSpace(v.Value.Str()) != "" {
+		ua = v.Value.Str()
+	}
+	// game-core 谜题 iframe 通常比 enforcement iframe 晚几百毫秒出现。
+	for i := 0; i < 40 && challenge.GameURL == ""; i++ {
+		challenge.GameURL = arkoseGameURL(page)
+		if challenge.GameURL != "" {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if challenge.GameURL == "" {
+		return fmt.Errorf("未找到 Arkose game-core 谜题 iframe")
+	}
+	solveURL := challenge.GameURL
+	in.logf("检测到 Adobe Arkose 图形验证，提交打码 (game=%s id=%s)", trimText(challenge.GameURL, 160), trimText(challenge.MessageID, 60))
+	token, err := in.Captcha.SolveFunCaptcha(ctx, challenge.PublicKey, solveURL, challenge.Surl, ua)
+	if err != nil {
+		return fmt.Errorf("Arkose 打码失败: %w", err)
+	}
+	if strings.TrimSpace(token) == "" {
+		return fmt.Errorf("Arkose 打码返回空 token")
+	}
+	if err := injectArkoseToken(page, challenge, token); err != nil {
+		return err
+	}
+	in.logf("Arkose 打码成功，已注入 token 并等待页面继续")
+	// 页面收到完成事件后才会发 create-account 请求。等 Arkose 消失；若仍在，
+	// 说明 token 被页面/服务端拒绝，交给调用方切换备用打码服务。
+	if !waitCleared(ctx, page, 10*time.Second, func() bool { return !onArkosePuzzle(page) }) {
+		return errArkoseTokenRejected
+	}
+	return nil
+}
+
+func injectArkoseToken(page *rod.Page, challenge *arkoseChallenge, token string) error {
+	// 1.40.0 的父页面只接受 source=window、id 为捕获到的 message id 的完成事件；
+	// iframe 当 source 或 hash 里的 session 当 id 都会被静默忽略，页面会重弹 Arkose。
+	mid := challenge.MessageID
+	if mid == "" {
+		mid = challenge.SessionID
+	}
+	ok, err := page.Timeout(15*time.Second).Eval(`(token, mid, src) => {
+		const ev = new MessageEvent('message', {
+			data: JSON.stringify({ message: 'challenge completed', id: mid, data: { token: token } }),
+			origin: new URL(src).origin,
+			source: window,
+		});
+		window.dispatchEvent(ev);
+		return true;
+	}`, token, mid, challenge.Src)
+	if err != nil {
+		return fmt.Errorf("注入 Arkose token 失败: %w", err)
+	}
+	if !ok.Value.Bool() {
+		return fmt.Errorf("注入 Arkose token 失败")
+	}
+	return nil
+}
 
 // solveCaptcha 调打码服务解掉页面上的 hCaptcha，并把 token 回填进页面。
 func solveCaptcha(ctx context.Context, page *rod.Page, in Input) error {
@@ -795,6 +1028,7 @@ func injectHCaptchaToken(page *rod.Page, token string) error {
 func submitAndAdvance(ctx context.Context, page *rod.Page, in Input, advanced func() bool, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	solves := 0
+	arkoseSolves := 0
 	for time.Now().Before(deadline) {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -802,11 +1036,18 @@ func submitAndAdvance(ctx context.Context, page *rod.Page, in Input, advanced fu
 		if advanced() {
 			return nil
 		}
-		clickPrimary(page)
+		if onArkosePuzzle(page) || onCaptchaPuzzle(page) {
+			// 已经出现验证，别再点提交，直接进入下面的打码分支。
+		} else {
+			clickPrimary(page)
+		}
 		// 细粒度轮询：页面通常 1~2 秒内推进，1 秒一探会白等大半秒。
 		for i := 0; i < 24; i++ {
 			if advanced() {
 				return nil
+			}
+			if onArkosePuzzle(page) || onCaptchaPuzzle(page) {
+				break
 			}
 			time.Sleep(250 * time.Millisecond)
 		}
@@ -820,6 +1061,34 @@ func submitAndAdvance(ctx context.Context, page *rod.Page, in Input, advanced fu
 				return errCaptchaPuzzle
 			}
 			deadline = time.Now().Add(timeout) // 打码耗时不算进提交超时
+			continue
+		}
+		if onArkosePuzzle(page) {
+			if in.Captcha == nil {
+				return errArkosePuzzle
+			}
+			if arkoseSolves >= maxArkoseSolves {
+				return errArkosePuzzle
+			}
+			arkoseSolves++
+			challenge, err := arkoseInfo(page)
+			if err != nil {
+				in.logf("读取 Arkose 参数失败: %v", err)
+				return errArkosePuzzle
+			}
+			if err := solveArkose(ctx, page, in, challenge); err != nil {
+				in.logf("%v", err)
+				if errors.Is(err, errArkoseTokenRejected) {
+					if p, ok := in.Captcha.(interface{ PreferSecondary() }); ok {
+						p.PreferSecondary()
+						in.logf("token 被页面拒绝，已切换备用打码服务重试")
+						deadline = time.Now().Add(timeout)
+						continue
+					}
+				}
+				return errArkosePuzzle
+			}
+			deadline = time.Now().Add(timeout)
 		}
 	}
 	if advanced() {
@@ -852,25 +1121,40 @@ func handleEmailVerification(ctx context.Context, page *rod.Page, in Input) erro
 			return nil
 		}
 		in.logf("检测到 Adobe 邮箱验证码页面，开始自动读取验证码")
-		code, err := in.WaitCode(ctx)
+		in.logf("等待 Adobe 核验验证码（最多 2 分钟）...")
+		codeCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		code, err := in.WaitCode(codeCtx)
+		cancel()
 		if err != nil {
 			return fmt.Errorf("获取邮箱验证码失败: %w", err)
 		}
 		if err = fillInput(ctx, page, `input.PinInput-Input`, code, 45*time.Second); err != nil {
 			return fmt.Errorf("填写验证码失败: %w", err)
 		}
-		// 6 位填满后 Adobe 自动提交；补按一次回车兜底。
+		// 填满后 Adobe 通常自动提交；再点一次主按钮并按回车兜底。
+		clickPrimary(page)
 		if pin, perr := waitVisible(page, `input.PinInput-Input`, 10*time.Second); perr == nil {
 			_ = pin.Type(input.Enter)
 		}
-		if waitCleared(ctx, page, 40*time.Second, func() bool { return !onEmailVerify(page, pageURL(page)) }) {
+		if waitCleared(ctx, page, 25*time.Second, func() bool { return !onEmailVerify(page, pageURL(page)) }) {
 			in.logf("邮箱验证码校验通过")
 			return nil
 		}
-		// 旧码已被消费或被拒，Adobe 不会自动再发；点「重新发送」让重试等的
-		// 是新邮件，否则会一直等到收码超时。
-		clickByText(page, `button,a,span`, `resend`)
-		in.logf("验证码提交后仍停留在验证页，已请求重发验证码后重试")
+		// 记录页面实际提示，区分“码错/过期”与“按钮没点上”。
+		if txt, terr := page.Timeout(5 * time.Second).Eval(`document.body ? document.body.innerText : ''`); terr == nil {
+			in.logf("验证码未通过，页面提示: %s", trimText(txt.Value.Str(), 200))
+		}
+		if attempt == 0 {
+			clickByText(page, `button,a,span`, `resend code`)
+			clickByText(page, `button,a,span`, `resend`)
+			clickByText(page, `button,a,span`, `重新发送`)
+			if in.ResetCodeBaseline != nil {
+				in.ResetCodeBaseline()
+			}
+			in.logf("已请求重发验证码，等待新邮件后重试一次")
+			continue
+		}
+		return fmt.Errorf("邮箱验证码校验未通过")
 	}
 	return fmt.Errorf("邮箱验证码校验未通过")
 }
@@ -893,6 +1177,90 @@ func waitFireflyReady(ctx context.Context, page *rod.Page, in Input, timeout tim
 		time.Sleep(300 * time.Millisecond)
 	}
 	return fmt.Errorf("等待 Firefly 就绪超时")
+}
+
+// captureArpSessionToken 取 Firefly 的 x-arp-session-id。
+// ArpJS（Sherlock）用 sessionStorage.riskSessionId 生成加密 token，再通过
+// tokenCallback 交给 Firefly；这里按同样方式主动实例化一次 Sherlock，
+// 把回调值捕获下来，不需要真的发起一次生图请求。
+func captureArpSessionToken(page *rod.Page, in Input) string {
+	readStr := func(expr string) string {
+		res, err := page.Timeout(8 * time.Second).Eval(expr)
+		if err != nil {
+			return ""
+		}
+		return strings.TrimSpace(res.Value.Str())
+	}
+	// ArpJS 往往要等 Firefly 页面交互后才加载；缺 riskSessionId 时轻触一下提示框。
+	// Firefly 落地页不会加载 ArpJS；先进入编辑器视图再采集。
+	if !strings.Contains(pageURL(page), "view=generate") {
+		if err := gotoStable(context.Background(), page, "https://firefly.adobe.com/generate/images?view=generate", in, 60*time.Second); err != nil {
+			in.logf("打开 Firefly 编辑器失败: %v", err)
+		}
+	}
+	in.logf("ARP 采集页面: %s", trimText(pageURL(page), 120))
+	for i := 0; i < 45; i++ {
+		if readStr(`sessionStorage.getItem('riskSessionId')||''`) != "" &&
+			readStr(`(window.SherlockSdk && typeof window.SherlockSdk.Sherlock) ? '1' : ''`) != "" {
+			break
+		}
+		switch i {
+		case 2, 7, 12, 17, 22, 27, 32:
+			_, _ = page.Timeout(5 * time.Second).Eval(`() => {
+				const visible = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+				const t = [...document.querySelectorAll('textarea, [contenteditable="true"]')].find(visible) || document.querySelector('textarea');
+				if (!t) return false;
+				t.focus();
+				t.value = 'a';
+				t.dispatchEvent(new Event('input', { bubbles: true }));
+				t.dispatchEvent(new Event('change', { bubbles: true }));
+				return true;
+			}`)
+		}
+		time.Sleep(1 * time.Second)
+	}
+	res, err := page.Timeout(60 * time.Second).Eval(`() => new Promise((resolve) => {
+		let done = false;
+		const diag = {};
+		const finish = (v) => { if (!done) { done = true; resolve(String(v || '')); } };
+		try {
+			const sid = sessionStorage.getItem('riskSessionId') || '';
+			diag.sid = !!sid;
+			diag.sdk = !!(window.SherlockSdk && window.SherlockSdk.Sherlock);
+			if (!sid || !window.SherlockSdk || !window.SherlockSdk.Sherlock) return finish('DIAG:' + JSON.stringify(diag));
+			const cfg = {
+				clientId: 'clio-playground-web',
+				sessionId: sid,
+				prodEnv: true,
+				logging: false,
+				vendors: ['forter', 'arkose', 'bfp'],
+				tokenCallback: function (token) { finish(token); }
+			};
+			const inst = new window.SherlockSdk.Sherlock(cfg);
+			diag.inst = !!inst;
+			diag.build = typeof (inst && inst._buildAndSendSessionToken);
+			setTimeout(function () {
+				try { inst._buildAndSendSessionToken(); diag.called = true; }
+				catch (e) { diag.callErr = String(e); }
+			}, 2500);
+		} catch (e) { diag.err = String(e); }
+		setTimeout(function () { finish('DIAG:' + JSON.stringify(diag)); }, 20000);
+	})`)
+	if err != nil {
+		in.logf("ARP token 采集失败: %v", err)
+		return ""
+	}
+	token := strings.TrimSpace(res.Value.Str())
+	if strings.HasPrefix(token, "DIAG:") {
+		in.logf("ARP token 采集诊断: %s", trimText(strings.TrimPrefix(token, "DIAG:"), 200))
+		return ""
+	}
+	if token == "" {
+		in.logf("等待 ARP session token 超时（页面 %s）", trimText(pageURL(page), 120))
+		return ""
+	}
+	in.logf("已捕获 ARP session token（长度 %d）", len(token))
+	return token
 }
 
 func captureAuth(page *rod.Page, in Input) (map[string]any, error) {
@@ -926,16 +1294,18 @@ func captureAuth(page *rod.Page, in Input) (map[string]any, error) {
 	var storage map[string]any
 	_ = json.Unmarshal([]byte(storageRaw), &storage)
 
+	arpToken := captureArpSessionToken(page, in)
 	return map[string]any{
-		"auth_mode":   "adobe_browser_session",
-		"platform":    "adobe",
-		"product":     "firefly",
-		"email":       in.Email,
-		"first_name":  in.FirstName,
-		"last_name":   in.LastName,
-		"captured_at": time.Now().UTC().Format(time.RFC3339),
-		"cookies":     cookieList,
-		"storage":     storage,
+		"auth_mode":         "adobe_browser_session",
+		"platform":          "adobe",
+		"product":           "firefly",
+		"email":             in.Email,
+		"first_name":        in.FirstName,
+		"last_name":         in.LastName,
+		"captured_at":       time.Now().UTC().Format(time.RFC3339),
+		"arp_session_token": arpToken,
+		"cookies":           cookieList,
+		"storage":           storage,
 	}, nil
 }
 

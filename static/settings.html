@@ -130,18 +130,28 @@
           </span>
           <div>
             <h2>打码服务</h2>
-            <p>注册时弹出图形验证（hCaptcha）自动打码</p>
+            <p>注册时弹出图形验证（hCaptcha / Arkose）自动打码</p>
           </div>
         </div>
         <label class="switch-row">
           <input id="set-captcha-enabled" type="checkbox">
           <span class="switch-ui"></span>
-          <span class="switch-label">启用 2Captcha 打码</span>
+          <span class="switch-label">启用打码（YesCaptcha 优先，其次 2Captcha）</span>
         </label>
         <div class="field">
+          <label>YesCaptcha API Key</label>
+          <span class="field-hint">推荐。Adobe 当前使用的 Arkose 用 YesCaptcha 更稳；未填写时回退 2Captcha</span>
+          <input id="set-yescaptcha-key" class="px-input" type="text" spellcheck="false" autocomplete="off" placeholder="YesCaptcha clientKey">
+        </div>
+        <div class="field">
           <label>2Captcha API Key</label>
-          <span class="field-hint">在 2captcha.com 后台获取；未启用或未填写时，弹出图形验证仍按注册失败处理</span>
+          <span class="field-hint">备用。未启用或都未填写时，弹出图形验证仍按注册失败处理</span>
           <input id="set-captcha-key" class="px-input" type="text" spellcheck="false" autocomplete="off" placeholder="32 位 key">
+        </div>
+        <div class="field">
+          <label>2Captcha 打码代理</label>
+          <span class="field-hint">可选但推荐。填公网可访问的 HTTP 代理，如 http://user:pass@host:port；Arkose 打码工人需要它才能解题</span>
+          <input id="set-captcha-proxy" class="px-input" type="text" spellcheck="false" autocomplete="off" placeholder="http://user:pass@host:port">
         </div>
         <div class="settings-foot">
           <button class="px-btn primary" onclick="saveCaptcha()">保存打码配置</button>
@@ -193,12 +203,16 @@ async function loadSettings() {
   document.getElementById('set-launch-stagger').value = d.launch_stagger_sec === undefined ? '45' : d.launch_stagger_sec;
   document.getElementById('set-captcha-enabled').checked = d.captcha_enabled === '1';
   document.getElementById('set-captcha-key').value = d.captcha_2captcha_key || '';
+  document.getElementById('set-yescaptcha-key').value = d.captcha_yescaptcha_key || '';
+  document.getElementById('set-captcha-proxy').value = d.captcha_2captcha_proxy || '';
 }
 
 async function saveCaptcha() {
   const body = {
     captcha_enabled: document.getElementById('set-captcha-enabled').checked ? '1' : '0',
     captcha_2captcha_key: document.getElementById('set-captcha-key').value.trim(),
+    captcha_yescaptcha_key: document.getElementById('set-yescaptcha-key').value.trim(),
+    captcha_2captcha_proxy: document.getElementById('set-captcha-proxy').value.trim(),
   };
   const r = await api('/api/settings', {
     method: 'PUT',

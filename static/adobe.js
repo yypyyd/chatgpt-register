@@ -4,6 +4,7 @@ const ADOBE_STATUS = {
   waiting_code: '等待验证码',
   registered: '已注册',
   register_failed: '注册失败',
+  account_exists: '账号已存在（已跳过）',
 };
 
 let page = 1;
@@ -37,7 +38,7 @@ function rowHtml(x) {
       <td class="col-check"><input type="checkbox" ${adobeSelected.has(x.id) ? 'checked' : ''} onclick="toggleSelect(${x.id}, this.checked)"></td>
       <td>${esc(x.email)}</td>
       <td>${fmtTime(x.created_at)}</td>
-      <td><span class="badge ${esc(x.status)}">${ADOBE_STATUS[x.status] || esc(x.status)}</span></td>
+      <td><span class="badge ${x.status === 'account_exists' ? 'pending' : esc(x.status)}">${ADOBE_STATUS[x.status] || esc(x.status)}</span></td>
       <td>${aliveCell(x)}</td>
       <td class="ship-cell"><span class="badge ${x.shipped ? 'registered' : 'pending'}" title="导出后自动标记，不能手动修改">${x.shipped ? '已出库' : '未出库'}</span></td>
       <td>

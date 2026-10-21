@@ -3,6 +3,7 @@ package adobeproducer
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -78,11 +79,18 @@ func (p *Producer) Start(email, note string) (*models.AdobeRegistration, error) 
 		if existing.Status == "registering" || existing.Status == "waiting_code" {
 			return nil, fmt.Errorf("该邮箱的 Adobe 注册正在进行中")
 		}
+		if existing.Status == "account_exists" {
+			return nil, fmt.Errorf("该邮箱已有 Adobe 账号，已跳过")
+		}
 		existing.Status = "registering"
 		existing.Note = note
 		existing.MailboxID = mailboxID
 		existing.Product = "firefly"
-		existing.Password = adobereg.GenPassword(16)
+		// 复用已有记录时保留原密码：该邮箱可能在上一次失败前已经建号，
+		// 重新生成密码会让“已有账号自动登录”必然失败。
+		if strings.TrimSpace(existing.Password) == "" {
+			existing.Password = adobereg.GenPassword(16)
+		}
 		existing.AuthData = ""
 		existing.Shot = nil
 		existing.Shipped = false
@@ -198,7 +206,9 @@ func (p *Producer) claimOne(email string, mailboxID uint, note string) (*models.
 		existing.Product = "firefly"
 		existing.Status = "registering"
 		existing.Shipped = false
-		existing.Password = reg.Password
+		if strings.TrimSpace(existing.Password) == "" {
+			existing.Password = reg.Password
+		}
 		existing.Note = note
 		existing.AuthData = ""
 		existing.Shot = nil
@@ -459,6 +469,13 @@ func (p *Producer) run(id uint) {
 	lease, proxyErr := p.AcquireProxy(ctx)
 	proxyCtx, cancelProxy := lease.Context(ctx)
 	defer cancelProxy()
+	// Arkose 打码（YesCaptcha FunCaptcha）必须带代理；复用浏览器那条 sticky
+	// 代理会和浏览器连接互相抢，实测会 ERROR_PROXY_READ_TIMEOUT。这里单独取
+	// 一条代理给打码服务，浏览器与打码各走各的出口。
+	captchaProxy := lease.Proxy
+	if cl, cerr := p.AcquireProxy(ctx); cerr == nil && strings.TrimSpace(cl.Proxy) != "" {
+		captchaProxy = cl.Proxy
+	}
 	since := time.Now().Add(-30 * time.Second)
 
 	in := adobereg.Input{
@@ -468,7 +485,7 @@ func (p *Producer) run(id uint) {
 		Headless: p.SettingOn("adobe_headless"),
 		// 出口 IP 探测默认关闭以提速；需排障时置 adobe_egress_check=1。
 		EgressCheck: p.SettingOn("adobe_egress_check"),
-		Captcha:     p.captchaSolver(id),
+		Captcha:     p.captchaSolver(id, captchaProxy),
 		Log: func(f string, a ...any) {
 			p.appendLog(id, fmt.Sprintf(f, a...))
 		},
@@ -480,7 +497,8 @@ func (p *Producer) run(id uint) {
 		},
 		// 过 ride 身份核验前重置验证码基线，避免误取注册阶段旧码。
 		ResetCodeBaseline: func() {
-			since = time.Now().Add(-15 * time.Second)
+			// 只认核验页打开这一刻之后到达的邮件，避免把注册阶段的旧码当核验码。
+			since = time.Now().Truncate(time.Second)
 		},
 		SaveShot: func(png []byte) {
 			p.db.Model(&models.AdobeRegistration{}).Where("id = ?", id).Update("shot", png)
@@ -493,6 +511,14 @@ func (p *Producer) run(id uint) {
 		res, err = adobereg.Register(proxyCtx, in)
 	}
 	if err != nil {
+		if errors.Is(err, adobereg.ErrAccountExists) {
+			p.appendLog(id, "该邮箱已有 Adobe 账号，已跳过（不重复注册/不登录）")
+			p.db.Model(&models.AdobeRegistration{}).Where("id = ?", id).Updates(map[string]any{
+				"status": "account_exists",
+				"note":   "Adobe 账号已存在，已跳过",
+			})
+			return
+		}
 		p.appendLog(id, "注册失败: "+err.Error())
 		p.db.Model(&models.AdobeRegistration{}).Where("id = ?", id).Updates(map[string]any{
 			"status": "register_failed",
@@ -508,6 +534,13 @@ func (p *Producer) run(id uint) {
 		"status":    "registered",
 		"auth_data": string(authBytes),
 	})
+
+	// ARP 令牌是 Image 2 提交的必需头；缺字段的令牌会被 Adobe 当成伪造会话。
+	// 这里只提示，不改注册状态：账号本身可用，问题会由自检/下游暴露。
+	arpToken, _ := res.AuthJSON["arp_session_token"].(string)
+	if missing := adobereg.ARPMissingFields(arpToken); len(missing) > 0 {
+		p.appendLog(id, fmt.Sprintf("警告：ARP 会话令牌缺字段 %v（Image 2 生成会失败）", missing))
+	}
 
 	// 注册成功后立即用与下游一致的 cookie→token 交换自检：若被 Adobe 卡在
 	// ride 身份核验（换不到 token），账号下游不可用，自动标记为失效（不删号）。
@@ -605,7 +638,8 @@ func (p *Producer) runRescue(id uint) {
 			return p.waitManualCode(ctx, id)
 		},
 		ResetCodeBaseline: func() {
-			since = time.Now().Add(-15 * time.Second)
+			// 只认核验页打开这一刻之后到达的邮件，避免把注册阶段的旧码当核验码。
+			since = time.Now().Truncate(time.Second)
 		},
 		SaveShot: func(png []byte) {
 			p.db.Model(&models.AdobeRegistration{}).Where("id = ?", id).Update("shot", png)
@@ -761,18 +795,34 @@ func (p *Producer) acquireSlot(ctx context.Context, id uint) bool {
 
 // captchaSolver 按设置页的 2Captcha 配置返回打码器；未启用或没填 key 时返回 nil，
 // 此时弹图形验证仍按失败处理。
-func (p *Producer) captchaSolver(id uint) adobereg.CaptchaSolver {
+func (p *Producer) captchaSolver(id uint, proxy string) adobereg.CaptchaSolver {
 	if !p.SettingOn("captcha_enabled") {
 		return nil
 	}
-	key := strings.TrimSpace(p.Setting("captcha_2captcha_key"))
-	if key == "" {
-		return nil
+	logf := func(f string, a ...any) {
+		p.appendLog(id, fmt.Sprintf(f, a...))
 	}
-	return &captcha.TwoCaptcha{
-		Key: key,
-		Log: func(f string, a ...any) {
-			p.appendLog(id, fmt.Sprintf(f, a...))
-		},
+	captchaProxy := strings.TrimSpace(p.Setting("captcha_2captcha_proxy"))
+	if captchaProxy == "" {
+		captchaProxy = proxy
 	}
+	var yes adobereg.CaptchaSolver
+	if key := strings.TrimSpace(p.Setting("captcha_yescaptcha_key")); key != "" {
+		yes = &captcha.YesCaptcha{Key: key, Proxy: captchaProxy, Log: logf}
+	}
+	var two adobereg.CaptchaSolver
+	if key := strings.TrimSpace(p.Setting("captcha_2captcha_key")); key != "" {
+		two = &captcha.TwoCaptcha{Key: key, Proxy: captchaProxy, ProxyType: "HTTP", Log: logf}
+	}
+	// 用户要求优先 YesCaptcha；失败时自动回退 2Captcha + 公网代理。
+	if yes != nil && two != nil {
+		return &captchaFallback{primary: yes, secondary: two, logf: logf}
+	}
+	if yes != nil {
+		return yes
+	}
+	if two != nil {
+		return two
+	}
+	return nil
 }

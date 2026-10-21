@@ -214,6 +214,7 @@ ADDR=8080 ./chatgpt-register.exe
 
 - **自动流程**：打开 `account.adobe.com` → 创建账号（邮箱 + 随机密码）→ 填姓名/生日/地区 → 提交 → 打开 Firefly 触发邮箱验证码页 → 自动读取邮箱池验证码并填入。
 - **验证码自动读取**：复用现有邮箱池（同 Grok 自动模式），按发件人/主题/正文特征筛出 Adobe 邮件并提取 6 位码，每条记录独立记录所用邮箱。
+- **图形验证**：Adobe 建号提交时会弹 hCaptcha 或 Arkose FunCaptcha。启用打码后会自动识别：优先 2Captcha（需在设置里填一条公网可访问的「2Captcha 打码代理」，Arkose 工人需要它），也可填 YesCaptcha。Arkose 使用内层 game-core iframe 的 URL 作为 pageurl，返回的 token 以 Arkose 完成事件回送给页面；`UNSOLVABLE` 会自动重新提交。
 - **批量生产 / 单个注册 / 停止 / 日志 / 失败截图 / 删除**：与 Grok 页面一致。
 - **Cookie 导出（三选一，导出即出库）**：
   - **Cookie 字符串**：`k=v; k=v; ...`（单账号 `.txt`，多账号打包 `.zip`）

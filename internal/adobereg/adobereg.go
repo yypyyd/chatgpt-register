@@ -5,6 +5,7 @@ import (
 	cryptorand "crypto/rand"
 	"fmt"
 	"math/big"
+	"strings"
 )
 
 const userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
@@ -16,6 +17,8 @@ type Input struct {
 	LastName  string
 	Proxy     string
 	Headless  bool
+	// Engine 为 "browser" 时走旧的 Chromium 流程；默认（或 "protocol"）走纯协议。
+	Engine string
 
 	// EgressCheck 为 true 时先打开 api.ipify.org 打印 Chromium 实际出口 IP（排障用）。
 	// 默认关闭，省去每次注册前的一次整页加载。
@@ -34,9 +37,10 @@ type Input struct {
 	Captcha CaptchaSolver
 }
 
-// CaptchaSolver 解 hCaptcha 并返回 token（由打码服务实现，如 2Captcha）。
+// CaptchaSolver 解 hCaptcha / Arkose FunCaptcha 并返回 token（由打码服务实现，如 2Captcha）。
 type CaptchaSolver interface {
 	SolveHCaptcha(ctx context.Context, sitekey, pageURL, rqdata, userAgent string) (string, error)
+	SolveFunCaptcha(ctx context.Context, publicKey, pageURL, surl, userAgent string) (string, error)
 }
 
 type Result struct {
@@ -66,7 +70,10 @@ func Register(ctx context.Context, in Input) (*Result, error) {
 	if in.LastName == "" {
 		in.LastName = lastNames[ri(len(lastNames))]
 	}
-	return registerBrowser(ctx, in)
+	if strings.EqualFold(strings.TrimSpace(in.Engine), "browser") {
+		return registerBrowser(ctx, in)
+	}
+	return registerProtocol(ctx, in)
 }
 
 var firstNames = []string{"Alex", "Jamie", "Taylor", "Jordan", "Casey", "Morgan", "Riley", "Avery", "Quinn", "Parker", "Cameron", "Reese"}

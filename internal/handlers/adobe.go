@@ -329,6 +329,14 @@ func adobeCookies(authData string) []map[string]any {
 
 // adobeCookieString 拼成浏览器 Cookie 头字符串：k=v; k=v; ...
 func adobeCookieString(authData string) string {
+	var auth map[string]any
+	_ = json.Unmarshal([]byte(authData), &auth)
+	// Preserve an already stored Cookie header byte for byte.
+	for _, key := range []string{"cookie", "cookie_string"} {
+		if value, ok := auth[key].(string); ok && value != "" {
+			return value
+		}
+	}
 	var parts []string
 	for _, ck := range adobeCookies(authData) {
 		name, _ := ck["name"].(string)
@@ -346,28 +354,18 @@ func adobeExportObject(r models.AdobeRegistration) map[string]any {
 	var auth map[string]any
 	_ = json.Unmarshal([]byte(r.AuthData), &auth)
 
-	cookies := adobeCookies(r.AuthData)
-	cookieMap := map[string]string{}
-	for _, ck := range cookies {
-		name, _ := ck["name"].(string)
-		if strings.TrimSpace(name) == "" {
-			continue
+	token, _ := auth["arp_session_token"].(string)
+	if token == "" {
+		// Accept the original header name when it was stored directly.
+		for key, value := range auth {
+			if strings.EqualFold(key, "x-arp-session-id") {
+				token, _ = value.(string)
+				break
+			}
 		}
-		value, _ := ck["value"].(string)
-		cookieMap[name] = value
 	}
-	obj := map[string]any{
-		"email":         r.Email,
-		"product":       r.Product,
-		"cookie_string": adobeCookieString(r.AuthData),
-		"cookies_map":   cookieMap,
-		"cookies":       cookies,
+	return map[string]any{
+		"cookie":            adobeCookieString(r.AuthData),
+		"arp_session_token": token,
 	}
-	if v, ok := auth["captured_at"]; ok {
-		obj["captured_at"] = v
-	}
-	if v, ok := auth["storage"]; ok {
-		obj["storage"] = v
-	}
-	return obj
 }
