@@ -155,6 +155,23 @@ func main() {
 		api.GET("/leonardo/registrations/livecheck/status", h.LeonardoLiveCheckStatus)
 		api.POST("/leonardo/registrations/:id/livecheck", h.LeonardoLiveCheckOne)
 
+		api.GET("/lovart/registrations", h.LovartList)
+		api.DELETE("/lovart/registrations", h.LovartDeleteAll)
+		api.POST("/lovart/registrations", h.LovartStart)
+		api.POST("/lovart/produce", h.LovartProduce)
+		api.GET("/lovart/produce/status", h.LovartProduceStatus)
+		api.POST("/lovart/produce/stop", h.LovartProduceStop)
+		api.POST("/lovart/registrations/:id/code", h.LovartSubmitCode)
+		api.POST("/lovart/registrations/:id/stop", h.LovartStop)
+		api.DELETE("/lovart/registrations/:id", h.LovartDelete)
+		api.GET("/lovart/registrations/:id/logs", h.LovartLog)
+		api.GET("/lovart/registrations/:id/shot", h.LovartShot)
+		api.POST("/lovart/download", h.LovartDownload)
+
+		api.POST("/lovart/registrations/livecheck", h.LovartLiveCheckStart)
+		api.GET("/lovart/registrations/livecheck/status", h.LovartLiveCheckStatus)
+		api.POST("/lovart/registrations/:id/livecheck", h.LovartLiveCheckOne)
+
 	}
 
 	sub, err := fs.Sub(staticFS, "static")
@@ -163,7 +180,7 @@ func main() {
 	}
 	httpFS := http.FS(sub)
 	r.StaticFS("/static", httpFS)
-	for _, p := range []string{"login", "dashboard", "mailboxes", "accounts", "grok", "adobe", "leonardo", "settings"} {
+	for _, p := range []string{"login", "dashboard", "mailboxes", "accounts", "grok", "adobe", "leonardo", "lovart", "settings"} {
 		p := p
 		r.GET("/"+p, func(c *gin.Context) { c.FileFromFS(p+".html", httpFS) })
 	}

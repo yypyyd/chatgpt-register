@@ -22,6 +22,10 @@ type AdobeRegistration struct {
 	Alive          string     `gorm:"size:16;default:''" json:"alive"`
 	AliveCheckedAt *time.Time `json:"alive_checked_at,omitempty"`
 
+	// ARPFailed 保留旧数据库字段，表示账号已建好但会话需要恢复。
+	// 历史缺 ARP 的记录验证 Cookie 后即可恢复，不再补采或要求 ARP。
+	ARPFailed bool `gorm:"default:false" json:"arp_failed"`
+
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }

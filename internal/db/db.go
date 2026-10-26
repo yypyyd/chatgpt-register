@@ -31,7 +31,7 @@ func Init(path string) (*gorm.DB, error) {
 	sqlDB.SetMaxIdleConns(1)
 	sqlDB.SetConnMaxLifetime(time.Hour)
 	dropUnusedTables(db)
-	if err := db.AutoMigrate(&models.Registration{}, &models.GrokRegistration{}, &models.AdobeRegistration{}, &models.LeonardoRegistration{}, &models.Mailbox{}, &models.Setting{}, &models.Admin{}); err != nil {
+	if err := db.AutoMigrate(&models.Registration{}, &models.GrokRegistration{}, &models.AdobeRegistration{}, &models.LeonardoRegistration{}, &models.LovartRegistration{}, &models.Mailbox{}, &models.Setting{}, &models.Admin{}); err != nil {
 		return nil, err
 	}
 	if err := proxypool.Migrate(db); err != nil {
@@ -118,6 +118,7 @@ func reclaimOrphanRegistering(db *gorm.DB) {
 		{&models.GrokRegistration{}, "程序重启中断，可重新注册"},
 		{&models.AdobeRegistration{}, "程序重启中断，可重新注册"},
 		{&models.LeonardoRegistration{}, "程序重启中断，可重新注册"},
+		{&models.LovartRegistration{}, "程序重启中断，可重新注册"},
 	} {
 		db.Model(m.model).Where("status IN ?", orphanStatuses).
 			Updates(map[string]any{"status": "register_failed", "note": m.note})

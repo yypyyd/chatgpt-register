@@ -10,6 +10,7 @@
 <div class="layout">
   <main class="main">
     <h1 class="page-title">Adobe 注册</h1>
+    <p class="import-sub">注册端保存登录 Cookie；ARP 由生图端在使用时获取或刷新。测活仅检查登录有效性，模型权限和额度以 Adobe 为准。</p>
 
     <!-- 生产进度概览 -->
     <div class="produce-bar" id="produce-bar">
@@ -68,7 +69,7 @@
       <table class="px-table">
         <thead><tr>
           <th class="col-check"><input type="checkbox" id="adobe-check-all" onclick="toggleSelectAll(this.checked)"></th>
-          <th>邮箱</th><th>创建时间</th><th>状态</th><th>存活</th><th>出库状态</th><th>操作</th>
+          <th>邮箱</th><th>创建时间</th><th>状态</th><th>登录会话</th><th>出库状态</th><th>操作</th>
         </tr></thead>
         <tbody id="rows"></tbody>
       </table>
@@ -119,7 +120,7 @@
 </div>
 
 <div id="toast" class="toast" style="display:none"></div>
-<script src="/static/layout.js?v=8"></script>
-<script src="/static/adobe.js?v=3"></script>
+<script src="/static/layout.js?v=9"></script>
+<script src="/static/adobe.js?v=4"></script>
 </body>
 </html>

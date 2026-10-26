@@ -10,10 +10,9 @@ import (
 	"time"
 )
 
-// Adobe 测活口径与下游 image2api 完全一致：拿账号 Cookie 去 IMS
-// check/v6/token 端点做真正的 cookie→token 交换。能换出 access_token 才算"有效"，
-// 因为下游图片生成正是靠这一步拿 token；只能登录 account.adobe.com 但换不到 token
-// 的账号（例如被 Adobe 卡在 ride 身份二次核验）下游同样不可用，判为失效。
+// Adobe 测活拿账号 Cookie 去 IMS check/v6/token 做真正的 token 交换。
+// 能换出 access_token 才算登录有效；这不代表模型权限、额度或 ARP 可用。
+// 被 Adobe 明确拒绝的登录会话（如需 ride 身份核验）判为失效。
 const (
 	adobeTokenURL  = "https://adobeid-na1.services.adobe.com/ims/check/v6/token?jslVersion=v2-v0.48.0-1-g1e322cb"
 	adobeClientID  = "clio-playground-web"
@@ -40,7 +39,7 @@ type AdobeItem struct {
 	Proxy   string
 }
 
-// CheckAdobe 批量测活 Adobe 账号：对每个账号用其 Cookie 做 cookie→token 交换。
+// CheckAdobe 批量检查 Cookie 登录有效性；不验证模型权限、额度或生图能力。
 //
 //	换出 access_token（HTTP 200）                 -> alive
 //	被上游明确拒绝（400/401/403，如 ride 核验）    -> dead

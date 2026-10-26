@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -61,7 +62,6 @@ const (
 	adobeIMSBase        = "https://ims-na1.adobelogin.com"
 	adobeIDPBase        = "https://adobeid-na1.services.adobe.com"
 	adobeSignupArkosePK = "436DD567-5435-4B14-89A6-2F1188E11334"
-	adobeSigninArkosePK = "430FF2C3-1AB1-40B7-8BE7-44FC683FE02C"
 
 	// account.adobe.com 登录页向 IMS 申请的完整 scope（抓包核对）。
 	adobeAuthScope = "AdobeID,openid,acct_mgmt_api,gnav,read_countries_regions,social.link,unlink_social_account," +
@@ -407,14 +407,20 @@ func (c *adobeProtocolClient) createSignupState(ctx context.Context) error {
 }
 
 func (c *adobeProtocolClient) solveSignupCaptcha(ctx context.Context) (string, error) {
+	return c.solveArkoseCaptcha(ctx, adobeSignupArkosePK, "注册")
+}
+
+// solveArkoseCaptcha 用打码服务解开 authenticationstate 下发的 Arkose 挑战。
+// 注册用 signup 的 public key，已有账号登录用 signin 的 public key，不能混用。
+func (c *adobeProtocolClient) solveArkoseCaptcha(ctx context.Context, publicKey, stage string) (string, error) {
 	if strings.TrimSpace(c.captchaBlob) == "" {
 		return "", nil
 	}
 	if c.in.Captcha == nil {
 		return "", fmt.Errorf("Adobe 要求图形验证，但未配置打码服务")
 	}
-	c.in.logf("Adobe 注册需要 Arkose，提交打码")
-	token, err := c.in.Captcha.SolveFunCaptcha(ctx, adobeSignupArkosePK, c.deeplink, "https://arks-client.adobe.com", c.ua)
+	c.in.logf("Adobe %s需要 Arkose，提交打码", stage)
+	token, err := c.in.Captcha.SolveFunCaptcha(ctx, publicKey, c.deeplink, "https://arks-client.adobe.com", c.ua)
 	if err != nil {
 		return "", fmt.Errorf("Adobe Arkose 打码失败: %w", err)
 	}
@@ -488,10 +494,11 @@ func (c *adobeProtocolClient) passwordLogin(ctx context.Context) (string, error)
 		"username": c.in.Email, "usernameType": "EMAIL", "password": c.in.Password,
 		"accountType": "individual", "rememberMe": false,
 	}
-	r, err := c.postJSON(ctx, "/signin/v2/tokens?credential=password", body, map[string]string{
+	extra := map[string]string{
 		"x-identity-verification-token":        c.ivt,
 		"x-ims-authentication-state-encrypted": c.authState,
-	})
+	}
+	r, err := c.postJSON(ctx, "/signin/v2/tokens?credential=password", body, extra)
 	if err != nil {
 		return "", fmt.Errorf("Adobe 密码登录失败: %w", err)
 	}
@@ -518,13 +525,31 @@ func (c *adobeProtocolClient) passwordLogin(ctx context.Context) (string, error)
 
 var errAdobeChallengeRequired = fmt.Errorf("Adobe 要求二次验证")
 
+// loginWithSignupState 建号后立刻用同一份 signUp auth state 做密码登录
+// （Adobe 此时不会再要求邮箱验证码），要求二次验证时先过邮箱挑战再重试。
+func (c *adobeProtocolClient) loginWithSignupState(ctx context.Context) (string, error) {
+	susi, err := c.passwordLogin(ctx)
+	if err == nil {
+		return susi, nil
+	}
+	if !strings.Contains(err.Error(), errAdobeChallengeRequired.Error()) {
+		return "", err
+	}
+	return c.passwordLoginWithOTP(ctx)
+}
+
 // verifyEmailChallenge 走一次邮箱验证码 challenge，把新账号的邮箱标记为已验证。
 // 建号后的密码会话仍然有效，验证完成后不需要再换 token。
+//
+// 注意：Adobe 对新建的 purpose=multiFactorAuthentication 登录态经常直接回
+// SERVICE_ERROR（"Failed to call init authentication flow"）。此时改用上一次
+// 请求带回来的 authState 继续做 challenge，成功率高得多。
 func (c *adobeProtocolClient) verifyEmailChallenge(ctx context.Context) error {
 	if c.in.WaitCode == nil {
 		return errAdobeChallengeRequired
 	}
 	c.in.logf("Adobe 邮箱验证：发送验证码并自动提交")
+	carried := c.authState
 	lsID := uuid.NewString()
 	body := map[string]any{
 		"extraPbaChecks": false, "pbaPolicy": nil,
@@ -538,19 +563,28 @@ func (c *adobeProtocolClient) verifyEmailChallenge(ctx context.Context) error {
 		return err
 	}
 	if r.Status != 201 {
-		return fmt.Errorf("Adobe 创建登录态 HTTP %d: %s", r.Status, trimAdobe(r.text(), 300))
+		if carried == "" {
+			return fmt.Errorf("Adobe 创建登录态 HTTP %d: %s", r.Status, trimAdobe(r.text(), 300))
+		}
+		c.in.logf("Adobe 新建 MFA 登录态被拒（HTTP %d），改用当前会话的登录态继续", r.Status)
+		c.authState = carried
 	}
 	if c.authState == "" {
 		return fmt.Errorf("Adobe 登录态缺少加密头")
 	}
-	auth := c.authState
+	return c.emailChallenge(ctx, c.authState)
+}
+
+// emailChallenge 用给定的加密登录态发起邮箱验证码 challenge：先请求发送验证码，
+// 再读取邮箱 6 位码并用 PUT 提交。成功后 authState 保持为这份登录态。
+func (c *adobeProtocolClient) emailChallenge(ctx context.Context, auth string) error {
 	ivt := c.ivt
 	if _, err := c.postJSON(ctx, "/signin/v3/challenges?purpose=multiFactorAuthentication", map[string]any{}, map[string]string{
 		"x-ims-authentication-state-encrypted": auth, "x-identity-verification-token": ivt,
 	}); err != nil {
 		return err
 	}
-	r, err = c.postJSON(ctx, "/signin/v3/challenges?purpose=multiFactorAuthentication&factor=email&extendedAuthState=false", map[string]any{}, map[string]string{
+	r, err := c.postJSON(ctx, "/signin/v3/challenges?purpose=multiFactorAuthentication&factor=email&extendedAuthState=false", map[string]any{}, map[string]string{
 		"x-ims-authentication-state-encrypted": auth, "x-identity-verification-token": ivt,
 	})
 	if err != nil {
@@ -573,7 +607,9 @@ func (c *adobeProtocolClient) verifyEmailChallenge(ctx context.Context) error {
 	if r.Status != 200 {
 		return fmt.Errorf("Adobe 验证码校验 HTTP %d: %s", r.Status, trimAdobe(r.text(), 300))
 	}
-	c.authState = auth
+	// 注意：不要在这里把 c.authState 写回旧的 auth。PUT 的响应头会让
+	// do() 更新成“已通过 MFA”的新状态，写回旧状态会让后面的密码登录重试
+	// 继续被判 challenge_required（“Adobe 要求二次验证”）。
 	return nil
 }
 
@@ -719,15 +755,14 @@ func (c *adobeProtocolClient) cookieList() []map[string]any {
 
 func (c *adobeProtocolClient) authJSON() map[string]any {
 	return map[string]any{
-		"auth_mode":         "adobe_protocol_session",
-		"platform":          "adobe",
-		"product":           "firefly",
-		"email":             c.in.Email,
-		"first_name":        c.in.FirstName,
-		"last_name":         c.in.LastName,
-		"captured_at":       time.Now().UTC().Format(time.RFC3339),
-		"arp_session_token": "",
-		"cookies":           c.cookieList(),
+		"auth_mode":   "adobe_protocol_session",
+		"platform":    "adobe",
+		"product":     "firefly",
+		"email":       c.in.Email,
+		"first_name":  c.in.FirstName,
+		"last_name":   c.in.LastName,
+		"captured_at": time.Now().UTC().Format(time.RFC3339),
+		"cookies":     c.cookieList(),
 		"storage": map[string]any{
 			"localStorage":   map[string]any{},
 			"sessionStorage": map[string]any{},
@@ -735,6 +770,11 @@ func (c *adobeProtocolClient) authJSON() map[string]any {
 		},
 	}
 }
+
+// ErrSessionLanding 表示 Adobe 账号已经创建成功，但会话（ims_sid）没落地。
+// 上层应把这条记录标成“账号已建好、待补采会话”，重试时用保存的密码登录
+// 复用账号，而不是重新建号（重试建号只会得到 account_exists）。
+var ErrSessionLanding = errors.New("Adobe 账号已创建但会话落地失败")
 
 // registerProtocol 用纯 HTTP 完成 Adobe 注册、密码登录和 IMS 会话落地。
 func registerProtocol(ctx context.Context, in Input) (*Result, error) {
@@ -770,14 +810,9 @@ func registerProtocol(ctx context.Context, in Input) (*Result, error) {
 	if err := c.createAccount(ctx, captchaToken); err != nil {
 		return nil, err
 	}
-	susi, err := c.passwordLogin(ctx)
+	susi, err := c.loginWithSignupState(ctx)
 	if err != nil {
-		if strings.Contains(err.Error(), errAdobeChallengeRequired.Error()) {
-			susi, err = c.passwordLoginWithOTP(ctx)
-		}
-		if err != nil {
-			return nil, err
-		}
+		return nil, err
 	}
 	// 刚建的账号密码登录会成功，但邮箱还没有完成验证；主动走一次邮箱验证码
 	// challenge，否则下游 cookie→token 会命中 ride_AdobeID_acct_evs。
@@ -810,27 +845,25 @@ func registerProtocol(ctx context.Context, in Input) (*Result, error) {
 					}
 				}
 			}
-			return nil, fmt.Errorf("Adobe 登录会话落地失败: %v（SUSI 重试: %v）", err, err2)
+			// 账号已经建出来了，只是落不了 ims_sid。用哨兵错误让上层知道
+			// 这是“可复用账号”，重试时应该登录补采而不是回到新建流程。
+			return nil, fmt.Errorf("%w: %v（SUSI 重试: %v）", ErrSessionLanding, err, err2)
 		}
 	}
 sessionReady:
 	c.fireflySession(ctx)
 	if !c.hasIMSSID() {
-		return nil, fmt.Errorf("Adobe 账号已创建，但未拿到 ims_sid 会话 Cookie")
+		return nil, fmt.Errorf("%w: 未拿到 ims_sid 会话 Cookie", ErrSessionLanding)
 	}
 
-	// 协议链路只能拿到登录 Cookie，拿不到 Image 2 需要的 x-arp-session-id：
-	// 该令牌由 Firefly 前端的 SherlockSdk 现场生成（含 arkose / 浏览器指纹字段），
-	// 纯 HTTP 产不出。旧令牌或伪造的 sid+ftr 会被 Adobe 以伪装的 408 拒绝，
-	// 所以注册末尾必须补一次浏览器采集，拿一个刚生成的新令牌。
+	// 注册只保存登录 Cookie。保留邮箱身份核验，ARP 由下游在实际生图时刷新。
 	auth := c.authJSON()
-	enriched, arpErr := CaptureARPSession(ctx, c.in, auth)
-	if arpErr != nil {
-		c.in.logf("ARP 会话令牌采集失败，账号无生成能力（下游 Image 2 不可用）: %v", arpErr)
-		auth["arp_error"] = arpErr.Error()
+	verified, verifyErr := RestoreSession(ctx, c.in, auth)
+	if verifyErr != nil {
+		c.in.logf("Cookie 会话验证未完成，保留会话并由测活记录状态: %v", verifyErr)
 		return &Result{AuthJSON: auth}, nil
 	}
-	return &Result{AuthJSON: enriched}, nil
+	return &Result{AuthJSON: verified}, nil
 }
 
 func trimAdobe(s string, n int) string {

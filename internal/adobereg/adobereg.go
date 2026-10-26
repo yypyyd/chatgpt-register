@@ -53,7 +53,7 @@ func (in Input) logf(format string, a ...any) {
 	}
 }
 
-// Register 走 Adobe 账号注册流程（免费 Firefly：注册即得免费生图/生视频额度）。
+// Register 完成 Adobe 账号注册并保存登录 Cookie；模型权限和额度由 Adobe 决定。
 func Register(ctx context.Context, in Input) (*Result, error) {
 	if in.WaitCode == nil {
 		return nil, fmt.Errorf("缺少验证码回调")

@@ -67,10 +67,6 @@ func (h *Handler) AdobeStart(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if h.Browser == nil || !h.Browser.Ready() {
-		c.JSON(http.StatusConflict, gin.H{"error": "缺少浏览器，无法注册：浏览器正在下载或下载失败"})
-		return
-	}
 	reg, err := h.AdobeProducer.Start(in.Email, in.Note)
 	if err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
@@ -83,10 +79,6 @@ func (h *Handler) AdobeProduce(c *gin.Context) {
 	var in adobeProduceInput
 	if err := c.ShouldBindJSON(&in); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	if h.Browser == nil || !h.Browser.Ready() {
-		c.JSON(http.StatusConflict, gin.H{"error": "缺少浏览器，无法注册：浏览器正在下载或下载失败"})
 		return
 	}
 	regs, err := h.AdobeProducer.StartFromAccounts(in.Count)
@@ -350,22 +342,24 @@ func adobeCookieString(authData string) string {
 }
 
 // adobeExportObject 构造单个 Adobe 账号的导出对象（Cookie JSON 对象 / 数组元素）。
+//
+// 只导出登录 Cookie 和 ims_sid。ARP / Sherlock 令牌由下游在生成时刷新，
+// 不再把注册时保存的旧令牌通过别名传给下游。
 func adobeExportObject(r models.AdobeRegistration) map[string]any {
-	var auth map[string]any
-	_ = json.Unmarshal([]byte(r.AuthData), &auth)
+	cookie := adobeCookieString(r.AuthData)
+	return map[string]any{
+		"email":   r.Email,
+		"cookie":  cookie,
+		"ims_sid": adobeCookieValue(cookie, "ims_sid"),
+	}
+}
 
-	token, _ := auth["arp_session_token"].(string)
-	if token == "" {
-		// Accept the original header name when it was stored directly.
-		for key, value := range auth {
-			if strings.EqualFold(key, "x-arp-session-id") {
-				token, _ = value.(string)
-				break
-			}
+func adobeCookieValue(cookie, name string) string {
+	for _, part := range strings.Split(cookie, ";") {
+		pair := strings.SplitN(strings.TrimSpace(part), "=", 2)
+		if len(pair) == 2 && strings.EqualFold(strings.TrimSpace(pair[0]), name) {
+			return strings.TrimSpace(pair[1])
 		}
 	}
-	return map[string]any{
-		"cookie":            adobeCookieString(r.AuthData),
-		"arp_session_token": token,
-	}
+	return ""
 }

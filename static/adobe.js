@@ -38,7 +38,7 @@ function rowHtml(x) {
       <td class="col-check"><input type="checkbox" ${adobeSelected.has(x.id) ? 'checked' : ''} onclick="toggleSelect(${x.id}, this.checked)"></td>
       <td>${esc(x.email)}</td>
       <td>${fmtTime(x.created_at)}</td>
-      <td><span class="badge ${x.status === 'account_exists' ? 'pending' : esc(x.status)}">${ADOBE_STATUS[x.status] || esc(x.status)}</span></td>
+      <td><span class="badge ${x.status === 'account_exists' ? 'pending' : esc(x.status)}" title="${esc(x.note || '')}">${ADOBE_STATUS[x.status] || esc(x.status)}</span>${x.arp_failed ? ' <span class="badge pending" title="账号已建好，需检查或恢复 Cookie 登录会话">待恢复会话</span>' : ''}</td>
       <td>${aliveCell(x)}</td>
       <td class="ship-cell"><span class="badge ${x.shipped ? 'registered' : 'pending'}" title="导出后自动标记，不能手动修改">${x.shipped ? '已出库' : '未出库'}</span></td>
       <td>
@@ -71,22 +71,7 @@ async function loadProduce() {
   } catch (e) { /* ignore */ }
 }
 
-/* 浏览器就绪状态：未就绪禁用生产 */
-let browserReady = true;
-async function loadBrowserGate() {
-  try {
-    const s = await (await api('/api/browser/status')).json();
-    browserReady = !!s.ready;
-    const btn = document.getElementById('produce-btn');
-    if (btn) {
-      btn.disabled = !browserReady;
-      btn.title = browserReady ? '' : (s.message || '缺少浏览器');
-    }
-  } catch (e) { /* ignore */ }
-}
-
 function openProduceModal() {
-  if (!browserReady) return toast('缺少浏览器，正在下载或下载失败，暂不能生产', true);
   document.getElementById('produce-count').value = 10;
   document.getElementById('produce-modal').style.display = 'flex';
 }
@@ -251,12 +236,12 @@ function closeShot() {
 
 /* ===== 测活（手动，仅点击触发；只标状态不删号；unknown 不判死） ===== */
 const LIVE_BASE = '/api/adobe/registrations';
-const ALIVE_LABEL = { alive: '有效', dead: '失效', unknown: '未知' };
+const ALIVE_LABEL = { alive: '登录有效', dead: '登录失效', unknown: '未知' };
 let liveTimer = null;
 function aliveCell(x) {
   if (!x.alive) return '<span class="badge pending" title="尚未测活">未测</span>';
   const cls = x.alive === 'alive' ? 'registered' : (x.alive === 'dead' ? 'register_failed' : 'pending');
-  const t = x.alive_checked_at ? '最近检测: ' + fmtTime(x.alive_checked_at) : '';
+  const t = '仅验证 Cookie 登录；模型权限和额度由 Adobe 决定。' + (x.alive_checked_at ? '最近检测: ' + fmtTime(x.alive_checked_at) : '');
   return `<span class="badge ${cls}" title="${t}">${ALIVE_LABEL[x.alive] || esc(x.alive)}</span>`;
 }
 async function liveCheckOne(id) {
@@ -342,8 +327,6 @@ document.getElementById('filter-status').addEventListener('change', () => { page
 
 load();
 loadProduce();
-loadBrowserGate();
 pollLive();
 setInterval(load, 3000);
 setInterval(loadProduce, 2000);
-setInterval(loadBrowserGate, 2500);

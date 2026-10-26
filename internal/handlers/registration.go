@@ -10,6 +10,7 @@ import (
 	"chatgpt-register/internal/chatgptauth"
 	"chatgpt-register/internal/grokproducer"
 	"chatgpt-register/internal/leonardoproducer"
+	"chatgpt-register/internal/lovartproducer"
 	"chatgpt-register/internal/mailfetch"
 	"chatgpt-register/internal/mailverify"
 	"chatgpt-register/internal/models"
@@ -28,6 +29,7 @@ type Handler struct {
 	GrokProducer     *grokproducer.Producer
 	AdobeProducer    *adobeproducer.Producer
 	LeonardoProducer *leonardoproducer.Producer
+	LovartProducer   *lovartproducer.Producer
 	Browser          *browserboot.Manager
 	MailboxVerifier  *mailverify.Service
 	GPTCredentials   *chatgptauth.Service
@@ -43,7 +45,7 @@ func New(db *gorm.DB, authSvc *auth.Service, browser *browserboot.Manager) (*Han
 		return nil, err
 	}
 	proxies := proxypool.New(db)
-	h := &Handler{DB: db, Mail: mail, Auth: authSvc, Producer: producer.New(db, mail, proxies), GrokProducer: grokproducer.New(db, mail, proxies), AdobeProducer: adobeproducer.New(db, mail, proxies), LeonardoProducer: leonardoproducer.New(db, mail, proxies), Browser: browser, MailboxVerifier: verifier, Live: newLiveRunners(), GPTCredentials: chatgptauth.New(db), Proxies: proxies}
+	h := &Handler{DB: db, Mail: mail, Auth: authSvc, Producer: producer.New(db, mail, proxies), GrokProducer: grokproducer.New(db, mail, proxies), AdobeProducer: adobeproducer.New(db, mail, proxies), LeonardoProducer: leonardoproducer.New(db, mail, proxies), LovartProducer: lovartproducer.New(db, mail, proxies), Browser: browser, MailboxVerifier: verifier, Live: newLiveRunners(), GPTCredentials: chatgptauth.New(db), Proxies: proxies}
 	h.startGPTCredentialMigration()
 	return h, nil
 }

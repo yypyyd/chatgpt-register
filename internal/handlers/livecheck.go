@@ -40,6 +40,7 @@ func newLiveRunners() map[string]*liveRunner {
 		"grok":     {},
 		"adobe":    {},
 		"leonardo": {},
+		"lovart":   {},
 	}
 }
 
@@ -388,6 +389,12 @@ func (h *Handler) applyAdobeAlive(id uint, st string) time.Time {
 	now := time.Now()
 	h.DB.Model(&models.AdobeRegistration{}).Where("id = ?", id).
 		Updates(map[string]any{"alive": st, "alive_checked_at": now})
+	// 旧版仅因 ARP 失败挡住的库存，必须经真实 Cookie 验证通过后才能恢复。
+	if st == livecheck.StatusAlive {
+		h.DB.Model(&models.AdobeRegistration{}).
+			Where("id = ? AND arp_failed = ? AND status IN ? AND auth_data <> ''", id, true, []string{"register_failed", "account_exists"}).
+			Updates(map[string]any{"status": "registered", "arp_failed": false, "note": "Cookie 登录已验证，生图会话由下游维护"})
+	}
 	return now
 }
 

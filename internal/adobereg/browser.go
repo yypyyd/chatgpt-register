@@ -234,12 +234,12 @@ func registerBrowser(ctx context.Context, in Input) (res *Result, err error) {
 	in.logf("账号创建完成，检查换 token 状态")
 	probed := false
 	if cookie := cookieHeaderFromPage(page); cookie != "" {
-		switch jump, perr := adobeRideJump(ctx, cookie); {
+		switch jump, perr := adobeRideJump(ctx, cookie, in.Proxy); {
 		case perr != nil:
 			in.logf("检查换 token 状态失败（稍后重试）: %v", perr)
 		case jump == "":
 			probed = true
-			in.logf("cookie→token 交换成功，账号下游可用")
+			in.logf("cookie→token 交换成功，登录会话有效")
 		default:
 			probed = true
 			if verr := rideVerify(ctx, page, in, jump); verr != nil {
@@ -255,12 +255,7 @@ func registerBrowser(ctx context.Context, in Input) (res *Result, err error) {
 	if err = handleEmailVerification(ctx, page, in); err != nil {
 		return nil, err
 	}
-	// 会话无论 Firefly 是否按预期跳转都会照常采集，这里不必久等：超时也直接进入
-	// 采集，避免账号建成后白等。
-	if err = waitFireflyReady(ctx, page, in, 15*time.Second); err != nil {
-		in.logf("等待 Firefly 就绪超时（账号已创建），继续采集会话: %v", err)
-	}
-
+	// 登录 Cookie 的保存不依赖 Firefly 编辑器或 ARP SDK 就绪。
 	auth, cerr := captureAuth(page, in)
 	if cerr != nil {
 		return nil, cerr
@@ -295,13 +290,13 @@ func passAdobeRide(ctx context.Context, page *rod.Page, in Input, auth map[strin
 	if cookie == "" {
 		return auth, false
 	}
-	jump, err := adobeRideJump(ctx, cookie)
+	jump, err := adobeRideJump(ctx, cookie, in.Proxy)
 	if err != nil {
 		in.logf("检查换 token 状态失败（不影响注册结果）: %v", err)
 		return auth, false
 	}
 	if jump == "" {
-		in.logf("cookie→token 交换成功，账号下游可用")
+		in.logf("cookie→token 交换成功，登录会话有效")
 		return auth, false
 	}
 	if err := rideVerify(ctx, page, in, jump); err != nil {
@@ -311,15 +306,14 @@ func passAdobeRide(ctx context.Context, page *rod.Page, in Input, auth map[strin
 	if err := gotoStable(ctx, page, fireflyURL, in, 60*time.Second); err != nil {
 		in.logf("核验后打开 Firefly 异常: %v", err)
 	}
-	_ = waitFireflyReady(ctx, page, in, 20*time.Second)
 	newAuth, err := captureAuth(page, in)
 	if err != nil {
 		in.logf("核验后重新采集会话失败: %v", err)
 		return auth, false
 	}
 	// 复验一次确认现在能换到 token。
-	if jump2, e := adobeRideJump(ctx, cookieHeaderFromAuth(newAuth)); e == nil && jump2 == "" {
-		in.logf("身份核验已通过，账号下游可用")
+	if jump2, e := adobeRideJump(ctx, cookieHeaderFromAuth(newAuth), in.Proxy); e == nil && jump2 == "" {
+		in.logf("身份核验已通过，登录会话有效")
 	} else {
 		in.logf("身份核验后仍未能换到 token，可能需人工处理")
 	}
@@ -406,8 +400,7 @@ func RescueRide(ctx context.Context, in Input, cookies []map[string]any) (res *R
 	if err := gotoStable(ctx, page, fireflyURL, in, 90*time.Second); err != nil {
 		in.logf("打开 Firefly 异常（继续尝试过核验）: %v", err)
 	}
-	// 等 Firefly 应用真正挂载后再采集，否则 ARP/Sherlock 还没初始化。
-	_ = waitFireflyReady(ctx, page, in, 20*time.Second)
+	// 恢复登录只需要 Cookie，无需等待编辑器或采集 ARP。
 	auth, cerr := captureAuth(page, in)
 	if cerr != nil {
 		return nil, cerr
@@ -476,10 +469,7 @@ func cookieHeaderFromPage(page *rod.Page) string {
 
 // cookieHeaderFromAuth 把 captureAuth 产出的 cookies 拼成 HTTP Cookie 请求头。
 func cookieHeaderFromAuth(auth map[string]any) string {
-	list, ok := auth["cookies"].([]map[string]any)
-	if !ok {
-		return ""
-	}
+	list := cookiesFromAuthMap(auth)
 	parts := make([]string, 0, len(list))
 	for _, ck := range list {
 		name, _ := ck["name"].(string)
@@ -492,9 +482,9 @@ func cookieHeaderFromAuth(auth map[string]any) string {
 	return strings.Join(parts, "; ")
 }
 
-// adobeRideJump 做一次 cookie→token 交换：换到 token 返回空串（下游可用）；被 ride
+// adobeRideJump 做一次 cookie→token 交换：换到 token 返回空串（登录会话有效）；被 ride
 // 身份核验拦住则返回跳转核验页的 URL；其它错误返回 err（调用方按不阻断处理）。
-func adobeRideJump(ctx context.Context, cookie string) (string, error) {
+func adobeRideJump(ctx context.Context, cookie, proxy string) (string, error) {
 	body := "client_id=" + adobeClientID + "&guest_allowed=true&scope=" + url.QueryEscape(adobeScope)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, adobeTokenURL, strings.NewReader(body))
 	if err != nil {
@@ -505,21 +495,23 @@ func adobeRideJump(ctx context.Context, cookie string) (string, error) {
 	req.Header.Set("referer", "https://firefly.adobe.com/")
 	req.Header.Set("cookie", cookie)
 	req.Header.Set("user-agent", userAgent)
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := httpClientWithProxy(proxy)
+	client.Timeout = 30 * time.Second
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode == http.StatusOK {
-		return "", nil
-	}
 	var payload struct {
-		Error string `json:"error"`
-		Jump  string `json:"jump"`
+		Error       string `json:"error"`
+		Jump        string `json:"jump"`
+		AccessToken string `json:"access_token"`
 	}
 	_ = json.Unmarshal(raw, &payload)
+	if resp.StatusCode == http.StatusOK && strings.TrimSpace(payload.AccessToken) != "" {
+		return "", nil
+	}
 	if payload.Jump != "" {
 		return payload.Jump, nil
 	}
@@ -1170,13 +1162,21 @@ func waitFireflyReady(ctx context.Context, page *rod.Page, in Input, timeout tim
 			time.Sleep(1 * time.Second)
 			continue
 		}
-		if strings.Contains(u, "firefly.adobe.com") || strings.Contains(u, "account.adobe.com") {
-			in.logf("Firefly/Adobe 会话就绪: %s", trimText(u, 120))
-			return nil
+		if strings.Contains(u, "firefly.adobe.com") {
+			ready, err := page.Timeout(3 * time.Second).Eval(`() => {
+				try {
+					return !!sessionStorage.getItem('riskSessionId') &&
+						!!(window.SherlockSdk && typeof window.SherlockSdk.Sherlock === 'function');
+				} catch (_) { return false; }
+			}`)
+			if err == nil && ready.Value.Bool() {
+				in.logf("Firefly 编辑器与 ARP SDK 已就绪: %s", trimText(u, 120))
+				return nil
+			}
 		}
 		time.Sleep(300 * time.Millisecond)
 	}
-	return fmt.Errorf("等待 Firefly 就绪超时")
+	return fmt.Errorf("等待 Firefly 编辑器与 ARP SDK 就绪超时，当前页面: %s", trimText(pageURL(page), 160))
 }
 
 // captureArpSessionToken 取 Firefly 的 x-arp-session-id。
@@ -1286,26 +1286,27 @@ func captureAuth(page *rod.Page, in Input) (map[string]any, error) {
 		})
 	}
 
-	storageRaw := page.MustEval(`() => JSON.stringify({
-		localStorage: Object.fromEntries(Object.entries(localStorage)),
-		sessionStorage: Object.fromEntries(Object.entries(sessionStorage)),
-		location: location.href
-	})`).String()
+	storageRaw := page.MustEval(`() => {
+		const read = (storage) => { try { return Object.fromEntries(Object.entries(storage)); } catch (_) { return {}; } };
+		return JSON.stringify({
+			localStorage: read(window.localStorage),
+			sessionStorage: read(window.sessionStorage),
+			location: location.href
+		});
+	}`).String()
 	var storage map[string]any
 	_ = json.Unmarshal([]byte(storageRaw), &storage)
 
-	arpToken := captureArpSessionToken(page, in)
 	return map[string]any{
-		"auth_mode":         "adobe_browser_session",
-		"platform":          "adobe",
-		"product":           "firefly",
-		"email":             in.Email,
-		"first_name":        in.FirstName,
-		"last_name":         in.LastName,
-		"captured_at":       time.Now().UTC().Format(time.RFC3339),
-		"arp_session_token": arpToken,
-		"cookies":           cookieList,
-		"storage":           storage,
+		"auth_mode":   "adobe_browser_session",
+		"platform":    "adobe",
+		"product":     "firefly",
+		"email":       in.Email,
+		"first_name":  in.FirstName,
+		"last_name":   in.LastName,
+		"captured_at": time.Now().UTC().Format(time.RFC3339),
+		"cookies":     cookieList,
+		"storage":     storage,
 	}, nil
 }
 

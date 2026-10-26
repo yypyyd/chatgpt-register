@@ -102,18 +102,21 @@ chatgpt-register/
 │   │   └── codexreg.go      # 注册任务入口（只走协议引擎）
 │   ├── adobereg/            # Adobe(Firefly) 注册核心逻辑（独立浏览器自动化）
 │   ├── adobeproducer/       # Adobe 批量注册调度器（复用邮箱池自动取码）
+│   ├── lovartreg/           # Lovart 纯协议注册（Turnstile + 邮箱验证码，无浏览器）
+│   ├── lovartproducer/      # Lovart 批量注册调度器（复用邮箱池自动取码）
 │   ├── db/                  # SQLite 数据库初始化（纯 Go 驱动，无需 CGO）
 │   ├── emailalias/          # 邮箱别名生成（裂变子号）
 │   ├── handlers/            # HTTP 接口层（Gin Handler）
 │   │   ├── auth.go          # 登录 / 改密接口
 │   │   ├── registration.go  # 账户 CRUD + 日志 + 截图接口
 │   │   ├── adobe.go         # Adobe 注册 CRUD + 生产 + 三种 Cookie 导出
+│   │   ├── lovart.go        # Lovart 注册 CRUD + 生产 + 三种导出 + 测活
 │   │   ├── produce.go       # 批量生产控制（启动 / 状态 / 停止）
 │   │   ├── mailbox.go       # 邮箱 CRUD + 取件接口
 │   │   ├── proxy.go         # 代理测试接口
 │   │   └── settings.go      # 系统设置接口
 │   ├── mailfetch/           # 邮件取件（自动读取验证码）
-│   ├── models/              # GORM 数据模型（Admin / Registration / GrokRegistration / AdobeRegistration / Mailbox / Setting）
+│   ├── models/              # GORM 数据模型（Admin / Registration / Grok / Adobe / Leonardo / Lovart / Mailbox / Setting）
 │   └── producer/            # 批量注册调度器（并发控制 + 裂变策略）
 └── static/                  # 前端静态页面（嵌入二进制，无需 Web 服务器）
     ├── dashboard.html        # 仪表盘
@@ -121,6 +124,7 @@ chatgpt-register/
     ├── mailboxes.html/js     # 邮箱管理
     ├── settings.html         # 系统设置
     ├── adobe.html/js         # Adobe(Firefly) 注册管理
+    ├── lovart.html/js        # Lovart 注册管理
     ├── login.html            # 登录页
     ├── layout.js             # 公共布局 / 侧边栏
     └── style.css             # 毛玻璃主题 CSS（35KB 精心打磨）
@@ -212,16 +216,33 @@ ADDR=8080 ./chatgpt-register.exe
 
 与 ChatGPT / Grok 注册完全分开，独立页面「Adobe 注册」、独立数据表 `adobe_registrations`、独立路由 `/api/adobe/*`，注册目标为 Adobe 账号（免费即可用 Firefly 免费额度）。
 
-- **自动流程**：打开 `account.adobe.com` → 创建账号（邮箱 + 随机密码）→ 填姓名/生日/地区 → 提交 → 打开 Firefly 触发邮箱验证码页 → 自动读取邮箱池验证码并填入。
+- **自动流程**：默认通过协议创建账号、密码登录、验证邮箱并保存 IMS Cookie；仅在需要补做邮箱身份核验时恢复浏览器，不采集 ARP。
 - **验证码自动读取**：复用现有邮箱池（同 Grok 自动模式），按发件人/主题/正文特征筛出 Adobe 邮件并提取 6 位码，每条记录独立记录所用邮箱。
 - **图形验证**：Adobe 建号提交时会弹 hCaptcha 或 Arkose FunCaptcha。启用打码后会自动识别：优先 2Captcha（需在设置里填一条公网可访问的「2Captcha 打码代理」，Arkose 工人需要它），也可填 YesCaptcha。Arkose 使用内层 game-core iframe 的 URL 作为 pageurl，返回的 token 以 Arkose 完成事件回送给页面；`UNSOLVABLE` 会自动重新提交。
 - **批量生产 / 单个注册 / 停止 / 日志 / 失败截图 / 删除**：与 Grok 页面一致。
+- **登录会话与生图会话**：注册端只保存 Cookie，通过 cookie→token 交换检查登录有效性，不采集或要求 ARP；2api 等下游在实际生成时维护 access token、ARP 和请求参数。
+  - 保留 Adobe 邮箱身份核验（ride）；仅在需要该核验时恢复浏览器，不再等待 Firefly/Sherlock SDK。
+  - 历史缺 ARP 的失败账号保留 Cookie，重试或测活通过后恢复为已注册；本地 Cookie 已丢失的账号仍需要重新登录恢复，不能只因取消 ARP 就判为有效。
+  - 登录有效不表示具有 GPT Image 2 权限或剩余额度，生成能力应由下游实际验证。
 - **Cookie 导出（三选一，导出即出库）**：
   - **Cookie 字符串**：`k=v; k=v; ...`（单账号 `.txt`，多账号打包 `.zip`）
-  - **Cookie JSON 对象**：单个 Adobe 的 Cookie 对象（含 `cookie_string` / `cookies_map` / 带元数据的 `cookies` / `storage`；单账号 `.json`，多账号 `.zip`）
+  - **Cookie JSON 对象**：含 `email` / `cookie` / `ims_sid`，不再附带旧 ARP 令牌（单账号 `.json`，多账号 `.zip`）
   - **Cookie 数组（多 Adobe 批量）**：所选账号合并为单个 `.json` 数组
 - **安全**：列表接口不返回 `auth_data`（`json:"-"`），日志与截图不含验证码或 Cookie 明文；Cookie 仅通过上述导出接口、且仅对已注册记录开放。
 - **相关设置键**：`adobe_headless`（无头）；并发跟全局 `max_concurrency`，代理使用「渠道代理」里的 Adobe 独立配置。
+
+### Lovart 注册（纯协议，无浏览器）
+
+独立页面「Lovart 注册」、独立数据表 `lovart_registrations`、独立路由 `/api/lovart/*`。Lovart 没有密码注册，首次邮箱验证码登录即创建账号。
+
+- **全协议流程**：Chrome TLS 指纹客户端直连 `www.lovart.ai` → 2Captcha 解 Turnstile（sitekey 取自站点运行配置）→ `sendLoginEmailWithCode` 发码 → 自动读取邮箱 6 位码 → `loginByEmailWithCode` 登录 → `/actions/login` 写入站点 Cookie → `getUserInfo` 真实探针确认会话。
+- **二次风险验证**：登录返回 `challengeToken` 时自动走邮箱挑战（`auth/challenge/send` → `verify/login`），短信挑战会明确报错而不是静默失败。
+- **批量生产 / 单个注册 / 停止 / 日志 / 删除**：与其它平台页面一致，复用邮箱池自动取码，失败地址按 `retry_cooldown_min` 冷却后重试。
+- **导出（三种格式，导出即出库）**：Cookie 字符串 / Cookie JSON / Cookie 数组；JSON 同时包含 `access_token`、`refresh_token`、过期时间与带元数据的 Cookie 列表。
+- **测活**：用 `accessToken` 请求 `user/getUserInfo`，过期时自动用 `refreshToken` 刷新；只把明确的 401/403 判死，网络/429/5xx 记为 unknown。
+- **渠道代理**：使用「渠道代理」里的 Lovart 独立配置；并发跟全局 `max_concurrency`。
+- **风控说明**：Lovart 对自动化注册/生图的风控较严。直连服务器/机房 IP 注册的账号登录正常，但首次提交生图任务常返回 `1200000400 GenerationFrozen`（页面显示「账号异常，限制发起任务」，默认 30 分钟）。实测用固定住宅代理注册的账号可以成功出图（如 `fal/flux-2-pro`，1024×1024，约 4 credits）；建议 Lovart 渠道使用固定住宅代理（优先 list 模式），并尽量让注册与后续生图保持同一出口 IP，避免短时间连续切换 IP 或批量提交任务。
+- **生图接口备注**：`POST https://lgw.lovart.ai/v1/generator/tasks`，需 `token`、`X-Send-Timestamp`、`X-Req-Uuid`、`X-Client-Signature`（签名由站点 `signature_wasm_bg.wasm` 生成）；任务结果通过 `GET /v1/generator/tasks?task_id=...` 查询。
 
 ---
 
@@ -251,7 +272,7 @@ ADDR=8080 ./chatgpt-register.exe
 | 并发数 | 同时注册的账号数量，GPT 按这个数字执行 | 4～6 |
 | 裂变数量 | 每个邮箱注册的子号数 | 5（即 1母 + 5子 = 6个账号）；`+别名` 子号与母号天然可被关联，追求存活率时建议调低甚至设为 0 |
 | 注册错峰间隔 | 相邻两个 GPT 任务实际启动的最小间隔 | 45 秒 |
-| 渠道代理 | GPT / Grok / Adobe / Leonardo 各自配置开关和提取 API | 低并发建议 `count=1` 或小批量；API 使用粘性会话 |
+| 渠道代理 | GPT / Grok / Adobe / Leonardo / Lovart 各自配置开关和提取 API | 低并发建议 `count=1` 或小批量；API 使用粘性会话 |
 
 在「渠道代理」选择渠道，填写完整提取 API，点击「提取并测试」，然后保存此渠道。测试使用当前草稿，不会自动保存或启用。开关关闭时新任务直连；开启后提取失败会明确报错，不会自动直连。已运行任务沿用已分配的会话，保存配置仅清理该渠道尚未分配的缓存。
 

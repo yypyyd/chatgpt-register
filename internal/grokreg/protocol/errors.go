@@ -10,7 +10,7 @@ const (
 	CodeCF403        = "cf_403"
 	CodeCFBlocked    = "cf_blocked"
 	CodeWarm         = "warm"
-	CodeGRPCCreate   = "grpc_create"
+	CodeSendCode     = "send_code"
 	CodeGRPCVerify   = "grpc_verify"
 	CodeGRPCPassword = "grpc_password"
 	CodeSignup       = "signup"

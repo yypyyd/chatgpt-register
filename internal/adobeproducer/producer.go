@@ -79,9 +79,7 @@ func (p *Producer) Start(email, note string) (*models.AdobeRegistration, error) 
 		if existing.Status == "registering" || existing.Status == "waiting_code" {
 			return nil, fmt.Errorf("该邮箱的 Adobe 注册正在进行中")
 		}
-		if existing.Status == "account_exists" {
-			return nil, fmt.Errorf("该邮箱已有 Adobe 账号，已跳过")
-		}
+		// 历史 ARP 失败的记录仍需保留 Cookie，重试时验证或恢复已有会话。
 		existing.Status = "registering"
 		existing.Note = note
 		existing.MailboxID = mailboxID
@@ -91,9 +89,14 @@ func (p *Producer) Start(email, note string) (*models.AdobeRegistration, error) 
 		if strings.TrimSpace(existing.Password) == "" {
 			existing.Password = adobereg.GenPassword(16)
 		}
-		existing.AuthData = ""
 		existing.Shot = nil
 		existing.Shipped = false
+		// 兼容历史 arp_failed：保留已有账号的会话，不再采集生成令牌。
+		if existing.ARPFailed {
+			p.appendLog(existing.ID, "本次验证并恢复已保存的 Cookie 会话，无需补采 ARP")
+		} else {
+			existing.AuthData = ""
+		}
 		if err := p.db.Save(&existing).Error; err != nil {
 			return nil, err
 		}
@@ -210,8 +213,11 @@ func (p *Producer) claimOne(email string, mailboxID uint, note string) (*models.
 			existing.Password = reg.Password
 		}
 		existing.Note = note
-		existing.AuthData = ""
 		existing.Shot = nil
+		// 历史 arp_failed 记录保留 auth_data，重试时恢复会话，不重复建号。
+		if !existing.ARPFailed {
+			existing.AuthData = ""
+		}
 		if err := p.db.Save(&existing).Error; err != nil {
 			return nil, err
 		}
@@ -455,6 +461,18 @@ func (p *Producer) run(id uint) {
 		return
 	}
 
+	// 账号已建好、但本地会话（cookie）已经没了：这种号既不能重建（Adobe 会判
+	// account_exists），也没法自动补采（补采必须注入 cookie）。直接进终态，
+	// 不占并发、不烧代理和打码，等人工/后续手段处理。
+	if reg.ARPFailed && len(cookiesFromAuthData(reg.AuthData)) == 0 {
+		p.appendLog(id, "账号已建好但本地 Cookie 丢失，需要重新登录恢复会话")
+		p.db.Model(&models.AdobeRegistration{}).Where("id = ?", id).Updates(map[string]any{
+			"status": "account_exists",
+			"note":   "账号已建好，但本地 Cookie 丢失，需要重新登录恢复会话",
+		})
+		return
+	}
+
 	if !p.acquireSlot(ctx, id) {
 		p.appendLog(id, "已取消（排队等待空闲注册槽位时被停止）")
 		p.db.Model(&models.AdobeRegistration{}).Where("id = ?", id).Updates(map[string]any{
@@ -507,7 +525,22 @@ func (p *Producer) run(id uint) {
 
 	var res *adobereg.Result
 	err := proxyErr
-	if err == nil {
+	savedCookies := cookiesFromAuthData(reg.AuthData)
+	if err == nil && reg.ARPFailed && len(savedCookies) > 0 {
+		// 历史记录已经建号，验证原 Cookie；需要邮箱核验时才恢复浏览器。
+		p.appendLog(id, "恢复已保存的 Cookie 会话（不会重复建号或采集 ARP）")
+		var saved map[string]any
+		if uerr := json.Unmarshal([]byte(reg.AuthData), &saved); uerr == nil {
+			fresh, aerr := adobereg.RestoreSession(proxyCtx, in, saved)
+			if aerr != nil {
+				err = aerr
+			} else {
+				res = &adobereg.Result{AuthJSON: fresh}
+			}
+		} else {
+			err = fmt.Errorf("读取保存的会话失败: %w", uerr)
+		}
+	} else if err == nil {
 		res, err = adobereg.Register(proxyCtx, in)
 	}
 	if err != nil {
@@ -519,6 +552,17 @@ func (p *Producer) run(id uint) {
 			})
 			return
 		}
+		if errors.Is(err, adobereg.ErrSessionLanding) {
+			// 账号建好了但 ims_sid 没落地，没有任何可用会话 → 不进重试队列
+			// （重试只会被判 account_exists），标成待人工补采。
+			p.appendLog(id, "账号已创建，但登录 Cookie 保存失败，需要重新登录恢复会话: "+err.Error())
+			p.db.Model(&models.AdobeRegistration{}).Where("id = ?", id).Updates(map[string]any{
+				"status":     "account_exists",
+				"note":       "账号已建好，但 Cookie 保存失败，需要重新登录恢复会话",
+				"arp_failed": true,
+			})
+			return
+		}
 		p.appendLog(id, "注册失败: "+err.Error())
 		p.db.Model(&models.AdobeRegistration{}).Where("id = ?", id).Updates(map[string]any{
 			"status": "register_failed",
@@ -527,20 +571,24 @@ func (p *Producer) run(id uint) {
 		return
 	}
 
+	if res == nil || len(livecheck.CookiesFromAuthJSON(marshalAuth(res))) == 0 {
+		p.appendLog(id, "注册未完成：没有取得登录 Cookie")
+		p.db.Model(&models.AdobeRegistration{}).Where("id = ?", id).Updates(map[string]any{
+			"status": "account_exists", "note": "账号已建好，但没有登录 Cookie，需要恢复会话",
+			"arp_failed": true,
+		})
+		return
+	}
+
 	res.AuthJSON["proxy"] = lease.Proxy
 	authBytes, _ := json.MarshalIndent(res.AuthJSON, "", "  ")
-	p.appendLog(id, "Adobe 注册成功")
+	p.appendLog(id, "Adobe 注册成功（已保存登录 Cookie，生图会话由下游维护）")
 	p.db.Model(&models.AdobeRegistration{}).Where("id = ?", id).Updates(map[string]any{
-		"status":    "registered",
-		"auth_data": string(authBytes),
+		"status":     "registered",
+		"auth_data":  string(authBytes),
+		"note":       "",
+		"arp_failed": false,
 	})
-
-	// ARP 令牌是 Image 2 提交的必需头；缺字段的令牌会被 Adobe 当成伪造会话。
-	// 这里只提示，不改注册状态：账号本身可用，问题会由自检/下游暴露。
-	arpToken, _ := res.AuthJSON["arp_session_token"].(string)
-	if missing := adobereg.ARPMissingFields(arpToken); len(missing) > 0 {
-		p.appendLog(id, fmt.Sprintf("警告：ARP 会话令牌缺字段 %v（Image 2 生成会失败）", missing))
-	}
 
 	// 注册成功后立即用与下游一致的 cookie→token 交换自检：若被 Adobe 卡在
 	// ride 身份核验（换不到 token），账号下游不可用，自动标记为失效（不删号）。
@@ -603,8 +651,8 @@ func (p *Producer) runRescue(id uint) {
 	if err := p.db.First(&reg, id).Error; err != nil {
 		return
 	}
-	cookies := cookiesFromAuthData(reg.AuthData)
-	if len(cookies) == 0 {
+	var savedAuth map[string]any
+	if json.Unmarshal([]byte(reg.AuthData), &savedAuth) != nil || len(cookiesFromAuthData(reg.AuthData)) == 0 {
 		p.appendLog(id, "救回失败：无有效会话 cookie")
 		return
 	}
@@ -625,6 +673,7 @@ func (p *Producer) runRescue(id uint) {
 	defer cancelProxy()
 	since := time.Now().Add(-15 * time.Second)
 	in := adobereg.Input{
+		Email:       reg.Email,
 		Proxy:       lease.Proxy,
 		Headless:    p.SettingOn("adobe_headless"),
 		EgressCheck: p.SettingOn("adobe_egress_check"),
@@ -646,16 +695,27 @@ func (p *Producer) runRescue(id uint) {
 		},
 	}
 
-	res, err := adobereg.RescueRide(proxyCtx, in, cookies)
+	// 恢复 Cookie 登录会话，只有邮箱身份核验需要浏览器；不采集 ARP。
+	freshAuth, err := adobereg.RestoreSession(proxyCtx, in, savedAuth)
 	if err != nil {
 		p.appendLog(id, "救回失败: "+err.Error())
 		return
 	}
-	res.AuthJSON["proxy"] = lease.Proxy
-	authBytes, _ := json.MarshalIndent(res.AuthJSON, "", "  ")
-	p.db.Model(&models.AdobeRegistration{}).Where("id = ?", id).Update("auth_data", string(authBytes))
+	freshAuth["proxy"] = lease.Proxy
+	authBytes, _ := json.MarshalIndent(freshAuth, "", "  ")
+	p.db.Model(&models.AdobeRegistration{}).Where("id = ?", id).Updates(map[string]any{
+		"auth_data": string(authBytes), "arp_failed": false, "status": "registered", "note": "",
+	})
 	// 复用注册后的自检判定 alive/dead。
 	p.selfCheckAdobeAlive(proxyCtx, id, string(authBytes), lease.Proxy)
+}
+
+func marshalAuth(res *adobereg.Result) string {
+	if res == nil {
+		return ""
+	}
+	data, _ := json.Marshal(res.AuthJSON)
+	return string(data)
 }
 
 // cookiesFromAuthData 从存库的 auth_data JSON 解析出 cookie 列表（供 cookie 注入用）。
@@ -670,7 +730,7 @@ func cookiesFromAuthData(authData string) []map[string]any {
 }
 
 // selfCheckAdobeAlive 用注册产出的 Cookie 做一次 cookie→token 交换，把结果写入
-// alive 字段：alive=下游可用、dead=被拒（如 ride 身份核验）、unknown=网络/限流不判死。
+// alive 字段：alive=登录会话有效、dead=被拒、unknown=网络/限流不判死。
 func (p *Producer) selfCheckAdobeAlive(ctx context.Context, id uint, authData, proxy string) {
 	cookies := livecheck.CookiesFromAuthJSON(authData)
 	if len(cookies) == 0 {
@@ -691,7 +751,7 @@ func (p *Producer) selfCheckAdobeAlive(ctx context.Context, id uint, authData, p
 	case livecheck.StatusDead:
 		p.appendLog(id, "自检：cookie→token 交换被拒（疑似 ride 身份核验），已标记为失效")
 	case livecheck.StatusAlive:
-		p.appendLog(id, "自检：cookie→token 交换成功，账号下游可用")
+		p.appendLog(id, "自检：Cookie 登录有效；模型权限、额度和生图会话由下游验证")
 	default:
 		p.appendLog(id, "自检：cookie→token 交换结果未知（网络/限流等），未改判")
 	}
