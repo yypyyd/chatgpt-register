@@ -4,3 +4,13 @@ adskull-register.exe
 backups/
 .ace-tool/
 /build/
+/.diagnostics/
+/.playwright-mcp/
+/.proxy-ui-verify/
+/.zcode/
+/.ssh_probe*.py
+/*.exe
+/chatgpt-register-linux*
+/gptlive-linux
+**/__pycache__/
+*.py[cod]

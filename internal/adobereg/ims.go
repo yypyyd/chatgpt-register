@@ -41,7 +41,7 @@ func imsAccessToken(ctx context.Context, proxy, cookie string) string {
 	req.Header.Set("content-type", "application/x-www-form-urlencoded;charset=UTF-8")
 	req.Header.Set("origin", "https://firefly.adobe.com")
 	req.Header.Set("referer", "https://firefly.adobe.com/")
-	req.Header.Set("user-agent", gen3PUserAgen)
+	req.Header.Set("user-agent", userAgent)
 	req.Header.Set("cookie", cookie)
 	resp, err := httpClientWithProxy(proxy).Do(req)
 	if err != nil {

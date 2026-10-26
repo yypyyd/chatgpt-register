@@ -52,3 +52,20 @@ func RestoreSession(ctx context.Context, in Input, auth map[string]any) (map[str
 	in.logf("Cookie 登录会话已验证；生图会话由下游维护")
 	return merged, nil
 }
+
+func cookiesFromAuthMap(auth map[string]any) []map[string]any {
+	if raw, ok := auth["cookies"].([]map[string]any); ok {
+		return raw
+	}
+	list, ok := auth["cookies"].([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(list))
+	for _, item := range list {
+		if cookie, ok := item.(map[string]any); ok {
+			out = append(out, cookie)
+		}
+	}
+	return out
+}
