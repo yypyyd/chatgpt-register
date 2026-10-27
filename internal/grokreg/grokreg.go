@@ -1,15 +1,16 @@
 package grokreg
 
 import (
+	"chatgpt-register/internal/grokreg/protocol"
 	"context"
 	cryptorand "crypto/rand"
-	"errors"
 	"fmt"
 	"math/big"
 )
 
 // ErrEmailTaken 该邮箱已有 Grok 账号，属于永久失败。
-var ErrEmailTaken = errors.New("该邮箱已注册 Grok")
+var ErrEmailTaken = protocol.ErrEmailTaken
+var ErrEmailSignupUnavailable = protocol.ErrEmailSignupUnavailable
 
 type Input struct {
 	Email     string

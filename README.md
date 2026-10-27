@@ -91,7 +91,7 @@ chatgpt-register/
 ├── main.go                  # 入口：Gin 路由注册 + 静态文件嵌入
 ├── internal/
 │   ├── auth/                # JWT 鉴权服务（单 token、自动续期、落库）
-│   ├── browserboot/         # Rod 浏览器生命周期（Adobe / Grok 用，GPT 注册不启动浏览器）
+│   ├── browserboot/         # Rod 浏览器生命周期（浏览器注册渠道使用，GPT/Grok 协议注册不启动）
 │   ├── chatgptauth/         # ChatGPT 凭据刷新、真实探针与安全出库
 │   ├── codexreg/            # ChatGPT 纯协议注册
 │   │   ├── protocol.go      # 协议注册（Chrome TLS 指纹直连 auth.openai.com）
@@ -193,6 +193,12 @@ ADDR=8080 ./chatgpt-register.exe
 ---
 
 ## 📋 功能说明
+
+### Grok 邮箱注册
+
+Grok 跟随官网的 JSON 注册流程，通过 Node.js 执行官网 Castle SDK，发送验证码、验证邮件、创建账号共用同一 HTTP 会话。只在取得有效 SSO 后标记注册成功；2Captcha 配置仍用于官网要求的 Turnstile。
+
+若上游返回 `account:email-signup-unavailable`，页面明确提示邮箱注册暂不可用并停止本批次自动补任务，不再误报已发码或无限等待邮件。当前单账号实测收到这一官方拒绝，尚未完成新版流程的成功注册验收；需要上游恢复邮箱注册后复验。响应读取已修正重复 gzip 解压造成正文开头丢失的问题。
 
 ### 批量生产（核心功能）
 

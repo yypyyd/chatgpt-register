@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"crypto/rand"
@@ -41,7 +42,7 @@ const (
 
 var (
 	siteKeyRe = regexp.MustCompile(`0x4AAAAAAA[a-zA-Z0-9_-]+`)
-	jsSrcRe   = regexp.MustCompile(`src="(/_next/static/[^"]+\.js)"`)
+	jsSrcRe   = regexp.MustCompile(`src="(/_next/static/[^"]+\.js(?:\?[^" ]*)?)"`)
 	jsPathRe  = regexp.MustCompile(`/_next/static/[^"'\\ )>]+\.js`)
 	hex40Re   = regexp.MustCompile(`[a-fA-F0-9]{40,50}`)
 	flightRe  = regexp.MustCompile(`self\.__next_f\.push\(\[1,"(.*?)"\]\)`)
@@ -57,10 +58,14 @@ type ClientOptions struct {
 }
 
 type SignupConfig struct {
-	SiteKey   string
-	ActionID  string
-	StateTree string
-	Source    string
+	SiteKey      string
+	ActionID     string
+	StateTree    string
+	Source       string
+	Standalone   bool
+	CastlePK     string
+	CastleScript string
+	CastleURL    string
 }
 
 type Client struct {
@@ -71,6 +76,7 @@ type Client struct {
 	profile string
 	mu      sync.Mutex
 	cfg     SignupConfig
+	castle  *castleWorker
 }
 
 func NewClientOpts(opt ClientOptions) (*Client, error) {
@@ -189,6 +195,11 @@ func (c *Client) FetchConfig() (SignupConfig, error) {
 	if m := siteKeyRe.FindString(html); m != "" {
 		cfg.SiteKey = m
 	}
+	decoded := strings.ReplaceAll(html, `\"`, `"`)
+	cfg.Standalone = strings.Contains(decoded, `"account_standalone_auth_enabled":true`)
+	if m := regexp.MustCompile(`"castlePk":"([^"]+)"`).FindStringSubmatch(decoded); len(m) > 1 {
+		cfg.CastlePK = m[1]
+	}
 	cfg.StateTree = scrapeStateTree(html)
 	if cfg.StateTree == "" {
 		cfg.StateTree = url.QueryEscape(DefaultRouterStateTreeJSON)
@@ -200,6 +211,51 @@ func (c *Client) FetchConfig() (SignupConfig, error) {
 		// src="..." attribute; fall back to any /_next/static/*.js path so the
 		// next-action id is still scraped instead of using the stale default.
 		jsURLs = uniqueStr(jsPathRe.FindAllString(html, -1))
+	}
+	if cfg.Standalone {
+		// The official page loads Castle lazily through its Turbopack map.
+		// Resolve the selected SDK instead of pinning a deployment's chunk name.
+		var scripts []string
+		var castleID string
+		for _, path := range jsURLs {
+			js, e := c.fetchJS(path)
+			if e != nil {
+				continue
+			}
+			scripts = append(scripts, js)
+			if strings.Contains(js, "CastleProvider") {
+				if m := regexp.MustCompile(`"next"===\w+\?\w+\.A\((\d+)\):\w+\.A\((\d+)\)`).FindStringSubmatch(js); len(m) == 3 {
+					castleID = m[2]
+					if strings.Contains(decoded, `"castle_sdk_next":true`) {
+						castleID = m[1]
+					}
+				}
+			}
+			if castleID != "" {
+				pattern := regexp.MustCompile(regexp.QuoteMeta(castleID) + `,[^;]{0,100}?\["(static/chunks/[^" ]+\.js)"\]`)
+				for _, source := range scripts {
+					if m := pattern.FindStringSubmatch(source); len(m) > 1 {
+						cfg.CastleURL = SiteURL + "/_next/" + m[1]
+						break
+					}
+				}
+			}
+			if cfg.CastleURL != "" {
+				break
+			}
+		}
+		if cfg.CastleURL == "" || cfg.CastlePK == "" {
+			return cfg, Failf(CodeConfig, "新版注册缺少 Castle SDK 配置 (pk=%t loader=%t chunk=%t scripts=%d)", cfg.CastlePK != "", castleID != "", cfg.CastleURL != "", len(scripts))
+		}
+		cfg.CastleScript, err = c.fetchJS(strings.TrimPrefix(cfg.CastleURL, SiteURL))
+		if err != nil || !strings.Contains(cfg.CastleScript, "configure") {
+			return cfg, Failf(CodeConfig, "无法读取官方 Castle SDK")
+		}
+		cfg.Source += "+standalone"
+		c.mu.Lock()
+		c.cfg = cfg
+		c.mu.Unlock()
+		return cfg, nil
 	}
 	for _, path := range jsURLs {
 		if cfg.ActionID != "" {
@@ -789,13 +845,18 @@ func readBody(resp *http.Response) (string, error) {
 		return "", nil
 	}
 	defer resp.Body.Close()
-	var r io.Reader = resp.Body
-	if strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
-		gz, err := gzip.NewReader(resp.Body)
-		if err == nil {
-			defer gz.Close()
-			r = gz
+	buffered := bufio.NewReader(resp.Body)
+	var r io.Reader = buffered
+	// tls-client can decompress the body while retaining Content-Encoding.
+	// Inspect without consuming bytes: a failed gzip.NewReader otherwise eats
+	// the first 4 KiB of the already-decoded HTML/JavaScript response.
+	if magic, _ := buffered.Peek(2); len(magic) == 2 && magic[0] == 0x1f && magic[1] == 0x8b {
+		gz, err := gzip.NewReader(buffered)
+		if err != nil {
+			return "", err
 		}
+		defer gz.Close()
+		r = gz
 	}
 	b, err := io.ReadAll(io.LimitReader(r, 8<<20))
 	return string(b), err

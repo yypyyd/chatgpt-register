@@ -69,6 +69,9 @@ async function loadProduce() {
     document.getElementById('pd-registered').textContent = s.registered || 0;
     document.getElementById('pd-failed').textContent = s.failed || 0;
     document.getElementById('pd-stop').style.display = s.running ? '' : 'none';
+    const error = document.getElementById('pd-error');
+    error.textContent = s.error || '';
+    error.style.display = s.error ? '' : 'none';
   } catch (e) { /* ignore */ }
 }
 

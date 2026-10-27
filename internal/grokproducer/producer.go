@@ -54,6 +54,7 @@ type Producer struct {
 	topUpCancel context.CancelFunc
 	runTarget   int    // 本次生产的目标数量
 	runTracked  []uint // 本次生产建过的任务 id
+	runError    string
 }
 
 func New(db *gorm.DB, mail *mailfetch.Client, managers ...*proxypool.Manager) *Producer {
@@ -155,6 +156,7 @@ func (p *Producer) claimTargets(count int) ([]models.GrokRegistration, bool, err
 	var accounts []models.Registration
 	if err := p.db.
 		Where("status = ? AND mailbox_id <> 0", "registered").
+		Where("mailbox_id IN (?)", p.db.Model(&models.Mailbox{}).Select("id").Where("status = ?", "verified")).
 		Where("email NOT IN (?)", blocked).
 		Where("mailbox_id NOT IN (?)", busyMailboxes).
 		Order("id asc").
@@ -279,6 +281,12 @@ func (p *Producer) topUp(count int, started []models.GrokRegistration) {
 
 	tracked := p.trackedIDs()
 	for {
+		p.mu.Lock()
+		halted := p.runError != ""
+		p.mu.Unlock()
+		if halted {
+			return
+		}
 		if !prodcore.Sleep(ctx, 5*time.Second) {
 			return
 		}
@@ -319,6 +327,7 @@ func (p *Producer) topUp(count int, started []models.GrokRegistration) {
 func (p *Producer) beginRun(count int, started []models.GrokRegistration) {
 	p.mu.Lock()
 	p.runTarget = count
+	p.runError = ""
 	p.runTracked = make([]uint, 0, count)
 	for _, reg := range started {
 		p.runTracked = append(p.runTracked, reg.ID)
@@ -426,11 +435,12 @@ func (p *Producer) StopAll() {
 
 // Progress 生产进度快照，供 /api/grok/produce/status 展示。
 type Progress struct {
-	Running    bool `json:"running"`
-	Pending    int  `json:"pending"`     // 待生产
-	RunningNum int  `json:"running_num"` // 在跑
-	Registered int  `json:"registered"`  // 已注册
-	Failed     int  `json:"failed"`      // 注册失败
+	Running    bool   `json:"running"`
+	Pending    int    `json:"pending"`     // 待生产
+	RunningNum int    `json:"running_num"` // 在跑
+	Registered int    `json:"registered"`  // 已注册
+	Failed     int    `json:"failed"`      // 注册失败
+	Error      string `json:"error,omitempty"`
 }
 
 // Snapshot 返回 Grok 生产进度：在跑数取自当前运行的任务，其余按库中状态统计。
@@ -438,6 +448,7 @@ func (p *Producer) Snapshot() Progress {
 	p.mu.Lock()
 	runningNum := len(p.cancel)
 	topUp := p.topUpCancel != nil
+	runError := p.runError
 	p.mu.Unlock()
 
 	count := func(statuses ...string) int {
@@ -451,6 +462,7 @@ func (p *Producer) Snapshot() Progress {
 		RunningNum: runningNum,
 		Registered: count("registered"),
 		Failed:     count("register_failed"),
+		Error:      runError,
 	}
 }
 
@@ -533,6 +545,12 @@ func (p *Producer) run(id uint) {
 	}
 	if err != nil {
 		p.appendLog(id, "注册失败: "+err.Error())
+		if errors.Is(err, grokreg.ErrEmailSignupUnavailable) {
+			p.mu.Lock()
+			p.runError = grokreg.ErrEmailSignupUnavailable.Error()
+			p.mu.Unlock()
+			p.endTopUp()
+		}
 		status := "register_failed"
 		if errors.Is(err, grokreg.ErrEmailTaken) {
 			// 邮箱已被注册是终态，标成 already_registered 后不再进冷却重试。
@@ -602,7 +620,7 @@ func (p *Producer) fetchCode(ctx context.Context, id, mailboxID uint, since time
 	if err := p.db.First(&mb, mailboxID).Error; err != nil {
 		return "", fmt.Errorf("读取邮箱凭据失败: %w", err)
 	}
-	acc := mailfetch.Account{Email: mb.Email, ClientID: mb.ClientID, RefreshToken: mb.RefreshToken}
+	acc := mailfetch.Account{Email: mb.Email, ClientID: mb.ClientID, RefreshToken: mb.RefreshToken, Password: mb.Password, Provider: mb.Provider}
 	deadline := time.Now().Add(codePollTimeout)
 	p.appendLog(id, "开始自动读取 Grok 邮件验证码")
 	for time.Now().Before(deadline) {

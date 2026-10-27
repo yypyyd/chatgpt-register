@@ -26,7 +26,7 @@ var signupCfg struct {
 func cachedSignupConfig() (protocol.SignupConfig, bool) {
 	signupCfg.mu.Lock()
 	defer signupCfg.mu.Unlock()
-	if signupCfg.cfg.ActionID == "" || time.Since(signupCfg.at) > signupConfigTTL {
+	if (signupCfg.cfg.ActionID == "" && signupCfg.cfg.CastleScript == "") || time.Since(signupCfg.at) > signupConfigTTL {
 		return protocol.SignupConfig{}, false
 	}
 	return signupCfg.cfg, true
@@ -34,7 +34,7 @@ func cachedSignupConfig() (protocol.SignupConfig, bool) {
 
 // storeSignupConfig 在注册成功后记下这套配置，供后续账号复用。
 func storeSignupConfig(cfg protocol.SignupConfig) {
-	if cfg.ActionID == "" || cfg.StateTree == "" {
+	if !cfg.Standalone && (cfg.ActionID == "" || cfg.StateTree == "") {
 		return
 	}
 	signupCfg.mu.Lock()
@@ -91,7 +91,7 @@ func registerProtocol(ctx context.Context, in Input) (*Result, error) {
 			invalidateSignupConfig()
 		}
 	}
-	if scfg.ActionID == "" {
+	if scfg.ActionID == "" && !scfg.Standalone {
 		scfg, err = client.FetchConfig()
 	}
 	if err != nil {
@@ -134,11 +134,23 @@ func registerProtocol(ctx context.Context, in Input) (*Result, error) {
 	if err != nil {
 		return nil, fmt.Errorf("获取注册配置失败: %w", err)
 	}
+	if scfg.Standalone {
+		in.logf("使用官网新版 JSON 注册流程，初始化 Castle SDK（Node.js）")
+		if err = client.StartCastle(ctx, scfg); err != nil {
+			return nil, fmt.Errorf("初始化注册会话失败: %w", err)
+		}
+		defer client.CloseCastle()
+	}
 	in.logf("注册配置就绪 site_key=%s action=%s… source=%s profile=%s",
 		scfg.SiteKey, trimText(scfg.ActionID, 12), scfg.Source, client.Profile())
 
 	// 1) request email validation code, wait for the mailbox to deliver it.
-	if err := client.CreateEmailCode(in.Email); err != nil {
+	if scfg.Standalone {
+		err = client.SendSignupCode(ctx, in.Email)
+	} else {
+		err = client.CreateEmailCode(in.Email)
+	}
+	if err != nil {
 		return nil, fmt.Errorf("发送邮箱验证码失败: %w", err)
 	}
 	in.logf("已请求邮箱验证码，等待收码…")
@@ -149,13 +161,20 @@ func registerProtocol(ctx context.Context, in Input) (*Result, error) {
 	}
 	code = strings.TrimSpace(code)
 
-	client.ClearAuthCookies()
-	if err := client.VerifyEmailCode(in.Email, code); err != nil {
+	if scfg.Standalone {
+		err = client.VerifySignupCode(ctx, in.Email, code)
+	} else {
+		client.ClearAuthCookies()
+		err = client.VerifyEmailCode(in.Email, code)
+	}
+	if err != nil {
 		return nil, fmt.Errorf("校验邮箱验证码失败: %w", err)
 	}
 	// ValidatePassword mirrors the browser form's field 4/5 probe; non-fatal.
-	if err := client.ValidatePassword(in.Email, in.Password); err != nil {
-		in.logf("ValidatePassword 跳过/失败(非致命): %v", err)
+	if !scfg.Standalone {
+		if err := client.ValidatePassword(in.Email, in.Password); err != nil {
+			in.logf("ValidatePassword 跳过/失败(非致命): %v", err)
+		}
 	}
 
 	in.logf("签发 Turnstile（2Captcha HTTP）")
@@ -164,9 +183,14 @@ func registerProtocol(ctx context.Context, in Input) (*Result, error) {
 		return nil, fmt.Errorf("签发 Turnstile 令牌失败: %w", err)
 	}
 	in.logf("Turnstile 令牌已就绪(len=%d)，提交注册", len(token))
-	body := protocol.BuildSignupBody(in.Email, in.Password, code, token)
-	text, sso, err := client.SignupServerAction(body, scfg.ActionID, scfg.StateTree)
-	in.logf("signup 响应: err=%v sso=%t body=%s", err, sso != "", trimText(text, 800))
+	var text, sso string
+	if scfg.Standalone {
+		sso, err = client.CreateSignupAccount(ctx, in.Email, in.Password, in.FirstName, in.LastName, code, token)
+	} else {
+		body := protocol.BuildSignupBody(in.Email, in.Password, code, token)
+		text, sso, err = client.SignupServerAction(body, scfg.ActionID, scfg.StateTree)
+	}
+	in.logf("signup 响应: err=%v sso=%t", err, sso != "")
 	if sso == "" {
 		sso = protocol.ExtractSSOFromText(text)
 	}
