@@ -14,3 +14,9 @@ backups/
 /gptlive-linux
 **/__pycache__/
 *.py[cod]
+
+# 运行产物：日志与 SQLite 临时文件，不进仓库
+run.out.log
+run.err.log
+*.db-shm
+*.db-wal
