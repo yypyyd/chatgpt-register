@@ -68,7 +68,12 @@ func (c *Core) SettingMinutes(key string, defMin int) time.Duration {
 
 // MaxConcurrency 并发上限，跟设置页「最大并发数」(max_concurrency)，最小为 1。
 func (c *Core) MaxConcurrency() int {
-	n := c.SettingInt("max_concurrency", defaultMaxConcurrency)
+	// 优先用渠道专属并发（如 adobe_max_concurrency），未设或非法时回退全局 max_concurrency。
+	// 这样浏览器方式的 Adobe 与纯协议的 Grok/Lovart 能各用各的并发，互不拖累。
+	n := c.SettingInt(c.channel+"_max_concurrency", 0)
+	if n < 1 {
+		n = c.SettingInt("max_concurrency", defaultMaxConcurrency)
+	}
 	if n < 1 {
 		return 1
 	}

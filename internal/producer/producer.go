@@ -727,8 +727,12 @@ func (p *Producer) aliasFinalized(email string) bool {
 // ---- DB / 设置 ----
 
 func (p *Producer) loadConfig() Config {
+	maxc := atoiDefault(p.getSetting("chatgpt_max_concurrency"), 0)
+	if maxc < 1 {
+		maxc = atoiDefault(p.getSetting("max_concurrency"), defaultMaxConcurrency)
+	}
 	cfg := Config{
-		MaxConcurrency: atoiDefault(p.getSetting("max_concurrency"), defaultMaxConcurrency),
+		MaxConcurrency: maxc,
 		FissionCount:   atoiDefault(p.getSetting("fission_count"), defaultFissionCount),
 	}
 	if cfg.MaxConcurrency < 1 {

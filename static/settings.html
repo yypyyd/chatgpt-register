@@ -32,6 +32,17 @@
           </div>
         </div>
         <div class="field">
+          <label>各渠道并发（选填，留空＝用上面的全局值）</label>
+          <span class="field-hint">GPT/Grok/Lovart 纯协议可较高；Adobe 走浏览器较重，建议 2~3</span>
+          <div class="input-suffix">
+            <input id="set-conc-chatgpt" class="px-input" type="number" min="1" max="100" placeholder="GPT" title="GPT 并发">
+            <input id="set-conc-grok" class="px-input" type="number" min="1" max="100" placeholder="Grok" title="Grok 并发">
+            <input id="set-conc-adobe" class="px-input" type="number" min="1" max="100" placeholder="Adobe" title="Adobe 并发">
+            <input id="set-conc-leonardo" class="px-input" type="number" min="1" max="100" placeholder="Leo" title="Leonardo 并发">
+            <input id="set-conc-lovart" class="px-input" type="number" min="1" max="100" placeholder="Lovart" title="Lovart 并发">
+          </div>
+        </div>
+        <div class="field">
           <label>裂变数量</label>
           <span class="field-hint">每个母邮箱成功后再用 +001/+002 裂变的子号数量（GPT 纯协议）</span>
           <div class="input-suffix">
@@ -197,6 +208,11 @@ async function loadSettings() {
   const r = await api('/api/settings');
   const d = await r.json();
 	document.getElementById('set-max-concurrency').value = d.max_concurrency || '2';
+  document.getElementById('set-conc-chatgpt').value = d.chatgpt_max_concurrency || '';
+  document.getElementById('set-conc-grok').value = d.grok_max_concurrency || '';
+  document.getElementById('set-conc-adobe').value = d.adobe_max_concurrency || '';
+  document.getElementById('set-conc-leonardo').value = d.leonardo_max_concurrency || '';
+  document.getElementById('set-conc-lovart').value = d.lovart_max_concurrency || '';
   document.getElementById('set-fission-count').value = d.fission_count || '5';
   document.getElementById('set-retry-cooldown').value = d.retry_cooldown_min || '30';
   document.getElementById('set-mailbox-interval').value = d.mailbox_interval_min || '5';
@@ -226,6 +242,11 @@ async function saveCaptcha() {
 async function saveSettings() {
   const body = {
     max_concurrency: document.getElementById('set-max-concurrency').value.trim(),
+    chatgpt_max_concurrency: document.getElementById('set-conc-chatgpt').value.trim(),
+    grok_max_concurrency: document.getElementById('set-conc-grok').value.trim(),
+    adobe_max_concurrency: document.getElementById('set-conc-adobe').value.trim(),
+    leonardo_max_concurrency: document.getElementById('set-conc-leonardo').value.trim(),
+    lovart_max_concurrency: document.getElementById('set-conc-lovart').value.trim(),
     fission_count: document.getElementById('set-fission-count').value.trim(),
     retry_cooldown_min: document.getElementById('set-retry-cooldown').value.trim(),
     mailbox_interval_min: document.getElementById('set-mailbox-interval').value.trim(),
