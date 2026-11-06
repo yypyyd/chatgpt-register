@@ -627,8 +627,13 @@ func registerProtocol(ctx context.Context, in Input) (res *protoResult, err erro
 	if !strings.Contains(continueURL, "chatgpt.com/api/auth/callback/") {
 		return nil, fmt.Errorf("未拿到 chatgpt.com 回调地址: %s", truncateForLog(continueURL, 200))
 	}
-	if _, _, err := c.followRedirects(ctx, continueURL, "https://auth.openai.com/"); err != nil {
-		return nil, fmt.Errorf("OAuth 回调失败: %w", err)
+	_, _, cbErr := c.followRedirects(ctx, continueURL, "https://auth.openai.com/")
+	if cbErr != nil && isTransientNetErr(cbErr) {
+		in.logf("♻ OAuth 回调连接中断，重试一次")
+		_, _, cbErr = c.followRedirects(ctx, continueURL, "https://auth.openai.com/")
+	}
+	if cbErr != nil {
+		return nil, fmt.Errorf("OAuth 回调失败: %w", cbErr)
 	}
 
 	in.logf("🔑 提取 accessToken...")
@@ -720,7 +725,10 @@ func isTransientNetErr(err error) bool {
 		return false
 	}
 	s := strings.ToLower(err.Error())
-	for _, k := range []string{"eof", "connection reset", "broken pipe", "i/o timeout", "tls handshake"} {
+	// "client.timeout exceeded" 覆盖 tls-client 的单请求级超时
+	// （"Client.Timeout exceeded while awaiting headers"），住宅代理偶发卡顿会命中它。
+	// 父 ctx 整体超时不带这个标记，因此不会被误判为可重试、导致流程超预算后还空转。
+	for _, k := range []string{"eof", "connection reset", "broken pipe", "i/o timeout", "tls handshake", "client.timeout exceeded"} {
 		if strings.Contains(s, k) {
 			return true
 		}
