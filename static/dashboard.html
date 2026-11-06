@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>仪表盘 · ChatGPT 注册管理</title>
-<link rel="stylesheet" href="/static/style.css?v=14">
+<link rel="stylesheet" href="/static/style.css?v=18">
 </head>
 <body data-page="dashboard">
 <div class="layout">
@@ -21,77 +21,39 @@
       <div class="bb-progress"><div class="bb-progress-bar" id="bb-bar" style="width:0%"></div></div>
     </div>
 
-    <!-- KPI 卡片 -->
+    <!-- 全渠道汇总 -->
     <div class="stats">
-      <div class="stat-box blue"><div class="stat-info"><div class="stat-num" id="st-total">0</div><div class="stat-label">账户总数</div></div><div class="stat-ico">⬡</div></div>
-      <div class="stat-box green"><div class="stat-info"><div class="stat-num" id="st-registered">0</div><div class="stat-label">已注册</div></div><div class="stat-ico">✓</div></div>
-      <div class="stat-box amber"><div class="stat-info"><div class="stat-num" id="st-registering">0</div><div class="stat-label">注册中</div></div><div class="stat-ico">◔</div></div>
-      <div class="stat-box red"><div class="stat-info"><div class="stat-num" id="st-register_failed">0</div><div class="stat-label">注册失败</div></div><div class="stat-ico">✕</div></div>
-      <div class="stat-box violet"><div class="stat-info"><div class="stat-num" id="st-unshipped">0</div><div class="stat-label">可出库库存</div></div><div class="stat-ico">⇪</div></div>
-      <div class="stat-box cyan"><div class="stat-info"><div class="stat-num" id="st-mailbox_verified">0</div><div class="stat-label">可用邮箱</div></div><div class="stat-ico">✉</div></div>
+      <div class="stat-box green"><div class="stat-info"><div class="stat-num" id="sum-registered">0</div><div class="stat-label">已注册（全部渠道）</div></div><div class="stat-ico">✓</div></div>
+      <div class="stat-box blue"><div class="stat-info"><div class="stat-num" id="sum-today">0</div><div class="stat-label">今日新增</div></div><div class="stat-ico">↑</div></div>
+      <div class="stat-box cyan"><div class="stat-info"><div class="stat-num" id="sum-running">0</div><div class="stat-label">在跑任务</div></div><div class="stat-ico">◔</div></div>
+      <div class="stat-box red"><div class="stat-info"><div class="stat-num" id="sum-failed">0</div><div class="stat-label">注册失败</div></div><div class="stat-ico">✕</div></div>
+      <div class="stat-box violet"><div class="stat-info"><div class="stat-num" id="sum-unshipped">0</div><div class="stat-label">可出库库存</div></div><div class="stat-ico">⇪</div></div>
+      <div class="stat-box amber"><div class="stat-info"><div class="stat-num" id="sum-mailbox">0</div><div class="stat-label">可用邮箱（共 <span id="sum-mailbox-total">0</span>）</div></div><div class="stat-ico">✉</div></div>
     </div>
 
-    <!-- 生产任务实时进度 -->
-    <div class="px-panel dash-produce" id="dash-produce">
-      <div class="dash-produce-head">
-        <h2>生产任务</h2>
-        <span class="dash-produce-state" id="pp-state">空闲</span>
-      </div>
-      <div class="dash-produce-body">
-        <div class="dp-main">
-          <div class="dp-main-num"><b id="pp-registered">0</b><i>/ <span id="pp-target">0</span></i></div>
-          <div class="dp-main-lbl">已注册 / 目标</div>
-        </div>
-        <div class="dash-progress-wrap">
-          <div class="dash-progress"><div class="dash-progress-bar" id="pp-bar" style="width:0%"></div></div>
-          <div class="dash-produce-msg" id="pp-msg"></div>
-        </div>
-        <div class="dp-pills">
-          <div class="dp-pill amber"><b id="pp-pending">0</b><span>待生产</span></div>
-          <div class="dp-pill cyan"><b id="pp-running">0</b><span>在跑</span></div>
-          <div class="dp-pill red"><b id="pp-failed">0</b><span>失败</span></div>
-        </div>
-      </div>
-    </div>
+    <!-- 各渠道概览：点卡片进入对应注册页 -->
+    <div class="ch-grid" id="ch-grid"></div>
 
     <div class="dash-grid">
-      <!-- 状态占比环 -->
+      <div class="px-panel dash-wide">
+        <h2>近 7 天产量</h2>
+        <div class="bars" id="trend-bars"></div>
+        <div class="trend-legend" id="trend-legend"></div>
+      </div>
       <div class="px-panel">
-        <h2>账户状态占比</h2>
+        <h2>已注册渠道占比</h2>
         <div class="donut-wrap">
-          <div class="donut" id="donut"><div class="donut-hole"><div class="donut-total" id="donut-total">0</div><div class="donut-sub">账户</div></div></div>
+          <div class="donut" id="donut"><div class="donut-hole"><div class="donut-total" id="donut-total">0</div><div class="donut-sub">已注册</div></div></div>
           <div class="donut-legend" id="donut-legend"></div>
         </div>
       </div>
-
-      <!-- 近 7 天产量 -->
-      <div class="px-panel">
-        <h2>近 7 天产量</h2>
-        <div class="bars" id="trend-bars"></div>
-      </div>
-
-      <!-- 结构 & 套餐 -->
-      <div class="px-panel">
-        <h2>账号结构</h2>
-        <div class="mini-rows">
-          <div class="mini-row"><span>母号</span><b id="mi-mother">0</b></div>
-          <div class="mini-row"><span>裂变子号</span><b id="mi-fission">0</b></div>
-          <div class="mini-row"><span>已出库</span><b id="mi-shipped">0</b></div>
-          <div class="mini-row"><span>可用邮箱 / 邮箱总数</span><b><span id="mi-mbv">0</span> / <span id="mi-mb">0</span></b></div>
-        </div>
-        <h3 class="mini-title">套餐分布</h3>
-        <div class="mini-rows" id="plan-rows"><div class="mini-empty">暂无</div></div>
-      </div>
     </div>
 
-    <!-- 最近账户 -->
+    <!-- 最近注册（全部渠道） -->
     <div class="px-panel dash-recent">
-      <div class="panel-title-row">
-        <h2>最近账户</h2>
-        <button class="px-btn danger" onclick="deleteAllAccounts()">全部删除</button>
-      </div>
+      <h2>最近注册</h2>
       <table class="px-table">
-        <thead><tr><th>ID</th><th>Email</th><th>母号</th><th>状态</th><th>出库</th><th>创建时间</th></tr></thead>
+        <thead><tr><th>渠道</th><th>邮箱</th><th>状态</th><th>创建时间</th></tr></thead>
         <tbody id="dash-rows"></tbody>
       </table>
     </div>
@@ -100,97 +62,111 @@
 <div id="toast" class="toast" style="display:none"></div>
 <script src="/static/layout.js?v=9"></script>
 <script>
-const DASH_STATUS = { pending: '待生产', registering: '注册中', registered: '已注册', register_failed: '注册失败' };
-const STATUS_COLOR = { registered: '#16a34a', registering: '#0891b2', register_failed: '#e11d48', pending: '#d97706' };
+const CH_COLOR = { chatgpt: '#7c3aed', grok: '#d97706', adobe: '#16a34a', leonardo: '#0f766e', lovart: '#2563eb' };
+const CH_NAME = { chatgpt: 'GPT', grok: 'Grok', adobe: 'Adobe', leonardo: 'Leonardo', lovart: 'Lovart' };
+const STATUS_LABEL = {
+  pending: '待生产', registering: '注册中', waiting_code: '等待验证码', registered: '已注册',
+  register_failed: '注册失败', register_rejected: '拒绝(Terms)', already_registered: '已存在', account_exists: '已存在',
+};
 
 function set(id, v) { const el = document.getElementById(id); if (el) el.textContent = v; }
 
-function renderDonut(d) {
-  const parts = [
-    ['registered', d.registered || 0],
-    ['registering', d.registering || 0],
-    ['pending', d.pending || 0],
-    ['register_failed', d.register_failed || 0],
-  ].filter(p => p[1] > 0);
-  const sum = parts.reduce((a, p) => a + p[1], 0);
+function statusLabel(ch, st) {
+  if (ch === 'chatgpt' && st === 'already_registered') return '停用';
+  return STATUS_LABEL[st] || st;
+}
+
+function renderChannels(list) {
+  document.getElementById('ch-grid').innerHTML = list.map(c => {
+    const state = c.producing
+      ? `<span class="ch-state on">生产中 · 在跑 ${c.running_num || 0}</span>`
+      : '<span class="ch-state">空闲</span>';
+    let extra = '';
+    if (c.key === 'chatgpt') extra += `<div class="ch-sub">母号 ${c.mother || 0} · 裂变 ${c.fission || 0}</div>`;
+    if (c.producing && c.target > 0) {
+      const done = c.run_registered || 0;
+      const pct = Math.min(100, Math.round(done / c.target * 100));
+      extra += `<div class="ch-run"><span>本次 ${done} / ${c.target}</span><div class="ch-progress"><div style="width:${pct}%"></div></div></div>`;
+    } else if (c.producing && c.pending > 0) {
+      extra += `<div class="ch-sub">待生产 ${c.pending}</div>`;
+    }
+    return `<a class="ch-card" href="${esc(c.page)}" style="--ch:${CH_COLOR[c.key] || 'var(--primary)'}">
+      <div class="ch-head"><span class="ch-dot"></span><span class="ch-name">${esc(c.name)}</span>${state}</div>
+      <div class="ch-main"><b>${c.registered || 0}</b><span>已注册</span></div>
+      <div class="ch-meta">
+        <span>注册中 <b>${c.in_progress || 0}</b></span>
+        <span>失败 <b class="${c.failed ? 'red' : ''}">${c.failed || 0}</b></span>
+        <span>未出库 <b>${c.unshipped || 0}</b></span>
+      </div>${extra}
+    </a>`;
+  }).join('');
+}
+
+function renderTrend(trend, list) {
+  const keys = list.map(c => c.key);
+  const totals = trend.map(t => keys.reduce((a, k) => a + ((t.counts || {})[k] || 0), 0));
+  const max = Math.max(1, ...totals);
+  document.getElementById('trend-bars').innerHTML = trend.map((t, i) => {
+    const total = totals[i], counts = t.counts || {};
+    const segs = keys.filter(k => counts[k] > 0).map(k =>
+      `<div class="bar-seg" style="height:${counts[k] / total * 100}%;background:${CH_COLOR[k]}" title="${CH_NAME[k] || k} ${counts[k]}"></div>`).join('');
+    const h = total ? Math.max(4, Math.round(total / max * 100)) : 2;
+    return `<div class="bar-col"><span class="bar-val">${total}</span><div class="bar-stack" style="height:${h}%">${segs}</div><span class="bar-lbl">${(t.date || '').slice(5)}</span></div>`;
+  }).join('');
+  document.getElementById('trend-legend').innerHTML = list.map(c =>
+    `<span class="tl-item"><span class="lg-dot" style="background:${CH_COLOR[c.key]}"></span>${esc(c.name)}</span>`).join('');
+}
+
+function renderDonut(list) {
+  const parts = list.filter(c => c.registered > 0);
+  const sum = parts.reduce((a, c) => a + c.registered, 0);
   const donut = document.getElementById('donut');
   const legend = document.getElementById('donut-legend');
   set('donut-total', sum);
   if (!sum) {
     donut.style.background = 'conic-gradient(#eef0f5 0 100%)';
-    legend.innerHTML = '<div class="mini-empty">暂无数据</div>';
+    legend.innerHTML = '<div class="lg-empty">暂无已注册账号</div>';
     return;
   }
-  let acc = 0, seg = [];
-  parts.forEach(([k, v]) => {
-    const from = acc / sum * 100, to = (acc + v) / sum * 100;
-    seg.push(`${STATUS_COLOR[k]} ${from}% ${to}%`);
-    acc += v;
+  let acc = 0;
+  const seg = parts.map(c => {
+    const from = acc / sum * 100, to = (acc + c.registered) / sum * 100;
+    acc += c.registered;
+    return `${CH_COLOR[c.key]} ${from}% ${to}%`;
   });
   donut.style.background = 'conic-gradient(' + seg.join(',') + ')';
-  legend.innerHTML = parts.map(([k, v]) =>
-    `<div class="lg-item"><span class="lg-dot" style="background:${STATUS_COLOR[k]}"></span>${DASH_STATUS[k]}<b>${v}</b><span class="lg-pct">${(v / sum * 100).toFixed(0)}%</span></div>`
+  legend.innerHTML = parts.map(c =>
+    `<div class="lg-item"><span class="lg-dot" style="background:${CH_COLOR[c.key]}"></span>${esc(c.name)}<b>${c.registered}</b><span class="lg-pct">${(c.registered / sum * 100).toFixed(0)}%</span></div>`
   ).join('');
 }
 
-function renderTrend(trend) {
-  const box = document.getElementById('trend-bars');
-  if (!trend || !trend.length) { box.innerHTML = '<div class="mini-empty">暂无产量记录</div>'; return; }
-  const max = Math.max(1, ...trend.map(t => t.count));
-  box.innerHTML = trend.map(t => {
-    const h = Math.round(t.count / max * 100);
-    const md = (t.date || '').slice(5);
-    return `<div class="bar-col"><span class="bar-val">${t.count}</span><div class="bar" style="height:${Math.max(4, h)}%"></div><span class="bar-lbl">${md}</span></div>`;
-  }).join('');
-}
-
-function renderProduce(d) {
-  const running = d.running;
-  set('pp-state', running ? '运行中' : '空闲');
-  document.getElementById('pp-state').className = 'dash-produce-state' + (running ? ' on' : '');
-  const target = d.produce_target || 0, done = d.produce_registered || 0;
-  set('pp-registered', done); set('pp-target', target);
-  set('pp-pending', d.produce_pending || 0);
-  set('pp-running', d.produce_running || 0);
-  set('pp-failed', d.produce_failed || 0);
-  set('pp-msg', d.produce_message || (running ? '' : '当前无生产任务'));
-  const pct = target > 0 ? Math.min(100, Math.round(done / target * 100)) : 0;
-  document.getElementById('pp-bar').style.width = pct + '%';
-}
-
-function renderPlans(plans) {
-  const box = document.getElementById('plan-rows');
-  const keys = Object.keys(plans || {});
-  if (!keys.length) { box.innerHTML = '<div class="mini-empty">暂无</div>'; return; }
-  box.innerHTML = keys.map(k => `<div class="mini-row"><span>${esc(k)}</span><b>${plans[k]}</b></div>`).join('');
+function renderRecent(rows) {
+  document.getElementById('dash-rows').innerHTML = (rows || []).map(x => `
+    <tr>
+      <td><span class="ch-tag" style="--ch:${CH_COLOR[x.channel] || 'var(--primary)'}"><span class="ch-dot"></span>${esc(CH_NAME[x.channel] || x.channel)}</span></td>
+      <td>${esc(x.email)}</td>
+      <td><span class="badge ${esc(x.status)}">${esc(statusLabel(x.channel, x.status))}</span></td>
+      <td>${fmtTime(x.created_at)}</td>
+    </tr>`).join('') || '<tr><td colspan="4">暂无数据</td></tr>';
 }
 
 async function loadDashboard() {
-  const r = await api('/api/stats');
-  const d = await r.json();
-  for (const k of ['total', 'registered', 'registering', 'register_failed', 'unshipped', 'mailbox_verified']) set('st-' + k, d[k] || 0);
-  set('mi-mother', d.mother || 0);
-  set('mi-fission', d.fission || 0);
-  set('mi-shipped', d.shipped || 0);
-  set('mi-mbv', d.mailbox_verified || 0);
-  set('mi-mb', d.mailboxes || 0);
-  renderDonut(d);
-  renderTrend(d.trend);
-  renderProduce(d);
-  renderPlans(d.plans);
-
-  const lr = await api('/api/registrations?page=1&size=8');
-  const ld = await lr.json();
-  document.getElementById('dash-rows').innerHTML = (ld.data || []).map(x => `
-    <tr>
-      <td>${x.id}</td>
-      <td>${esc(x.email)}</td>
-      <td>${x.is_mother ? '母号' : '裂变'}</td>
-      <td><span class="badge ${esc(x.status)}">${DASH_STATUS[x.status] || esc(x.status)}</span></td>
-      <td>${x.shipped ? '已出库' : '未出库'}</td>
-      <td>${fmtTime(x.created_at)}</td>
-    </tr>`).join('') || '<tr><td colspan="6">暂无数据</td></tr>';
+  const d = await (await api('/api/stats')).json();
+  const s = d.summary || {};
+  set('sum-registered', s.registered || 0);
+  set('sum-today', s.today || 0);
+  set('sum-running', s.running || 0);
+  set('sum-failed', s.failed || 0);
+  set('sum-unshipped', s.unshipped || 0);
+  set('sum-mailbox', s.mailbox_verified || 0);
+  set('sum-mailbox-total', s.mailboxes || 0);
+  const list = d.channels || [];
+  renderChannels(list);
+  renderTrend(d.trend || [], list);
+  renderDonut(list);
+  renderRecent(d.recent);
 }
+
 async function loadBrowser() {
   let s;
   try { s = await (await api('/api/browser/status')).json(); } catch (e) { return; }
@@ -203,16 +179,6 @@ async function loadBrowser() {
   const pct = s.percent || 0;
   document.getElementById('bb-pct').textContent = (s.phase === 'downloading' || s.phase === 'unzip') ? pct + '%' : '';
   document.getElementById('bb-bar').style.width = (s.phase === 'error' ? 100 : pct) + '%';
-}
-
-async function deleteAllAccounts() {
-  if (!confirm('确定删除全部账户？此操作不可恢复。')) return;
-  if (!confirm('再次确认：将永久删除所有账户记录。')) return;
-  const r = await api('/api/registrations', { method: 'DELETE' });
-  const d = await r.json().catch(() => ({}));
-  if (!r.ok) return toast('全部删除失败: ' + (d.error || r.status), true);
-  toast('已删除 ' + (d.deleted || 0) + ' 个账户');
-  loadDashboard();
 }
 
 loadDashboard();
