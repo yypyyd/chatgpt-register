@@ -569,7 +569,7 @@ func (p *Producer) run(id uint) {
 		p.appendLog(id, "注册失败: "+err.Error())
 		p.db.Model(&models.AdobeRegistration{}).Where("id = ?", id).Updates(map[string]any{
 			"status": "register_failed",
-			"note":   prodcore.Truncate(err.Error(), 500),
+			"note":   prodcore.Truncate("【"+prodcore.ClassifyFailure(err.Error())+"】 "+err.Error(), 500),
 		})
 		return
 	}

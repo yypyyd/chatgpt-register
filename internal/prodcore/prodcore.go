@@ -146,6 +146,30 @@ func Truncate(s string, n int) string {
 	return s[:n]
 }
 
+// ClassifyFailure 把失败原因归到一个「一眼知道该怎么办」的类别，供 note 前缀与界面展示。
+// 判断按从具体到宽泛排序，避免「超时」等宽泛词抢先命中。
+func ClassifyFailure(msg string) string {
+	m := strings.ToLower(msg)
+	switch {
+	case strings.Contains(msg, "未解出") || strings.Contains(m, "unsolvable"):
+		return "打码没解出(换干净IP/换打码商)"
+	case strings.Contains(msg, "没有可用代理") || strings.Contains(msg, "启用打码") || strings.Contains(msg, "未配置打码") || strings.Contains(msg, "提取 API"):
+		return "打码/代理没配好"
+	case strings.Contains(msg, "账号已存在") || strings.Contains(msg, "已有账号") || strings.Contains(m, "already") || strings.Contains(m, "exists"):
+		return "账号已存在"
+	case strings.Contains(msg, "取消"):
+		return "已取消"
+	case strings.Contains(msg, "图形验证") || strings.Contains(msg, "被拦") || strings.Contains(msg, "风控") || strings.Contains(m, "challenge"):
+		return "被风控(建议换IP)"
+	case strings.Contains(msg, "验证码"):
+		return "验证码问题"
+	case strings.Contains(m, "timeout") || strings.Contains(m, "deadline") || strings.Contains(m, "eof") || strings.Contains(msg, "超时") || strings.Contains(msg, "连接"):
+		return "网络/超时"
+	default:
+		return "其他"
+	}
+}
+
 // Sleep 等一段时间；ctx 取消时立刻返回 false。
 func Sleep(ctx context.Context, d time.Duration) bool {
 	select {
