@@ -74,7 +74,7 @@ func (t *TwoCaptcha) SolveHCaptcha(ctx context.Context, sitekey, pageURL, rqdata
 	if err != nil {
 		return "", err
 	}
-	t.logf("2Captcha 已提交 hCaptcha 任务 id=%s，等待结果", id)
+	t.logf("2Captcha 已提交 hCaptcha 任务，等待结果")
 
 	deadline := time.Now().Add(solveTimeout)
 	if !sleepCtx(ctx, firstPollWait) {
@@ -158,7 +158,7 @@ func (t *TwoCaptcha) SolveFunCaptcha(ctx context.Context, publicKey, pageURL, su
 			}
 			return "", err
 		}
-		t.logf("2Captcha 已提交 Arkose FunCaptcha 任务 id=%s（第 %d/%d 次），等待结果", id, attempt, attempts)
+		t.logf("2Captcha 已提交 Arkose 任务（第 %d/%d 次），等待结果", attempt, attempts)
 		token, err := t.poll(ctx, id)
 		if err == nil {
 			return token, nil

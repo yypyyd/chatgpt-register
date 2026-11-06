@@ -55,11 +55,9 @@ func invalidateSignupConfig() {
 func registerProtocol(ctx context.Context, in Input) (*Result, error) {
 	in.logf("Grok 协议注册启动")
 	if strings.TrimSpace(in.Proxy) != "" {
-		server, _, _, perr := proxyutil.Parse(in.Proxy)
-		if perr != nil {
+		if _, _, _, perr := proxyutil.Parse(in.Proxy); perr != nil {
 			return nil, fmt.Errorf("解析代理失败: %w", perr)
 		}
-		in.logf("Grok 协议客户端使用上游代理: %s", server)
 	}
 
 	impersonate := firstNonEmpty(in.Impersonate, "chrome_131")
@@ -85,7 +83,6 @@ func registerProtocol(ctx context.Context, in Input) (*Result, error) {
 	if cached, ok := cachedSignupConfig(); ok {
 		if status, _, werr := client.WarmSignup(); werr == nil && status == 200 {
 			scfg = cached
-			in.logf("复用缓存的注册配置 site_key=%s action=%s…", scfg.SiteKey, trimText(scfg.ActionID, 12))
 		} else {
 			in.logf("缓存配置 warm 失败(status=%d err=%v)，重新抓取", status, werr)
 			invalidateSignupConfig()
@@ -105,9 +102,8 @@ func registerProtocol(ctx context.Context, in Input) (*Result, error) {
 			if rerr := client.RecreateWithProfile(fb); rerr != nil {
 				continue
 			}
-			in.logf("尝试指纹回退 profile=%s", fb)
 			if scfg, err = client.FetchConfig(); err == nil {
-				in.logf("warm 成功 profile=%s", client.Profile())
+				in.logf("指纹回退成功（%s）", client.Profile())
 				break
 			}
 			in.logf("回退 %s 仍失败: %v", fb, err)
@@ -135,14 +131,11 @@ func registerProtocol(ctx context.Context, in Input) (*Result, error) {
 		return nil, fmt.Errorf("获取注册配置失败: %w", err)
 	}
 	if scfg.Standalone {
-		in.logf("使用官网新版 JSON 注册流程，初始化 Castle SDK（Node.js）")
 		if err = client.StartCastle(ctx, scfg); err != nil {
 			return nil, fmt.Errorf("初始化注册会话失败: %w", err)
 		}
 		defer client.CloseCastle()
 	}
-	in.logf("注册配置就绪 site_key=%s action=%s… source=%s profile=%s",
-		scfg.SiteKey, trimText(scfg.ActionID, 12), scfg.Source, client.Profile())
 
 	// 1) request email validation code, wait for the mailbox to deliver it.
 	if scfg.Standalone {
@@ -177,12 +170,11 @@ func registerProtocol(ctx context.Context, in Input) (*Result, error) {
 		}
 	}
 
-	in.logf("签发 Turnstile（2Captcha HTTP）")
 	token, err := mintTurnstileToken(ctx, in, scfg.SiteKey, protocol.SiteURL+"/sign-up")
 	if err != nil {
 		return nil, fmt.Errorf("签发 Turnstile 令牌失败: %w", err)
 	}
-	in.logf("Turnstile 令牌已就绪(len=%d)，提交注册", len(token))
+	in.logf("Turnstile 打码成功，提交注册")
 	var text, sso string
 	if scfg.Standalone {
 		sso, err = client.CreateSignupAccount(ctx, in.Email, in.Password, in.FirstName, in.LastName, code, token)
@@ -190,7 +182,6 @@ func registerProtocol(ctx context.Context, in Input) (*Result, error) {
 		body := protocol.BuildSignupBody(in.Email, in.Password, code, token)
 		text, sso, err = client.SignupServerAction(body, scfg.ActionID, scfg.StateTree)
 	}
-	in.logf("signup 响应: err=%v sso=%t", err, sso != "")
 	if sso == "" {
 		sso = protocol.ExtractSSOFromText(text)
 	}

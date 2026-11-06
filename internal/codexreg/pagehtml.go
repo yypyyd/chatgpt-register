@@ -153,9 +153,6 @@ func (c *protocolClient) rememberAuthPage(pageURL string, body []byte) {
 	if looksLikeHTMLDocument(body) {
 		c.authHTML = append([]byte(nil), body...)
 	}
-	prefix := strings.ReplaceAll(string(body), "\n", " ")
-	c.in.logf("🛡 捕获页面 HTML url=%s bytes=%d html=%t prefix=%s",
-		truncateForLog(pageURL, 96), len(body), looksLikeHTMLDocument(body), truncateForLog(prefix, 220))
 }
 
 func (c *protocolClient) loadAuthDocument(ctx context.Context, pageURL, referer string) (string, error) {

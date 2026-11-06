@@ -452,7 +452,7 @@ func (p *Producer) produceOne(ctx context.Context, cfg Config, mb models.Mailbox
 		}
 	}
 
-	appendLog("✓ ChatGPT 注册成功（未执行 Agent Identity）")
+	appendLog("✓ ChatGPT 注册成功")
 	authBytes, _ := json.MarshalIndent(res.AuthJSON, "", "  ")
 	verifiedAt := time.Now().UTC()
 	registered := models.Registration{

@@ -46,7 +46,7 @@ func (t *TwoCaptcha) SolveTurnstile(ctx context.Context, sitekey, pageURL, actio
 	if err != nil {
 		return "", err
 	}
-	t.logf("2Captcha 已提交 Turnstile 任务 id=%s，等待结果", id)
+	t.logf("2Captcha 已提交 Turnstile 任务，等待结果")
 
 	deadline := time.Now().Add(solveTimeout)
 	if !sleepCtx(ctx, firstPollWait) {

@@ -189,10 +189,8 @@ func (c *protocolClient) sendInitialEmailCodeIfPending(ctx context.Context, land
 		return time.Time{}, false, err
 	}
 	if !first.eligibleForInitialSend() {
-		c.in.logf("📧 当前会话无需执行 passwordless 首次发码 pending=%t mode=%s", first.SendPending, first.Mode)
 		return time.Time{}, false, nil
 	}
-	c.in.logf("📧 已确认 passwordless 首次发码待处理 mode=%s", first.Mode)
 
 	// Supply the already-read first snapshot so the shared runner does not add
 	// a third network read. It still performs the mandatory post-token recheck.
@@ -209,9 +207,7 @@ func (c *protocolClient) sendInitialEmailCodeIfPending(ctx context.Context, land
 		return time.Time{}, false, err
 	}
 	if sent {
-		c.in.logf("📧 passwordless 首次发码请求已被接受，等待收件确认")
-	} else {
-		c.in.logf("📧 Sentinel 签发期间待发送状态已清除，不重复发信")
+		c.in.logf("📧 验证码已发送，等待收件")
 	}
 	return sentAt, sent, nil
 }

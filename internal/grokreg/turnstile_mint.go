@@ -24,7 +24,6 @@ func mintTurnstileToken(ctx context.Context, in Input, sitekey, pageURL string) 
 	if key == "" {
 		return "", fmt.Errorf("未配置 2Captcha key（设置 captcha_2captcha_key）")
 	}
-	in.logf("Turnstile 走 2Captcha HTTP（不开浏览器） sitekey=%s", trimText(sitekey, 18))
 	solver := &captcha.TwoCaptcha{Key: key, Log: in.Log}
 	tok, err := solver.SolveTurnstile(ctx, sitekey, pageURL, "", "")
 	if err != nil {

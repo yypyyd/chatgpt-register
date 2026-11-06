@@ -15,9 +15,9 @@ import (
 
 func newPageClient(ctx context.Context, in Input) (*leoClient, error) {
 	if in.Headless {
-		in.logf("启动无头浏览器过 Vercel BotID，随后走页面 fetch")
+		in.logf("启动无头浏览器，打开 Leonardo 登录页")
 	} else {
-		in.logf("启动可见浏览器过 Vercel BotID，随后走页面 fetch")
+		in.logf("启动可见浏览器，打开 Leonardo 登录页")
 	}
 	browser, authBridge, cleanup, err := launchLeonardoBrowser(in)
 	if err != nil {
@@ -76,7 +76,7 @@ func newPageClient(ctx context.Context, in Input) (*leoClient, error) {
 	if err = waitPastBotID(ctx, page, in, 120*time.Second); err != nil {
 		return nil, err
 	}
-	in.logf("登录页已出现邮箱框，后续 auth 走页面 fetch")
+	in.logf("Leonardo 登录页已加载")
 	if _, werr := c.get(ctx, origin+pathCrossOrigin); werr != nil {
 		in.logf("cross-origin-cookie 预热失败（继续）: %v", werr)
 	}

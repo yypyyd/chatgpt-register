@@ -94,7 +94,6 @@ func launchAdobeBrowser(in Input) (browser *rod.Browser, bridge *proxyutil.AuthB
 		in.logf("准备 Adobe 专用 Chromium 失败，回退默认浏览器: %v", cerr)
 	} else {
 		l = l.Bin(chromePath)
-		in.logf("使用 Adobe 专用 Chromium，与 GPT/Grok 浏览器隔离")
 	}
 
 	if strings.TrimSpace(in.Proxy) != "" {
@@ -103,15 +102,12 @@ func launchAdobeBrowser(in Input) (browser *rod.Browser, bridge *proxyutil.AuthB
 			return nil, nil, nil, fmt.Errorf("解析代理失败: %w", perr)
 		}
 		if user != "" || pass != "" {
-			upstreamServer := server
 			bridge, server, perr = proxyutil.StartAuthBridge(in.Proxy)
 			if perr != nil {
 				return nil, nil, nil, fmt.Errorf("启动认证代理桥失败: %w", perr)
 			}
-			in.logf("已启用 Chromium 本地认证代理桥，本地 %s → 上游 %s", server, upstreamServer)
 		}
 		l = l.Set("proxy-server", server)
-		in.logf("Chromium 使用代理入口: %s", server)
 	}
 
 	controlURL, lerr := l.Launch()
@@ -200,7 +196,6 @@ func registerBrowser(ctx context.Context, in Input) (res *Result, err error) {
 			if vals, perr := url.ParseQuery(body); perr == nil {
 				if blob := strings.TrimSpace(vals.Get("data[blob]")); blob != "" {
 					_, _ = page.Eval(`(b) => { window.__arkBlob = b; }`, blob)
-					in.logf("已从 Arkose 请求捕获 blob（len=%d）", len(blob))
 				}
 			}
 		}
@@ -224,7 +219,6 @@ func registerBrowser(ctx context.Context, in Input) (res *Result, err error) {
 					AcceptLanguage: "en-US,en;q=0.9",
 					Platform:       "Linux x86_64",
 				}).Call(page)
-				in.logf("无头 UA 已修正: %s", ua)
 			}
 		}
 	}
@@ -566,7 +560,6 @@ func gotoStable(ctx context.Context, page *rod.Page, target string, in Input, ti
 		time.Sleep(300 * time.Millisecond)
 	}
 	if last != "" {
-		in.logf("页面加载完成(可能仍在跳转): %s", trimText(last, 120))
 		return nil
 	}
 	return fmt.Errorf("导航到 %s 超时", target)
@@ -660,10 +653,7 @@ func fillStep1(ctx context.Context, page *rod.Page, in Input) error {
 func completeSignup(ctx context.Context, page *rod.Page, in Input) error {
 	const stepTimeout = 180 * time.Second
 	deadline := time.Now().Add(stepTimeout)
-	extend := func(reason string) {
-		deadline = time.Now().Add(stepTimeout)
-		in.logf("注册阶段完成（%s），重置 3 分钟步骤超时", reason)
-	}
+	extend := func() { deadline = time.Now().Add(stepTimeout) }
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -673,28 +663,28 @@ func completeSignup(ctx context.Context, page *rod.Page, in Input) error {
 			return fmt.Errorf("注册落到错误页: %s", trimText(u, 200))
 		}
 		if isSignupDoneURL(u) {
-			in.logf("注册表单已完成: %s", trimText(u, 120))
+			in.logf("注册表单已完成")
 			return nil
 		}
 		if onEmailVerify(page, u) {
 			if err := handleEmailVerification(ctx, page, in); err != nil {
 				return err
 			}
-			extend("邮箱验证")
+			extend()
 			continue
 		}
 		if hasSel(page, `input[name="firstname"]`) {
 			if err := fillStep2(ctx, page, in); err != nil {
 				return err
 			}
-			extend("创建账号提交")
+			extend()
 			continue
 		}
 		if time.Now().After(deadline) {
 			// 页面可能刚好在超时边界跳转完成，失败前再确认一次。
 			u = pageURL(page)
 			if isSignupDoneURL(u) {
-				in.logf("注册表单已完成: %s", trimText(u, 120))
+				in.logf("注册表单已完成")
 				return nil
 			}
 			return fmt.Errorf("完成注册步骤超时（可能遇到额外校验，当前页面: %s）", trimText(u, 200))
@@ -916,7 +906,11 @@ func solveArkose(ctx context.Context, page *rod.Page, in Input, challenge *arkos
 		return fmt.Errorf("未找到 Arkose game-core 谜题 iframe")
 	}
 	solveURL := challenge.GameURL
-	in.logf("检测到 Adobe Arkose 图形验证，提交打码 (game=%s id=%s blob=%s)", trimText(challenge.GameURL, 120), trimText(challenge.MessageID, 40), trimText(challenge.Blob, 16))
+	if strings.TrimSpace(challenge.Blob) == "" {
+		in.logf("检测到 Adobe Arkose 图形验证（未捕获到 blob，解出率会明显下降）")
+	} else {
+		in.logf("检测到 Adobe Arkose 图形验证")
+	}
 	token, err := in.Captcha.SolveFunCaptcha(ctx, challenge.PublicKey, solveURL, challenge.Surl, challenge.Blob, ua)
 	if err != nil {
 		return fmt.Errorf("Arkose 打码失败: %w", err)
@@ -927,7 +921,7 @@ func solveArkose(ctx context.Context, page *rod.Page, in Input, challenge *arkos
 	if err := injectArkoseToken(page, challenge, token); err != nil {
 		return err
 	}
-	in.logf("Arkose 打码成功，已注入 token 并等待页面继续")
+	in.logf("Arkose 打码成功")
 	// 页面收到完成事件后才会发 create-account 请求。等 Arkose 消失；若仍在，
 	// 说明 token 被页面/服务端拒绝，交给调用方切换备用打码服务。
 	if !waitCleared(ctx, page, 10*time.Second, func() bool { return !onArkosePuzzle(page) }) {
@@ -1139,8 +1133,7 @@ func handleEmailVerification(ctx context.Context, page *rod.Page, in Input) erro
 		if !onEmailVerify(page, pageURL(page)) {
 			return nil
 		}
-		in.logf("检测到 Adobe 邮箱验证码页面，开始自动读取验证码")
-		in.logf("等待 Adobe 核验验证码（最多 2 分钟）...")
+		in.logf("检测到 Adobe 邮箱验证码页面，等待验证码（最多 2 分钟）")
 		codeCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 		code, err := in.WaitCode(codeCtx)
 		cancel()
@@ -1197,7 +1190,7 @@ func waitFireflyReady(ctx context.Context, page *rod.Page, in Input, timeout tim
 				} catch (_) { return false; }
 			}`)
 			if err == nil && ready.Value.Bool() {
-				in.logf("Firefly 编辑器与 ARP SDK 已就绪: %s", trimText(u, 120))
+				in.logf("Firefly 编辑器已就绪")
 				return nil
 			}
 		}
@@ -1225,7 +1218,6 @@ func captureArpSessionToken(page *rod.Page, in Input) string {
 			in.logf("打开 Firefly 编辑器失败: %v", err)
 		}
 	}
-	in.logf("ARP 采集页面: %s", trimText(pageURL(page), 120))
 	for i := 0; i < 45; i++ {
 		if readStr(`sessionStorage.getItem('riskSessionId')||''`) != "" &&
 			readStr(`(window.SherlockSdk && typeof window.SherlockSdk.Sherlock) ? '1' : ''`) != "" {
@@ -1286,7 +1278,7 @@ func captureArpSessionToken(page *rod.Page, in Input) string {
 		in.logf("等待 ARP session token 超时（页面 %s）", trimText(pageURL(page), 120))
 		return ""
 	}
-	in.logf("已捕获 ARP session token（长度 %d）", len(token))
+	in.logf("已捕获 ARP session token")
 	return token
 }
 

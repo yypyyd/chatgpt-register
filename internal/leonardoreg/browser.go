@@ -92,7 +92,6 @@ func launchLeonardoBrowser(in Input) (browser *rod.Browser, bridge *proxyutil.Au
 		in.logf("准备 Leonardo 专用 Chromium 失败，回退默认浏览器: %v", cerr)
 	} else {
 		l = l.Bin(chromePath)
-		in.logf("使用 Leonardo 专用 Chromium，与其它平台浏览器隔离")
 	}
 
 	// 加载 Turnstile 补丁扩展（同 grokreg）：不打补丁时 Cloudflare 能从
@@ -103,7 +102,6 @@ func launchLeonardoBrowser(in Input) (browser *rod.Browser, bridge *proxyutil.Au
 		patchDir = ""
 	} else {
 		l = l.Set("disable-extensions-except", patchDir).Set("load-extension", patchDir)
-		in.logf("已加载 Turnstile 补丁扩展")
 	}
 	removePatch := func() {
 		if patchDir != "" {
@@ -122,15 +120,12 @@ func launchLeonardoBrowser(in Input) (browser *rod.Browser, bridge *proxyutil.Au
 			return nil, nil, nil, fmt.Errorf("解析代理失败: %w", perr)
 		}
 		if user != "" || pass != "" {
-			upstreamServer := server
 			bridge, server, perr = proxyutil.StartAuthBridge(in.Proxy)
 			if perr != nil {
 				return nil, nil, nil, fmt.Errorf("启动认证代理桥失败: %w", perr)
 			}
-			in.logf("已启用 Chromium 本地认证代理桥，本地 %s → 上游 %s", server, upstreamServer)
 		}
 		l = l.Set("proxy-server", server)
-		in.logf("Chromium 使用代理入口: %s", server)
 	}
 
 	controlURL, lerr := l.Launch()
@@ -177,7 +172,6 @@ func gotoStable(ctx context.Context, page *rod.Page, target string, in Input, ti
 		time.Sleep(300 * time.Millisecond)
 	}
 	if last != "" {
-		in.logf("页面加载完成(可能仍在跳转): %s", trimText(last, 120))
 		return nil
 	}
 	return fmt.Errorf("导航到 %s 超时", target)

@@ -95,7 +95,6 @@ func Register(ctx context.Context, in Input) (*Result, error) {
 	// 全协议库存以 Web Session 为准。注册瞬间打 conversation/init
 	// 会把刚建的号送进异步反滥用复核；出库管线稍后会再取 AT 并探针。
 	res.AuthJSON["token_initially_verified_at"] = time.Now().UTC().Format(time.RFC3339)
-	in.logf("✅ ChatGPT 注册完成（已跳过 Agent Identity）")
 	return res, nil
 }
 

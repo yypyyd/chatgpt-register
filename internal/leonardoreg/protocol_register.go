@@ -20,11 +20,9 @@ func registerProtocol(ctx context.Context, in Input) (res *Result, err error) {
 	}
 	in.logf("Leonardo 协议注册启动")
 	if strings.TrimSpace(in.Proxy) != "" {
-		server, _, _, perr := proxyutil.Parse(in.Proxy)
-		if perr != nil {
+		if _, _, _, perr := proxyutil.Parse(in.Proxy); perr != nil {
 			return nil, fmt.Errorf("解析代理失败: %w", perr)
 		}
-		in.logf("Leonardo 协议客户端使用上游代理: %s", server)
 	}
 
 	var c *leoClient
@@ -47,7 +45,6 @@ func registerProtocol(ctx context.Context, in Input) (res *Result, err error) {
 	if sitekey == "" {
 		sitekey = fallbackTurnstileSitekey
 	}
-	in.logf("注册配置就绪 sitekey=%s transport=%s", trimText(sitekey, 18), c.kind)
 
 	tok, err := c.mintCaptcha(ctx, sitekey)
 	if err != nil {
@@ -83,7 +80,7 @@ func openLeoClient(ctx context.Context, in Input) (*leoClient, error) {
 
 func (c *leoClient) signup(ctx context.Context, in Input, sitekey, token string) error {
 	// 纯协议不先走 GraphQL 查重：那会核销一枚 2Captcha token，邮箱占用由 signup 自己返回。
-	in.logf("提交注册 captcha_len=%d transport=%s", len(token), c.kind)
+	in.logf("提交注册")
 	if err := c.signupLegacy(ctx, in, token); err == nil || errors.Is(err, ErrEmailTaken) || errors.Is(err, errUnconfirmed) {
 		return err
 	} else if captchaRejected(err) {
@@ -103,7 +100,7 @@ func (c *leoClient) signup(ctx context.Context, in Input, sitekey, token string)
 	} else if !isNotFoundErr(err) {
 		return err
 	}
-	in.logf("旧注册接口不可用，改走 sign-up/email")
+	in.logf("旧注册接口不可用，改用新接口注册")
 	fresh, merr := c.remintCaptcha(ctx, sitekey)
 	if merr != nil {
 		return merr
@@ -126,11 +123,10 @@ func (c *leoClient) signupLegacy(ctx context.Context, in Input, token string) er
 			last = fmt.Errorf("提交注册失败: %w", err)
 		} else if r.vercel() {
 			last = fmt.Errorf("注册接口命中 Vercel BotID")
-			in.logf("legacy signup 命中 BotID（第 %d 次）", attempt+1)
+			in.logf("注册接口命中 Vercel BotID（第 %d 次），稍后重试", attempt+1)
 		} else {
 			code, msg := parseAuthError(r.Body)
 			raw := string(r.Body)
-			in.logf("legacy signup HTTP %d %s", r.Status, trimText(raw, 240))
 			if isUnconfirmed(code, msg, raw) {
 				return errUnconfirmed
 			}
@@ -168,7 +164,6 @@ func (c *leoClient) signupBetterAuth(ctx context.Context, in Input, token string
 	}
 	code, msg := parseAuthError(r.Body)
 	raw := string(r.Body)
-	in.logf("sign-up/email HTTP %d %s", r.Status, trimText(raw, 240))
 	if isUnconfirmed(code, msg, raw) {
 		return errUnconfirmed
 	}
@@ -235,7 +230,7 @@ func (c *leoClient) resendCode(ctx context.Context, in Input, sitekey string) er
 			continue
 		}
 		if r.Status >= 200 && r.Status < 300 {
-			in.logf("已请求重发验证码 %s HTTP %d", a.path, r.Status)
+			in.logf("已请求重发验证码")
 			return nil
 		}
 		last = fmt.Errorf("%s HTTP %d %s", a.path, r.Status, trimText(string(r.Body), 160))
@@ -265,13 +260,12 @@ func (c *leoClient) confirm(ctx context.Context, in Input, sitekey, code string)
 	var last error
 	for _, a := range attempts {
 		if err := c.confirmOnce(ctx, in, sitekey, a.path, a.body, a.needCaptcha); err == nil {
-			in.logf("验证码校验通过（%s）", a.path)
+			in.logf("验证码校验通过")
 			return nil
 		} else {
 			last = err
-			in.logf("%s 未通过: %v", a.path, err)
-			if isNotFoundErr(err) {
-				continue
+			if !isNotFoundErr(err) {
+				in.logf("验证码确认未通过: %v", err)
 			}
 		}
 	}
@@ -357,9 +351,7 @@ func (c *leoClient) sessionOK(ctx context.Context) bool {
 		c.in.logf("get-session 命中 Vercel BotID")
 		return false
 	}
-	ok := sessionHasUser(r.Body)
-	c.in.logf("get-session HTTP %d session=%t %s", r.Status, ok, trimText(string(r.Body), 180))
-	return ok
+	return sessionHasUser(r.Body)
 }
 
 func (c *leoClient) ensureSession(ctx context.Context, in Input, sitekey string) error {
@@ -367,7 +359,7 @@ func (c *leoClient) ensureSession(ctx context.Context, in Input, sitekey string)
 		return nil
 	}
 	// Cognito confirm-signup 不会下 better-auth cookie，必须再走一次账密登录。
-	in.logf("会话尚未就绪，用账密 sign-in/email 换会话")
+	in.logf("会话尚未就绪，自动登录换取会话")
 	var last error
 	for attempt := 0; attempt < 2; attempt++ {
 		token, err := c.remintCaptcha(ctx, sitekey)
@@ -382,7 +374,6 @@ func (c *leoClient) ensureSession(ctx context.Context, in Input, sitekey string)
 		if err != nil {
 			return fmt.Errorf("自动登录失败: %w", err)
 		}
-		in.logf("sign-in/email HTTP %d %s", r.Status, trimText(string(r.Body), 200))
 		code, msg := parseAuthError(r.Body)
 		if r.Status < 400 && !looksLikeAPIError(r.Body) {
 			last = nil
@@ -406,7 +397,7 @@ func (c *leoClient) ensureSession(ctx context.Context, in Input, sitekey string)
 		}
 	}
 	if hasBetterAuthCookie(c.cookies()) {
-		in.logf("get-session 仍为空，但已采集到 better-auth cookie，按成功导出")
+		in.logf("会话接口未返回用户，但已取得登录 Cookie，按成功处理")
 		return nil
 	}
 	return fmt.Errorf("未采集到 better-auth 会话 cookie，登录可能未完成")
@@ -417,7 +408,7 @@ func (c *leoClient) result(in Input) (*Result, error) {
 	if !hasBetterAuthCookie(cookies) {
 		return nil, fmt.Errorf("未采集到 better-auth 会话 cookie，登录可能未完成")
 	}
-	in.logf("已采集 %d 条 Cookie（含 better-auth 会话 cookie）", len(cookies))
+	in.logf("已取得登录会话（%d 条 Cookie）", len(cookies))
 	auth := map[string]any{
 		"auth_mode":   "leonardo_protocol_session",
 		"platform":    "leonardo",

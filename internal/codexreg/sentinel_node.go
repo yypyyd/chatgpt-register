@@ -212,26 +212,13 @@ func (c *protocolClient) initSentinelNode(ctx context.Context, snap map[string]a
 		return fmt.Errorf("node Sentinel 初始化异常 type=%s err=%s", ready.Type, ready.Error)
 	}
 	n.ready = true
-	c.in.logf("🛡 Sentinel 已改用 Node 假浏览器跑官方 SDK tls=%s ua=Chrome/%s tz=%s", protocolTLSProfileName(), c.chromeMajor, c.timezone)
 	c.logSentinelHydration("init", snap)
 	return nil
 }
 
-func (c *protocolClient) logSentinelHydration(phase string, snap map[string]any) {
-	n := 0
-	switch s := snap["scripts"].(type) {
-	case []string:
-		n = len(s)
-	case []any:
-		n = len(s)
-	}
-	build, _ := snap["dataBuild"].(string)
-	ago := snap["loadedAgoMs"]
-	search, _ := snap["searchKeys"].(string)
-	href, _ := snap["href"].(string)
-	c.in.logf("🛡 Sentinel 页面水合 phase=%s scripts=%d build=%s age_ms=%v search=%s page=%s",
-		phase, n, truncateForLog(build, 48), ago, search, truncateForLog(href, 96))
-}
+// logSentinelHydration 曾输出页面水合调试信息；为精简执行日志已不再打印，
+// 保留空壳以免改动调用点（排障需要时可临时在此加回）。
+func (c *protocolClient) logSentinelHydration(phase string, snap map[string]any) {}
 
 func (c *protocolClient) fetchOfficialSentinelSDK(ctx context.Context) (string, []byte, error) {
 	boot, err := c.get(ctx, sentinelHost+"/backend-api/sentinel/sdk.js", "https://auth.openai.com/", false)
@@ -255,7 +242,6 @@ func (c *protocolClient) fetchOfficialSentinelSDK(ctx context.Context) (string, 
 	if full.Status != 200 || !isFullSentinelSDK(full.Body) {
 		return "", nil, fmt.Errorf("官方 Sentinel SDK HTTP %d 或内容无法识别", full.Status)
 	}
-	c.in.logf("🛡 已加载官方 Sentinel SDK %s bytes=%d", sdkURL, len(full.Body))
 	return sdkURL, full.Body, nil
 }
 
@@ -451,7 +437,6 @@ func (c *protocolClient) startSentinelPage(ctx context.Context, flow, pageURL st
 		c.sentinelPageAt = map[string]time.Time{}
 	}
 	c.sentinelPageAt[flow] = time.Now()
-	c.in.logf("🛡 Sentinel 页面已就绪 flow=%s，Session Observer 开始观察", flow)
 }
 
 // dwellOnPage 让“看页面”的停留时间至少达到 minSec~maxSec 之间的随机值（从页面就绪算起）。
@@ -464,7 +449,6 @@ func (c *protocolClient) dwellOnPage(ctx context.Context, flow string, minSec, m
 	}
 	target := time.Duration(minSec+ri(maxSec-minSec+1)) * time.Second
 	if left := target - time.Since(start); left > 0 {
-		c.in.logf("🕒 在页面上停留 %.0fs（flow=%s）", left.Seconds(), flow)
 		select {
 		case <-ctx.Done():
 		case <-time.After(left):
@@ -517,7 +501,6 @@ func (c *protocolClient) mintSentinelNode(ctx context.Context, flow, pageURL str
 	}
 	if strings.TrimSpace(msg.SO) != "" {
 		if snap, ok := decodeSessionObserver(msg.SO); ok {
-			c.in.logf("🛡 Session Observer flow=%s %s", flow, snap)
 			// 明明模拟了输入却一次交互都没记到，说明收集器没接上事件。这样的会话即便
 			// 同步签发成功，也会被异步风控撤销 AT——直接失败，不提交。
 			if interacted && snap.Empty() {
@@ -528,7 +511,6 @@ func (c *protocolClient) mintSentinelNode(ctx context.Context, flow, pageURL str
 		}
 	}
 	dumpSentinelTokens(flow, msg.Token, msg.SO)
-	c.in.logf("🛡 Sentinel 已签发 flow=%s page=%s display=node", flow, href)
 	return msg.Token, msg.SO, nil
 }
 

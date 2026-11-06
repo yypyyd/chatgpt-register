@@ -26,8 +26,6 @@ type geoInfo struct {
 
 // lookupGeoIPViaRequest 经由代理出口查询当前 IP 的地理位置，用于对齐 locale / 语言。
 func lookupGeoIPViaRequest(in Input) *geoInfo {
-	in.logf("🌍 正在通过代理查询出口 IP 地理位置...")
-
 	transport := &http.Transport{}
 	if strings.TrimSpace(in.Proxy) != "" {
 		pu, perr := url.Parse(proxyutil.Normalize(in.Proxy))
@@ -66,8 +64,7 @@ func lookupGeoIPViaRequest(in Input) *geoInfo {
 		in.logf("⚠️ GeoIP 查询失败，跳过地理位置对齐 (HTTP %d, resp=%q)", resp.StatusCode, snippet)
 		return nil
 	}
-	in.logf("📍 出口 IP=%s 位置=%s/%s 时区=%s (%.4f, %.4f)",
-		g.Query, g.CountryCode, g.City, g.Timezone, g.Lat, g.Lon)
+	in.logf("📍 出口 IP=%s（%s/%s）", g.Query, g.CountryCode, g.City)
 	return &g
 }
 

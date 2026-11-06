@@ -90,12 +90,6 @@ func Register(ctx context.Context, in Input) (*Result, error) {
 	}
 
 	in.logf("Lovart 协议注册启动")
-	if strings.TrimSpace(in.Proxy) != "" {
-		server, _, _, perr := proxyutil.Parse(in.Proxy)
-		if perr == nil {
-			in.logf("Lovart 协议客户端使用上游代理: %s", server)
-		}
-	}
 
 	if err := c.warmup(ctx); err != nil {
 		in.logf("Lovart 首页预热失败（继续）: %v", err)
@@ -327,7 +321,6 @@ func (c *protocolClient) postJSON(ctx context.Context, path string, payload any,
 
 func (c *protocolClient) mintTurnstile(ctx context.Context) (string, error) {
 	solver := &captcha.TwoCaptcha{Key: c.in.CaptchaKey, Log: c.in.logf}
-	c.in.logf("提交 2Captcha 解 Lovart Turnstile")
 	return solver.SolveTurnstile(ctx, turnstileSitekey, origin+"/", "", "")
 }
 

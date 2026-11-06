@@ -35,7 +35,6 @@ func mintPageTurnstile(ctx context.Context, in Input, page *rod.Page) (string, e
 	}
 	// 组件里若还留着上一口已核销的 token，必须先 reset，否则会直接复用导致 siteverify 失败。
 	if turnstileTokenLen(page.Timeout(5*time.Second)) >= 20 {
-		in.logf("丢弃页面上已签发的旧 Turnstile token")
 		resetTurnstile(page.Timeout(5 * time.Second))
 		if !sleepCtxLeo(ctx, 2*time.Second) {
 			return "", ctx.Err()
@@ -54,7 +53,6 @@ func mintPageTurnstile(ctx context.Context, in Input, page *rod.Page) (string, e
 	if len(tok) < 20 {
 		return "", fmt.Errorf("Turnstile 已通过但未读到 token")
 	}
-	in.logf("页面 Turnstile 令牌已就绪(len=%d)", len(tok))
 	return tok, nil
 }
 
@@ -70,11 +68,6 @@ func mintTurnstileToken(ctx context.Context, in Input, sitekey, pageURL string) 
 		return "", fmt.Errorf("未配置 2Captcha key（设置 captcha_2captcha_key）")
 	}
 	proxy, proxyType := twoCaptchaProxy(in.Proxy)
-	if proxy != "" {
-		in.logf("Turnstile 走 2Captcha HTTP（工人走同一代理） sitekey=%s", trimText(sitekey, 18))
-	} else {
-		in.logf("Turnstile 走 2Captcha HTTP sitekey=%s", trimText(sitekey, 18))
-	}
 	solver := &captcha.TwoCaptcha{
 		Key:       key,
 		Log:       in.Log,

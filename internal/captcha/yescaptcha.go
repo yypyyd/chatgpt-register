@@ -83,7 +83,7 @@ func (y *YesCaptcha) SolveFunCaptcha(ctx context.Context, publicKey, pageURL, su
 	if err != nil {
 		return "", err
 	}
-	y.logf("YesCaptcha 已提交 Arkose 任务 id=%s，等待结果", id)
+	y.logf("YesCaptcha 已提交 Arkose 任务，等待结果")
 	return y.wait(ctx, id)
 }
 
@@ -111,7 +111,7 @@ func (y *YesCaptcha) SolveHCaptcha(ctx context.Context, sitekey, pageURL, rqdata
 	if err != nil {
 		return "", err
 	}
-	y.logf("YesCaptcha 已提交 hCaptcha 任务 id=%s，等待结果", id)
+	y.logf("YesCaptcha 已提交 hCaptcha 任务，等待结果")
 	return y.wait(ctx, id)
 }
 

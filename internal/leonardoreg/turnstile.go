@@ -31,7 +31,7 @@ const (
 func waitTurnstile(ctx context.Context, page *rod.Page, in Input, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	start := time.Now()
-	logged, clicked := false, false
+	clicked := false
 	rounds := 0
 	var lastClick time.Time
 	for time.Now().Before(deadline) {
@@ -41,10 +41,6 @@ func waitTurnstile(ctx context.Context, page *rod.Page, in Input, timeout time.D
 		if turnstileTokenLen(page.Timeout(5*time.Second)) >= 20 {
 			in.logf("Turnstile 人机校验已通过")
 			return nil
-		}
-		if !logged {
-			in.logf("等待 Turnstile 人机校验")
-			logged = true
 		}
 		// 点一次后等它跑挑战（中途重复点会打断），到点还没 token 就 reset 重新发起。
 		// 出口被 Cloudflare 判定时再点也不会出 token，点满 turnstileMaxRounds 轮就
@@ -64,7 +60,7 @@ func waitTurnstile(ctx context.Context, page *rod.Page, in Input, timeout time.D
 				break
 			}
 			if how := clickTurnstileCheckbox(page.Timeout(15 * time.Second)); how != "" {
-				in.logf("已点选 Turnstile 复选框(%s)，等待签发 token", how)
+				in.logf("已点选 Turnstile 复选框")
 				clicked = true
 				rounds++
 				lastClick = time.Now()
