@@ -183,12 +183,14 @@ function parseImportLines(text) {
     line = line.trim();
     if (!line) return;
     const parts = line.split('----').map(p => p.trim());
-    if (parts.length !== 4 || !parts[0].includes('@')) return;
+    // 至少 4 段且第一段是邮箱。client_id 与 refresh_token 固定取最后两段，
+    // 中间多出来的辅助邮箱/辅助密码等字段（号商常见的 6 段格式）忽略。
+    if (parts.length < 4 || !parts[0].includes('@')) return;
     items.push({
       email: parts[0],
       password: parts[1],
-      client_id: parts[2],
-      refresh_token: parts[3],
+      client_id: parts[parts.length - 2],
+      refresh_token: parts[parts.length - 1],
     });
   });
   return items;
