@@ -2,10 +2,13 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
@@ -52,7 +55,7 @@ func probeProxy(ctx context.Context, raw, endpoint string) (string, int64, error
 	start := time.Now()
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", 0, fmt.Errorf("代理连接失败或出口探测超时")
+		return "", 0, fmt.Errorf("代理连接失败或出口探测超时：%s", describeProbeError(err))
 	}
 	defer resp.Body.Close()
 	buf, err := io.ReadAll(io.LimitReader(resp.Body, 256))
@@ -61,6 +64,27 @@ func probeProxy(ctx context.Context, raw, endpoint string) (string, int64, error
 		return "", 0, fmt.Errorf("代理出口探测未返回有效 IP")
 	}
 	return ip, time.Since(start).Milliseconds(), nil
+}
+
+var proxyCredPattern = regexp.MustCompile(`//[^/@\s]+@`)
+
+// describeProbeError 把探测的底层网络错误转成可读文本：剥掉 url.Error 外壳里的目标地址、
+// 脱敏代理账号密码，并在超时时补充最常见的原因（协议不匹配）。
+func describeProbeError(err error) string {
+	inner := err
+	var ue *url.Error
+	if errors.As(err, &ue) && ue.Err != nil {
+		inner = ue.Err
+	}
+	msg := proxyCredPattern.ReplaceAllString(inner.Error(), "//***@")
+	if r := []rune(msg); len(r) > 200 {
+		msg = string(r[:200]) + "…"
+	}
+	var ne net.Error
+	if (errors.As(err, &ne) && ne.Timeout()) || errors.Is(err, context.DeadlineExceeded) {
+		msg += "（12 秒内无响应，常见于协议不匹配：例如把 SOCKS5 端口当作 HTTP 代理使用，请检查提取 API 的 proto 参数或代理前缀）"
+	}
+	return msg
 }
 
 func (h *Handler) proxyManager() *proxypool.Manager {

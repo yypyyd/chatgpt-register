@@ -49,7 +49,44 @@ func normalizeProxy(raw string) (string, error) {
 	return u.String(), nil
 }
 
-func parseList(raw string) ([]string, error) {
+func parseList(raw string) ([]string, error) { return parseListScheme(raw, "") }
+
+// apiProxyScheme reads the protocol the extraction API was asked for (BestGo
+// style `proto=socks5`, or `protocol=socks5`). Such providers return bare
+// host:port lines no matter which protocol was requested, and Normalize would
+// otherwise treat them as HTTP proxies — which hangs until timeout against a
+// SOCKS5 port. Only socks5 is tagged; everything else keeps the HTTP default.
+func apiProxyScheme(apiURL string) string {
+	u, err := url.Parse(apiURL)
+	if err != nil {
+		return ""
+	}
+	q := u.Query()
+	for _, key := range []string{"proto", "protocol"} {
+		switch strings.ToLower(strings.TrimSpace(q.Get(key))) {
+		case "socks5", "socks5h":
+			return "socks5"
+		}
+	}
+	return ""
+}
+
+// tagScheme gives a scheme-less proxy line an explicit scheme, accepting the
+// same host:port and host:port:user:pass forms as proxyutil.Normalize.
+func tagScheme(line, scheme string) string {
+	line = strings.TrimSpace(line)
+	if scheme == "" || line == "" || strings.Contains(line, "://") {
+		return line
+	}
+	if parts := strings.Split(line, ":"); len(parts) == 4 {
+		return (&url.URL{Scheme: scheme, Host: parts[0] + ":" + parts[1], User: url.UserPassword(parts[2], parts[3])}).String()
+	}
+	return scheme + "://" + line
+}
+
+// parseListScheme parses proxy lines; when scheme is non-empty, scheme-less
+// entries are tagged with it before normalization (see apiProxyScheme).
+func parseListScheme(raw, scheme string) ([]string, error) {
 	raw = strings.TrimPrefix(strings.TrimSpace(raw), "\ufeff")
 	raw = strings.ReplaceAll(raw, "\\r\\n", "\n")
 	raw = strings.ReplaceAll(raw, "\r", "\n")
@@ -60,7 +97,7 @@ func parseList(raw string) ([]string, error) {
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
-		proxy, err := normalizeProxy(line)
+		proxy, err := normalizeProxy(tagScheme(line, scheme))
 		if err != nil {
 			return nil, fmt.Errorf("第 %d 行不是有效代理：%s", i+1, err)
 		}
@@ -139,6 +176,6 @@ func (m *Manager) fetchOnce(ctx context.Context, raw string) ([]string, bool, er
 	if len(body) > maxResponseBytes {
 		return nil, false, fmt.Errorf("代理提取结果超过 1 MB")
 	}
-	proxies, err := parseList(string(body))
+	proxies, err := parseListScheme(string(body), apiProxyScheme(raw))
 	return proxies, false, err
 }
