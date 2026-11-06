@@ -81,7 +81,10 @@ func launchAdobeBrowser(in Input) (browser *rod.Browser, bridge *proxyutil.AuthB
 		Set("disable-infobars").
 		Set("disable-popup-blocking").
 		Set("hide-crash-restore-bubble").
-		Set("disable-features", "PrivacySandboxSettings4")
+		// 关掉站点隔离：让 arks-client.adobe.com 的 Arkose iframe 与父页同进程，
+		// 其 /fc/gt2/public_key/ 请求才能被父 page 的 HijackRequests 拦到（抓 blob）。
+		Set("disable-features", "PrivacySandboxSettings4,IsolateOrigins,site-per-process").
+		Set("disable-site-isolation-trials")
 	debugPort, perr := availableLoopbackPort()
 	if perr != nil {
 		return nil, nil, nil, fmt.Errorf("分配 Chrome 调试端口失败: %w", perr)
@@ -188,6 +191,23 @@ func registerBrowser(ctx context.Context, in Input) (res *Result, err error) {
 	if _, e := page.EvalOnNewDocument(adobeArkoseIDScript); e != nil {
 		in.logf("安装 Arkose 消息 id 监听失败: %v", e)
 	}
+	// Arkose 的 data[blob] 由站点 JS 运行时生成，只出现在 enforcement 请求
+	// /fc/gt2/public_key/ 的 postData 里（JS hook 抓不到）。这里拦截该请求、抠出
+	// blob 写回页面的 window.__arkBlob，供 arkoseInfo 读取后喂给打码服务。
+	arkoseRouter := page.HijackRequests()
+	arkoseRouter.MustAdd("*/fc/gt2/public_key/*", func(h *rod.Hijack) {
+		if body := h.Request.Body(); body != "" {
+			if vals, perr := url.ParseQuery(body); perr == nil {
+				if blob := strings.TrimSpace(vals.Get("data[blob]")); blob != "" {
+					_, _ = page.Eval(`(b) => { window.__arkBlob = b; }`, blob)
+					in.logf("已从 Arkose 请求捕获 blob（len=%d）", len(blob))
+				}
+			}
+		}
+		h.ContinueRequest(&proto.FetchContinueRequest{})
+	})
+	go arkoseRouter.Run()
+	defer func() { _ = arkoseRouter.Stop() }()
 	_ = (proto.EmulationSetDeviceMetricsOverride{
 		Width:             1280,
 		Height:            900,
@@ -791,12 +811,13 @@ const maxCaptchaSolves = 2
 
 // maxArkoseSolves 单次提交里最多解几次 Arkose；token 被拒时再解一次仍失败就
 // 直接报错，避免无限循环。
-const maxArkoseSolves = 2
+const maxArkoseSolves = 4
 
 // adobeArkoseIDScript 在页面脚本之前挂上 message 监听，记录 Arkose iframe
 // 发给父页面的消息 id。父页面 Arkose API 校验的 id 是它自己生成的 io.id，
 // 不是 iframe hash 里的 session；直接拿 hash 里的 session 注入会被丢弃。
-const adobeArkoseIDScript = `window.__adobeArkId = ''; window.addEventListener('message', function (e) {
+const adobeArkoseIDScript = `window.__adobeArkId = ''; window.__arkBlob = '';
+window.addEventListener('message', function (e) {
   try {
     var d = (typeof e.data === 'string') ? JSON.parse(e.data) : e.data;
     if (d && d.id && d.message) { window.__adobeArkId = d.id; }
@@ -813,6 +834,7 @@ type arkoseChallenge struct {
 	MessageID string
 	Surl      string
 	GameURL   string
+	Blob      string
 }
 
 // arkoseInfo 从当前页面的 Arkose iframe 解析 publickey / session id / surl，
@@ -823,7 +845,7 @@ func arkoseInfo(page *rod.Page) (*arkoseChallenge, error) {
 		if (!f) return '';
 		const u = new URL(f.src);
 		const parts = decodeURIComponent((u.hash || '').replace(/^#/, '')).split('&');
-		return JSON.stringify({ src: f.src, pk: parts[0] || '', sid: parts[1] || '', surl: u.origin, mid: window.__adobeArkId || '' });
+		return JSON.stringify({ src: f.src, pk: parts[0] || '', sid: parts[1] || '', surl: u.origin, mid: window.__adobeArkId || '', blob: window.__arkBlob || '' });
 	}`)
 	if err != nil {
 		return nil, fmt.Errorf("读取 Arkose 参数失败: %w", err)
@@ -834,6 +856,7 @@ func arkoseInfo(page *rod.Page) (*arkoseChallenge, error) {
 		SID  string `json:"sid"`
 		Surl string `json:"surl"`
 		MID  string `json:"mid"`
+		Blob string `json:"blob"`
 	}
 	if json.Unmarshal([]byte(res.Value.Str()), &raw) != nil || raw.PK == "" {
 		return nil, fmt.Errorf("未取到 Arkose publickey")
@@ -842,7 +865,7 @@ func arkoseInfo(page *rod.Page) (*arkoseChallenge, error) {
 	if mid == "" {
 		mid = raw.SID
 	}
-	return &arkoseChallenge{Src: raw.Src, PublicKey: raw.PK, SessionID: raw.SID, MessageID: mid, Surl: raw.Surl}, nil
+	return &arkoseChallenge{Src: raw.Src, PublicKey: raw.PK, SessionID: raw.SID, MessageID: mid, Surl: raw.Surl, Blob: raw.Blob}, nil
 }
 
 // arkoseGameURL 从 CDP 的 frame tree 里找内层 game-core 谜题 iframe。
@@ -889,8 +912,8 @@ func solveArkose(ctx context.Context, page *rod.Page, in Input, challenge *arkos
 		return fmt.Errorf("未找到 Arkose game-core 谜题 iframe")
 	}
 	solveURL := challenge.GameURL
-	in.logf("检测到 Adobe Arkose 图形验证，提交打码 (game=%s id=%s)", trimText(challenge.GameURL, 160), trimText(challenge.MessageID, 60))
-	token, err := in.Captcha.SolveFunCaptcha(ctx, challenge.PublicKey, solveURL, challenge.Surl, ua)
+	in.logf("检测到 Adobe Arkose 图形验证，提交打码 (game=%s id=%s blob=%s)", trimText(challenge.GameURL, 120), trimText(challenge.MessageID, 40), trimText(challenge.Blob, 16))
+	token, err := in.Captcha.SolveFunCaptcha(ctx, challenge.PublicKey, solveURL, challenge.Surl, challenge.Blob, ua)
 	if err != nil {
 		return fmt.Errorf("Arkose 打码失败: %w", err)
 	}

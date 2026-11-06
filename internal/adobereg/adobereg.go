@@ -40,7 +40,7 @@ type Input struct {
 // CaptchaSolver 解 hCaptcha / Arkose FunCaptcha 并返回 token（由打码服务实现，如 2Captcha）。
 type CaptchaSolver interface {
 	SolveHCaptcha(ctx context.Context, sitekey, pageURL, rqdata, userAgent string) (string, error)
-	SolveFunCaptcha(ctx context.Context, publicKey, pageURL, surl, userAgent string) (string, error)
+	SolveFunCaptcha(ctx context.Context, publicKey, pageURL, surl, blob, userAgent string) (string, error)
 }
 
 type Result struct {

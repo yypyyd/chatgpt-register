@@ -53,7 +53,7 @@ func (y *YesCaptcha) client() *http.Client {
 // SolveFunCaptcha 提交 Arkose FunCaptcha（Adobe 新版 game-core）任务。
 // pageURL 传内层 game-core iframe 的完整 URL；surl 传 iframe 的 origin，
 // 对应 YesCaptcha 的 funcaptchaApiJSSubdomain。
-func (y *YesCaptcha) SolveFunCaptcha(ctx context.Context, publicKey, pageURL, surl, userAgent string) (string, error) {
+func (y *YesCaptcha) SolveFunCaptcha(ctx context.Context, publicKey, pageURL, surl, blob, userAgent string) (string, error) {
 	if strings.TrimSpace(y.Key) == "" {
 		return "", fmt.Errorf("未配置 YesCaptcha key")
 	}
@@ -68,6 +68,13 @@ func (y *YesCaptcha) SolveFunCaptcha(ctx context.Context, publicKey, pageURL, su
 	}
 	if userAgent != "" {
 		task["userAgent"] = userAgent
+	}
+	if blob = strings.TrimSpace(blob); blob != "" {
+		// Arkose 会话 blob（Adobe 的 x-ims-captcha-encrypted）通过 data 字段传入，
+		// 值为 {"blob":"..."} 的 JSON 字符串；缺它打码商会解错会话、几乎必然 UNSOLVABLE。
+		if b, err := json.Marshal(map[string]string{"blob": blob}); err == nil {
+			task["data"] = string(b)
+		}
 	}
 	if err := addYesCaptchaProxy(task, y.Proxy); err != nil {
 		return "", err

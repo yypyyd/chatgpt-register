@@ -500,6 +500,9 @@ func (p *Producer) run(id uint) {
 		Email:    reg.Email,
 		Password: reg.Password,
 		Proxy:    lease.Proxy,
+		// 引擎可切换：adobe_engine=browser 走真实 Chromium（Adobe 风控对纯协议
+		// 普遍下发 Arkose、且协议拿到的是解不开的加密 blob，故默认协议不可用时切这里）。
+		Engine:   p.Setting("adobe_engine"),
 		Headless: p.SettingOn("adobe_headless"),
 		// 出口 IP 探测默认关闭以提速；需排障时置 adobe_egress_check=1。
 		EgressCheck: p.SettingOn("adobe_egress_check"),
@@ -872,7 +875,7 @@ func (p *Producer) captchaSolver(id uint, proxy string) adobereg.CaptchaSolver {
 	}
 	var two adobereg.CaptchaSolver
 	if key := strings.TrimSpace(p.Setting("captcha_2captcha_key")); key != "" {
-		two = &captcha.TwoCaptcha{Key: key, Proxy: captchaProxy, ProxyType: "HTTP", Log: logf}
+		two = &captcha.TwoCaptcha{Key: key, Proxy: captchaProxy, Log: logf}
 	}
 	// 用户要求优先 YesCaptcha；失败时自动回退 2Captcha + 公网代理。
 	if yes != nil && two != nil {

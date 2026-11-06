@@ -420,7 +420,7 @@ func (c *adobeProtocolClient) solveArkoseCaptcha(ctx context.Context, publicKey,
 		return "", fmt.Errorf("Adobe 要求图形验证，但未配置打码服务")
 	}
 	c.in.logf("Adobe %s需要 Arkose，提交打码", stage)
-	token, err := c.in.Captcha.SolveFunCaptcha(ctx, publicKey, c.deeplink, "https://arks-client.adobe.com", c.ua)
+	token, err := c.in.Captcha.SolveFunCaptcha(ctx, publicKey, c.deeplink, "https://arks-client.adobe.com", c.captchaBlob, c.ua)
 	if err != nil {
 		return "", fmt.Errorf("Adobe Arkose 打码失败: %w", err)
 	}

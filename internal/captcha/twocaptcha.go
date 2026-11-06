@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -103,7 +104,7 @@ func (t *TwoCaptcha) SolveHCaptcha(ctx context.Context, sitekey, pageURL, rqdata
 // publicKey/surl/sessionID 从 Arkose enforcement iframe 的 URL 中解析；
 // 实测 Adobe 的 Arkose 令牌不绑定打码出口 IP，传注册代理反而会让工人连不上，
 // 因此这里不向 2Captcha 传 proxy。
-func (t *TwoCaptcha) SolveFunCaptcha(ctx context.Context, publicKey, pageURL, surl, userAgent string) (string, error) {
+func (t *TwoCaptcha) SolveFunCaptcha(ctx context.Context, publicKey, pageURL, surl, blob, userAgent string) (string, error) {
 	if strings.TrimSpace(t.Key) == "" {
 		return "", fmt.Errorf("未配置 2Captcha key")
 	}
@@ -120,6 +121,11 @@ func (t *TwoCaptcha) SolveFunCaptcha(ctx context.Context, publicKey, pageURL, su
 	if surl != "" {
 		form.Set("surl", surl)
 	}
+	if blob != "" {
+		// Arkose 会话 blob（Adobe 的 x-ims-captcha-encrypted）用 data[blob] 传入；
+		// 缺它工人解的是无关会话的题，几乎必然 UNSOLVABLE 或 token 被站点拒。
+		form.Set("data[blob]", blob)
+	}
 	if userAgent != "" {
 		form.Set("userAgent", userAgent)
 	}
@@ -127,12 +133,9 @@ func (t *TwoCaptcha) SolveFunCaptcha(ctx context.Context, publicKey, pageURL, su
 	// sticky 住宅代理时，2Captcha 工人往往连不上（UNSOLVABLE）。这里使用
 	// 设置里的 captcha_2captcha_proxy（公网可访问的 HTTP 代理）。
 	if proxy := strings.TrimSpace(t.Proxy); proxy != "" {
-		form.Set("proxy", normalizeTwoCaptchaProxy(proxy))
-		pt := strings.TrimSpace(t.ProxyType)
-		if pt == "" {
-			pt = "HTTP"
-		}
-		form.Set("proxytype", pt)
+		addr, ptype := twoCaptchaProxyParts(proxy, t.ProxyType)
+		form.Set("proxy", addr)
+		form.Set("proxytype", ptype)
 	}
 	// Adobe 的 Arkose 挑战带有较强的风控随机性：同一组参数偶尔会被工人判为
 	// UNSOLVABLE，隔几秒重新提交通常就能解出来。这里最多重试 3 次，
@@ -227,18 +230,27 @@ func (t *TwoCaptcha) post(ctx context.Context, endpoint string, form url.Values)
 		return "", err
 	}
 	defer resp.Body.Close()
-
-	var out struct {
-		Status  int    `json:"status"`
-		Request string `json:"request"`
+	raw, _ := io.ReadAll(resp.Body)
+	body := strings.TrimSpace(string(raw))
+	// 2Captcha 即便带 json=1 偶尔仍回纯文本（CAPCHA_NOT_READY / OK|xxx / ERROR_xxx），
+	// JSON 与纯文本两种格式都兼容，避免直接 JSON 解析报错中断打码。
+	if strings.HasPrefix(body, "{") {
+		var out struct {
+			Status  int    `json:"status"`
+			Request string `json:"request"`
+		}
+		if err := json.Unmarshal(raw, &out); err != nil {
+			return "", fmt.Errorf("解析 2Captcha 响应失败: %w", err)
+		}
+		if out.Status != 1 {
+			return "", fmt.Errorf("2Captcha 返回错误: %s", out.Request)
+		}
+		return out.Request, nil
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return "", fmt.Errorf("解析 2Captcha 响应失败: %w", err)
+	if strings.HasPrefix(body, "OK|") {
+		return strings.TrimPrefix(body, "OK|"), nil
 	}
-	if out.Status != 1 {
-		return "", fmt.Errorf("2Captcha 返回错误: %s", out.Request)
-	}
-	return out.Request, nil
+	return "", fmt.Errorf("2Captcha 返回错误: %s", body)
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) bool {
@@ -250,11 +262,29 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// normalizeTwoCaptchaProxy 把 http://user:pass@host:port 转成 2Captcha 需要的
-// user:pass@host:port 形式。
-func normalizeTwoCaptchaProxy(proxy string) string {
+// twoCaptchaProxyParts 把代理串拆成 2Captcha 需要的 "login:pass@host:port" 地址，
+// 并按 URL scheme 推断 proxytype（HTTP/HTTPS/SOCKS4/SOCKS5）；override 非空时优先用它。
+// 2Captcha 的 proxy 字段不能带 scheme 前缀，否则返回 ERROR_PROXY_FORMAT。
+func twoCaptchaProxyParts(proxy, override string) (addr, ptype string) {
 	proxy = strings.TrimSpace(proxy)
-	proxy = strings.TrimPrefix(proxy, "http://")
-	proxy = strings.TrimPrefix(proxy, "https://")
-	return strings.TrimRight(proxy, "/")
+	scheme := "http"
+	addr = proxy
+	if i := strings.Index(proxy, "://"); i >= 0 {
+		scheme = strings.ToLower(proxy[:i])
+		addr = proxy[i+3:]
+	}
+	addr = strings.TrimRight(addr, "/")
+	if ptype = strings.ToUpper(strings.TrimSpace(override)); ptype == "" {
+		switch scheme {
+		case "socks5", "socks5h":
+			ptype = "SOCKS5"
+		case "socks4", "socks4a":
+			ptype = "SOCKS4"
+		case "https":
+			ptype = "HTTPS"
+		default:
+			ptype = "HTTP"
+		}
+	}
+	return addr, ptype
 }

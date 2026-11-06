@@ -32,12 +32,12 @@ func (f *captchaFallback) useSecondaryOnly() bool {
 	return f.secondaryOnly && f.secondary != nil
 }
 
-func (f *captchaFallback) SolveFunCaptcha(ctx context.Context, publicKey, pageURL, surl, userAgent string) (string, error) {
+func (f *captchaFallback) SolveFunCaptcha(ctx context.Context, publicKey, pageURL, surl, blob, userAgent string) (string, error) {
 	if f.useSecondaryOnly() {
 		f.logf("使用备用打码服务解 Arkose")
-		return f.secondary.SolveFunCaptcha(ctx, publicKey, pageURL, surl, userAgent)
+		return f.secondary.SolveFunCaptcha(ctx, publicKey, pageURL, surl, blob, userAgent)
 	}
-	token, err := f.primary.SolveFunCaptcha(ctx, publicKey, pageURL, surl, userAgent)
+	token, err := f.primary.SolveFunCaptcha(ctx, publicKey, pageURL, surl, blob, userAgent)
 	if err == nil {
 		return token, nil
 	}
@@ -45,7 +45,7 @@ func (f *captchaFallback) SolveFunCaptcha(ctx context.Context, publicKey, pageUR
 		return "", err
 	}
 	f.logf("主打码服务失败，自动切换备用打码: %v", err)
-	return f.secondary.SolveFunCaptcha(ctx, publicKey, pageURL, surl, userAgent)
+	return f.secondary.SolveFunCaptcha(ctx, publicKey, pageURL, surl, blob, userAgent)
 }
 
 func (f *captchaFallback) SolveHCaptcha(ctx context.Context, sitekey, pageURL, rqdata, userAgent string) (string, error) {
