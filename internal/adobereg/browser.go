@@ -773,7 +773,11 @@ var errCaptchaPuzzle = errors.New("触发 Adobe 图形验证（同 IP 注册过�
 
 // errArkosePuzzle 表示 Adobe 走到了 Arkose FunCaptcha。它和 hCaptcha 是两套
 // 完全不同的接口，不能用 hCaptcha 的打码结果顶替。
-var errArkosePuzzle = errors.New("触发 Adobe Arkose 图形验证，请在系统设置启用 2Captcha 打码后重试")
+var errArkosePuzzle = errors.New("触发 Adobe Arkose 图形验证，请在系统设置启用打码（YesCaptcha/2Captcha）后重试")
+
+// errArkoseUnsolved 表示打码已启用并尝试过，但这道 Arkose 没解出来（UNSOLVABLE / 超时 /
+// token 被拒）。与 errArkosePuzzle（压根没配打码）区分，免得已启用打码还提示去「启用打码」。
+var errArkoseUnsolved = errors.New("Adobe Arkose 打码未通过：已尝试但未解出（UNSOLVABLE/超时），可重试；频繁如此多为打码服务对该 Arkose 解出率偏低")
 
 // errArkoseTokenRejected 表示打码服务返回了 token，但页面没有接受（Arkose 仍存在）。
 // 这类情况应切换到备用打码服务重试，而不是用同一家继续解。
@@ -1083,7 +1087,7 @@ func submitAndAdvance(ctx context.Context, page *rod.Page, in Input, advanced fu
 				return errArkosePuzzle
 			}
 			if arkoseSolves >= maxArkoseSolves {
-				return errArkosePuzzle
+				return errArkoseUnsolved
 			}
 			arkoseSolves++
 			challenge, err := arkoseInfo(page)
@@ -1101,7 +1105,7 @@ func submitAndAdvance(ctx context.Context, page *rod.Page, in Input, advanced fu
 						continue
 					}
 				}
-				return errArkosePuzzle
+				return errArkoseUnsolved
 			}
 			deadline = time.Now().Add(timeout)
 		}
