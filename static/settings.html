@@ -32,14 +32,43 @@
           </div>
         </div>
         <div class="field">
-          <label>各渠道并发（选填，留空＝用上面的全局值）</label>
-          <span class="field-hint">GPT/Grok/Lovart 纯协议可较高；Adobe 走浏览器较重，建议 2~3</span>
+          <label>各渠道并发（选填）</label>
+          <span class="field-hint">每个注册渠道可单独设并发；留空＝用上面的「最大并发数」。下面逐项对应各注册模块</span>
+        </div>
+        <div class="field">
+          <label>· GPT 并发</label>
           <div class="input-suffix">
-            <input id="set-conc-chatgpt" class="px-input" type="number" min="1" max="100" placeholder="GPT" title="GPT 并发">
-            <input id="set-conc-grok" class="px-input" type="number" min="1" max="100" placeholder="Grok" title="Grok 并发">
-            <input id="set-conc-adobe" class="px-input" type="number" min="1" max="100" placeholder="Adobe" title="Adobe 并发">
-            <input id="set-conc-leonardo" class="px-input" type="number" min="1" max="100" placeholder="Leo" title="Leonardo 并发">
-            <input id="set-conc-lovart" class="px-input" type="number" min="1" max="100" placeholder="Lovart" title="Lovart 并发">
+            <input id="set-conc-chatgpt" class="px-input" type="number" min="1" max="100" placeholder="跟随全局">
+            <span class="suffix">个</span>
+          </div>
+        </div>
+        <div class="field">
+          <label>· Grok 并发</label>
+          <div class="input-suffix">
+            <input id="set-conc-grok" class="px-input" type="number" min="1" max="100" placeholder="跟随全局">
+            <span class="suffix">个</span>
+          </div>
+        </div>
+        <div class="field">
+          <label>· Adobe 并发</label>
+          <span class="field-hint">浏览器方式较重，建议 2~3（太高会抢资源）</span>
+          <div class="input-suffix">
+            <input id="set-conc-adobe" class="px-input" type="number" min="1" max="100" placeholder="建议 2~3">
+            <span class="suffix">个</span>
+          </div>
+        </div>
+        <div class="field">
+          <label>· Leonardo 并发</label>
+          <div class="input-suffix">
+            <input id="set-conc-leonardo" class="px-input" type="number" min="1" max="100" placeholder="跟随全局">
+            <span class="suffix">个</span>
+          </div>
+        </div>
+        <div class="field">
+          <label>· Lovart 并发</label>
+          <div class="input-suffix">
+            <input id="set-conc-lovart" class="px-input" type="number" min="1" max="100" placeholder="跟随全局">
+            <span class="suffix">个</span>
           </div>
         </div>
         <div class="field">
