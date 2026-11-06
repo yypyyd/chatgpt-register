@@ -41,7 +41,10 @@ const (
 	// 两封验证码邮件挤在一起容易读错/读不到。可在系统设置 mailbox_interval_min
 	// 覆盖，0 = 不限。
 	defaultMailboxIntervalMin = 5
-	defaultLaunchStaggerSec   = 45
+	// 相邻两个注册任务启动的最小间隔（秒），用来把同时冲出去的任务错开几秒。
+	// 它同时是启动速率上限：单个注册约 1 分钟，间隔 S 秒时同时在跑约 60/S 个，
+	// 设大了并发就跑不满。可在系统设置 launch_stagger_sec 覆盖，0 = 不错峰。
+	defaultLaunchStaggerSec = 5
 	// registerAttemptTimeout 单次协议注册的墙钟上限。
 	// 需覆盖：Node 伪浏览器执行官方 Sentinel SDK + 页面停留/真人交互合成 + 每轮收码 1 分钟（最多重发一次）+ 建号探针。
 	registerAttemptTimeout = 8 * time.Minute
@@ -155,8 +158,23 @@ func (p *Producer) run(ctx context.Context, target int) {
 	}()
 
 	cfg := p.loadConfig()
-	p.logf("开始生产，目标 %d 个账号（每邮箱母号+%d 裂变，并发 %d，引擎=纯协议）",
-		target, cfg.FissionCount, cfg.MaxConcurrency)
+	staggerSec := int(cfg.LaunchStagger / time.Second)
+	p.logf("开始生产，目标 %d 个账号（每邮箱母号+%d 裂变，并发 %d，错峰 %d 秒，引擎=纯协议）",
+		target, cfg.FissionCount, cfg.MaxConcurrency, staggerSec)
+	limit := cfg.MaxConcurrency
+	if target < limit {
+		limit = target
+	}
+	if cfg.LaunchStagger > 0 && limit > 1 {
+		est := int(time.Minute / cfg.LaunchStagger)
+		if est < 1 {
+			est = 1
+		}
+		if est < limit {
+			p.logf("⚠ 错峰 %d 秒偏大：每 %d 秒才启动一个注册，同时在跑约 %d 个，跑不满并发 %d。可在系统设置调小「注册错峰间隔」",
+				staggerSec, staggerSec, est, cfg.MaxConcurrency)
+		}
+	}
 
 	sem := make(chan struct{}, cfg.MaxConcurrency)
 	var wg sync.WaitGroup

@@ -37,6 +37,7 @@
         </div>
         <div class="field">
           <label>· GPT 并发</label>
+          <span class="field-hint">实际同时在跑还受下方「注册错峰间隔」限制</span>
           <div class="input-suffix">
             <input id="set-conc-chatgpt" class="px-input" type="number" min="1" max="100" placeholder="跟随全局">
             <span class="suffix">个</span>
@@ -97,9 +98,9 @@
         </div>
         <div class="field">
           <label>注册错峰间隔</label>
-		  <span class="field-hint">GPT 相邻两个注册任务实际启动的最小间隔；已在后端强制生效（0 = 不错峰，不建议）</span>
+		  <span class="field-hint">GPT 每隔多少秒才启动下一个注册。单个注册约 1 分钟，同时在跑 ≈ 60 ÷ 间隔，设大了会压住并发（45 秒时只能同时跑 1~2 个），建议 3~5 秒；0 = 不错峰</span>
           <div class="input-suffix">
-            <input id="set-launch-stagger" class="px-input" type="number" min="0" max="600" placeholder="默认 45">
+            <input id="set-launch-stagger" class="px-input" type="number" min="0" max="600" placeholder="默认 5">
             <span class="suffix">秒</span>
           </div>
         </div>
@@ -245,7 +246,7 @@ async function loadSettings() {
   document.getElementById('set-fission-count').value = d.fission_count || '5';
   document.getElementById('set-retry-cooldown').value = d.retry_cooldown_min || '30';
   document.getElementById('set-mailbox-interval').value = d.mailbox_interval_min || '5';
-  document.getElementById('set-launch-stagger').value = d.launch_stagger_sec === undefined ? '45' : d.launch_stagger_sec;
+  document.getElementById('set-launch-stagger').value = d.launch_stagger_sec === undefined ? '5' : d.launch_stagger_sec;
   document.getElementById('set-captcha-enabled').checked = d.captcha_enabled === '1';
   document.getElementById('set-captcha-key').value = d.captcha_2captcha_key || '';
   document.getElementById('set-yescaptcha-key').value = d.captcha_yescaptcha_key || '';
