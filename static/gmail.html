@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Gmail 注册 · ChatGPT 注册管理</title>
+<link rel="stylesheet" href="/static/style.css?v=19">
+<style>
+  .gm-pw { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px; color: #4b4b6b; user-select: all; }
+</style>
+</head>
+<body data-page="gmail">
+<div class="layout">
+  <main class="main">
+    <h1 class="page-title">Gmail 注册</h1>
+    <div class="toolbar">
+      <input id="gm-search" class="px-input search" placeholder="搜索 email / 备注 ...">
+      <select id="gm-filter" class="px-input">
+        <option value="">全部状态</option>
+        <option value="registering">注册中</option>
+        <option value="registered">已注册</option>
+        <option value="register_failed">注册失败</option>
+      </select>
+      <button class="px-btn primary" onclick="openGmailModal()">单个注册</button>
+      <button class="px-btn primary" onclick="openProduceModal()">批量生产</button>
+      <button class="px-btn danger" onclick="deleteAllGmail()">全部删除</button>
+    </div>
+
+    <!-- 生产进度条 -->
+    <div class="produce-bar" id="gm-produce-bar" style="display:none">
+      <div class="produce-info">
+        <span id="gm-produce-text">—</span>
+        <button class="px-btn danger" onclick="stopProduce()">停止生产</button>
+      </div>
+    </div>
+
+    <!-- 多选批量栏 -->
+    <div class="batch-bar" id="gm-batch" style="display:none">
+      <span id="gm-batch-count">已选 0 项</span>
+      <button class="px-btn primary" onclick="exportSelected('text')">导出密码(TXT)</button>
+      <button class="px-btn primary" onclick="exportSelected('json')">导出 JSON</button>
+      <button class="px-btn" onclick="toMailbox()">加入邮箱池</button>
+      <button class="px-btn danger" onclick="delSelected()">删除所选</button>
+      <button class="px-btn ghost" onclick="clearSelection()">取消</button>
+    </div>
+
+    <div class="table-wrap">
+      <table class="px-table">
+        <thead><tr>
+          <th class="col-check"><input type="checkbox" id="gm-check-all" onclick="toggleSelectAll(this.checked)"></th>
+          <th>邮箱</th>
+          <th>密码</th>
+          <th>创建时间</th>
+          <th>状态</th>
+          <th>操作</th>
+        </tr></thead>
+        <tbody id="gm-rows"></tbody>
+      </table>
+      <div class="pager" id="gm-pager"></div>
+    </div>
+  </main>
+</div>
+
+<!-- 单个注册 modal -->
+<div class="modal-mask" id="gm-modal" style="display:none">
+  <div class="modal px-panel">
+    <h2>Gmail 单个注册</h2>
+    <label>用户名（@ 前面的部分，留空随机生成）</label>
+    <input id="gm-username" class="px-input" placeholder="如 johnsmith123">
+    <label>备注</label>
+    <textarea id="gm-note" class="px-input" rows="2"></textarea>
+    <div class="modal-actions">
+      <button class="px-btn" onclick="closeModal('gm-modal')">取消</button>
+      <button class="px-btn primary" onclick="startGmail()">开始注册</button>
+    </div>
+  </div>
+</div>
+
+<!-- 批量生产 modal -->
+<div class="modal-mask" id="produce-modal" style="display:none">
+  <div class="modal px-panel">
+    <h2>Gmail 批量生产</h2>
+    <label>目标数量</label>
+    <input id="produce-count" class="px-input" type="number" min="1" value="10" placeholder="要注册的 Gmail 账号数量">
+    <div class="modal-actions">
+      <button class="px-btn" onclick="closeModal('produce-modal')">取消</button>
+      <button class="px-btn primary" onclick="doProduce()">开始生产</button>
+    </div>
+  </div>
+</div>
+
+<!-- 日志 modal -->
+<div class="modal-mask" id="log-modal" style="display:none">
+  <div class="modal px-panel log-panel">
+    <div class="log-head">
+      <h2 id="log-title">执行日志</h2>
+      <button class="px-btn" onclick="closeLog()">关闭</button>
+    </div>
+    <pre class="log-body" id="log-body"></pre>
+  </div>
+</div>
+
+<!-- 取件 modal -->
+<div class="modal-mask" id="mail-modal" style="display:none">
+  <div class="modal px-panel mail-modal">
+    <div class="mail-head">
+      <div>
+        <h2 id="mail-title">取件</h2>
+        <div class="mail-sub" id="mail-sub"></div>
+      </div>
+      <button class="px-btn" onclick="closeMailModal()">关闭</button>
+    </div>
+    <div class="mail-body">
+      <div class="mail-list" id="mail-list"><div class="mail-empty">加载中...</div></div>
+      <div class="mail-detail">
+        <div class="mail-meta" id="mail-meta"></div>
+        <iframe id="mail-frame" sandbox="allow-same-origin allow-popups" title="邮件内容"></iframe>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast" style="display:none"></div>
+<script src="/static/layout.js?v=11"></script>
+<script src="/static/gmail.js?v=3"></script>
+</body>
+</html>

@@ -18,11 +18,11 @@ import (
 
 const MigrationKey = "internal_channel_proxy_migration_v1"
 
-var Channels = []string{"chatgpt", "grok", "adobe", "leonardo", "lovart"}
+var Channels = []string{"chatgpt", "grok", "adobe", "leonardo", "lovart", "gmail"}
 
 var labels = map[string]string{
 	"chatgpt": "GPT", "grok": "Grok", "adobe": "Adobe",
-	"leonardo": "Leonardo", "lovart": "Lovart",
+	"leonardo": "Leonardo", "lovart": "Lovart", "gmail": "Gmail",
 }
 
 type Config struct {

@@ -172,6 +172,21 @@ func main() {
 		api.GET("/lovart/registrations/livecheck/status", h.LovartLiveCheckStatus)
 		api.POST("/lovart/registrations/:id/livecheck", h.LovartLiveCheckOne)
 
+		api.GET("/gmail/registrations", h.GmailList)
+		api.DELETE("/gmail/registrations", h.GmailDeleteAll)
+		api.POST("/gmail/registrations", h.GmailStart)
+		api.POST("/gmail/produce", h.GmailProduce)
+		api.GET("/gmail/produce/status", h.GmailProduceStatus)
+		api.POST("/gmail/produce/stop", h.GmailProduceStop)
+		api.POST("/gmail/registrations/:id/stop", h.GmailStop)
+		api.DELETE("/gmail/registrations/:id", h.GmailDelete)
+		api.GET("/gmail/registrations/:id/logs", h.GmailLog)
+		api.GET("/gmail/registrations/:id/shot", h.GmailShot)
+		api.GET("/gmail/registrations/:id/messages", h.GmailMessages)
+		api.GET("/gmail/registrations/:id/message", h.GmailMessage)
+		api.POST("/gmail/to-mailbox", h.GmailToMailbox)
+		api.POST("/gmail/download", h.GmailDownload)
+
 	}
 
 	sub, err := fs.Sub(staticFS, "static")
@@ -180,7 +195,7 @@ func main() {
 	}
 	httpFS := http.FS(sub)
 	r.StaticFS("/static", httpFS)
-	for _, p := range []string{"login", "dashboard", "mailboxes", "accounts", "grok", "adobe", "leonardo", "lovart", "settings"} {
+	for _, p := range []string{"login", "dashboard", "mailboxes", "accounts", "grok", "adobe", "leonardo", "lovart", "gmail", "settings"} {
 		p := p
 		r.GET("/"+p, func(c *gin.Context) { c.FileFromFS(p+".html", httpFS) })
 	}
